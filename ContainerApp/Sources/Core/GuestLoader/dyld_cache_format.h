@@ -48,12 +48,8 @@ struct dyld_cache_local_symbols_entry_64
     uint32_t   nlistCount;
 };
 
-struct dyld_uuid_info
-{
-    uint8_t    uuid[16];
-    uint64_t   loadAddress;
-    uint32_t   textSegmentSize;
-};
+// NOTE: `struct dyld_uuid_info` is provided by <mach-o/dyld_images.h> (already
+// included by litehook.c); do NOT redefine it here.
 
 struct dyld_cache_header
 {
@@ -97,7 +93,7 @@ struct dyld_cache_header
     uint32_t   subCacheArrayCount;
     uint32_t   dynamicConfigOffset;
     uint32_t   dynamicConfigCount;
-    dyld_uuid_info symbolFileUUID;      // uuid of the accompanying .symbols file
+    struct dyld_uuid_info symbolFileUUID;  // uuid of the accompanying .symbols file
 };
 
 #endif /* LITEHOOK_DYLD_CACHE_FORMAT_H */
