@@ -160,15 +160,13 @@ struct SettingsView: View {
     }
 
     private func pickFirmware() {
-        DocPicker.present(asCopy: false) { result in
+        // asCopy: TRUE — open-in-place (asCopy:false) never delivers the
+        // selection on iPadOS 27 beta, which is why firmware picking stalled.
+        DocPicker.present(asCopy: true) { result in
             switch result {
             case .success(let url):
-                let ext = url.pathExtension.lowercased()
-                guard ext == "ryboxenv" || ext == "ipsw" else {
-                    firm.message = "请选择 .ryboxenv 或 .ipsw 文件（当前：\(url.lastPathComponent)）"
-                    firm.phase = .failed
-                    return
-                }
+                // No extension gate — FirmwareImporter decides by content.
+                firm.message = "已选择：\(url.lastPathComponent)"
                 firm.ingest(url)
             case .failure(let e):
                 firm.message = "选择失败：\(e.localizedDescription)"
@@ -273,26 +271,34 @@ struct SettingsView: View {
         }
     }
 
+    /// The file's ROLE is detected from its CONTENT, not its extension — p12 /
+    /// pfx / extension-less files all work, and picking a profile in the cert
+    /// row simply fills the other slot.
     private func handle(_ url: URL, isP12: Bool) {
-        let ext = url.pathExtension.lowercased()
-        let want = isP12 ? "p12" : "mobileprovision"
-        guard ext == want else {
-            message = "请选择 .\(want) 文件（当前：\(url.lastPathComponent)）"
-            return
-        }
         do {
             let data = try Data(contentsOf: url)
-            if isP12 {
-                stagedP12 = data
-                p12Name = url.lastPathComponent
-            } else {
+            let name = url.lastPathComponent
+            if looksLikeProvisioning(data) {
                 stagedProv = data
-                provName = url.lastPathComponent
+                provName = name
+                message = "已识别为描述文件：\(name)"
+            } else {
+                stagedP12 = data
+                p12Name = name
+                message = "已识别为证书：\(name)（\(data.count) 字节）"
             }
-            message = "已暂存，点「应用配置」完成导入"
         } catch {
             message = "读取文件失败：\(error.localizedDescription)"
         }
+    }
+
+    private func looksLikeProvisioning(_ data: Data) -> Bool {
+        guard let s = String(data: data.prefix(1 << 20), encoding: .isoLatin1) else { return false }
+        if s.contains("mobileprovision") { return true }
+        if s.contains("<?xml"),
+           (s.contains("TeamIdentifier") || s.contains("ProvisionedDevices")
+            || s.contains("Entitlements") || s.contains("AppIDName")) { return true }
+        return false
     }
 
     private func apply() {
@@ -300,9 +306,17 @@ struct SettingsView: View {
             message = "请先选择 p12 与 mobileprovision"
             return
         }
-        let okP12 = store.importP12(p12, password: p12Password)
-        store.importProvisioning(prov)
-        message = okP12 ? "配置成功：证书 + 描述文件已就绪" : "p12 导入失败（密码错误或格式不符）"
+        switch store.importP12(p12, password: p12Password) {
+        case .success:
+            switch store.importProvisioning(prov) {
+            case .success:
+                message = "配置成功：证书 + 描述文件已就绪"
+            case .failure(let m):
+                message = "证书已就绪，但描述文件有问题：\(m)"
+            }
+        case .failure(let m):
+            message = m      // detailed diagnosis (key-only cert / PEM / OpenSSL 3 p12 / wrong password)
+        }
     }
 }
 
