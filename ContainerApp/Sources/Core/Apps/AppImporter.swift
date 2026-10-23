@@ -102,24 +102,22 @@ public final class AppImporter: ObservableObject {
         return .success(app)
     }
 
+    /// Uninstall a guest app: delete its bundle from the virtual root and
+    /// unregister it (the desktop icon disappears with it).
+    public func remove(_ app: ImportedApp) {
+        try? fm.removeItem(atPath: app.containerPath)
+        DispatchQueue.main.async {
+            self.importedApps.removeAll { $0.bundleIdentifier == app.bundleIdentifier }
+            if self.lastImported?.bundleIdentifier == app.bundleIdentifier {
+                self.lastImported = nil
+            }
+        }
+    }
+
     private func runUnzip(archive: String, into dir: String) -> Int32 {
-        var pid: pid_t = 0
-        var fa: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fa)
-        let exe = "/usr/bin/unzip"
-        var a: [UnsafeMutablePointer<CChar>?] = [
-            strdup(exe), strdup("-o"), strdup("-q"),
-            strdup(archive), strdup("-d"), strdup(dir)
-        ]
-        a.append(nil)
-        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { $0.withCString(strdup) }
-        e.append(nil)
-        let rc = posix_spawn(&pid, exe, &fa, nil, &a, &e)
-        a.forEach { free($0) }; e.forEach { free($0) }
-        posix_spawn_file_actions_destroy(&fa)
-        guard rc == 0 else { return rc }
-        var st: Int32 = 0
-        waitpid(pid, &st, 0)
-        return st
+        // In-process extraction (RyUnzip.c + zlib). posix_spawn of
+        // /usr/bin/unzip is denied by the iOS sandbox (EPERM), so the
+        // subprocess path was replaced by this in-process extractor.
+        return Int32(ry_unzip_extract(archive, dir))
     }
 }
