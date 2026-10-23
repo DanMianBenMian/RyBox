@@ -36,10 +36,16 @@ final class PreinstalledStore: ObservableObject {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
-    /// Called on launch / view appear. Idempotent: installs once.
+    /// Called on launch / view appear. Idempotent: installs once, and
+    /// auto-retries a previous failure (e.g. the user just configured a cert
+    /// in Settings and came back).
     func bootstrapIfNeeded() {
         if isInstalled {
             state = .installed
+            return
+        }
+        if state == .failed {
+            installSileo()
             return
         }
         guard !bootstrapped else { return }
@@ -53,6 +59,7 @@ final class PreinstalledStore: ObservableObject {
             state = .installed
             return
         }
+        guard state != .installing else { return }   // no double imports
         guard let ipa = bundledIPA else {
             state = .failed
             message = "未找到内置 Sileo.ipa（RyBox.app/Preinstalled/）"
