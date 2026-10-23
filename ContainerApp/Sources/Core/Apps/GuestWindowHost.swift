@@ -66,6 +66,7 @@ final class GuestWindowHost {
         let overlay = UIWindow(frame: UIScreen.main.bounds)
         overlay.windowLevel = .alert + 1
         let vc = UIViewController()
+        vc.view = PassThroughView()   // keep the guest UI beneath interactive
         vc.view.backgroundColor = .clear
         let btn = UIButton(type: .system)
         btn.setTitle("弹出 App", for: .normal)
