@@ -8,6 +8,11 @@ public final class CertificateStore: ObservableObject {
     public static let shared = CertificateStore()
 
     private var identity: SecIdentity?
+    /// True when SecPKCS12Import couldn't read the file but RyP12 did. In that
+    /// mode there is no SecIdentity object, but nothing needs one: CodeSigner
+    /// only stages the p12 bytes + password for the bundled helper, and the
+    /// parser already proved the passphrase and the private key are real.
+    private var p12VerifiedByFallback = false
     private var provisioningData: Data?
     /// Raw p12 bytes (kept so CodeSigner can stage them for the bundled helper).
     private var p12Data: Data?
@@ -16,6 +21,8 @@ public final class CertificateStore: ObservableObject {
     @Published public private(set) var isConfigured: Bool = false
     /// Team id extracted from the provisioning profile (e.g. "ABCDE12345").
     @Published public private(set) var teamIdentifier: String?
+    /// Human readable "what we actually imported" line, shown in the UI.
+    @Published public private(set) var certificateInfo: String?
 
     /// Import a .p12 / .pfx (distribution or development) using its password.
     ///
@@ -58,12 +65,48 @@ public final class CertificateStore: ObservableObject {
                 continue
             }
             self.identity = (raw as! SecIdentity)
+            self.p12VerifiedByFallback = false
             self.p12Data = data
             self.p12Password = pw
+            self.certificateInfo = Self.describe(identity: self.identity)
             refresh()
             return .success(())
         }
-        return .failure(Self.diagnoseP12(data, status: lastStatus, password: password))
+
+        // ---- fallback -----------------------------------------------------
+        // SecPKCS12Import gave up. The overwhelmingly common cause is an
+        // OpenSSL 3.x p12 (PBES2/AES-256-CBC/PBKDF2-SHA256) — Apple's importer
+        // predates that. Parse it ourselves instead of sending the user away.
+        var lastFallback = ""
+        for pw in candidates {
+            switch RyP12.decode(data, password: pw) {
+            case .success(let o):
+                self.identity = nil
+                self.p12VerifiedByFallback = true
+                self.p12Data = data
+                self.p12Password = o.password
+                self.certificateInfo = "\(o.subject) · \(o.keyDescription) · \(o.scheme)"
+                refresh()
+                return .success(())
+            case .failure(let m):
+                if lastFallback.isEmpty { lastFallback = m }
+            }
+        }
+        // Prefer the built-in decoder's reason: it knows far more about the
+        // actual bytes than a bare OSStatus does.
+        let fallbackHint = lastFallback.isEmpty
+            ? "" : "\n（RyBox 内置解码器：\(lastFallback)）"
+        return .failure(Self.diagnoseP12(data, status: lastStatus,
+                                         password: password) + fallbackHint)
+    }
+
+    private static func describe(identity: SecIdentity?) -> String {
+        guard let identity = identity else { return "证书已导入" }
+        var cert: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &cert) == errSecSuccess,
+              let cert = cert else { return "证书已导入" }
+        let subject = (SecCertificateCopySubjectSummary(cert) as? String) ?? "证书"
+        return "\(subject) · 系统钥匙串已接受"
     }
 
     /// Import a .mobileprovision (embedded entitlements are read from it).
@@ -105,13 +148,13 @@ public final class CertificateStore: ObservableObject {
             let hint = password.isEmpty
                 ? "（密码留空）若这个 p12 设了密码，请填上。"
                 : "密码可能不对。"
-            return "PKCS#12 解析失败：\(hint) 另一个常见原因是文件用了 iOS 不支持的新式加密（OpenSSL 3.x 默认 AES-256-CBC + PBKDF2），需用旧式加密重新导出：\nopenssl pkcs12 -export -legacy -inkey key.pem -in cert.pem -out cert.p12\n（错误码 \(status)）"
+            return "PKCS#12 解析失败：\(hint) RyBox 已用内置解码器重试过（支持 OpenSSL 3 的 PBES2/AES-256-CBC 等新式加密），仍然失败。若你有原始的 key.pem + cert.pem，可用旧式加密重新导出：\nopenssl pkcs12 -export -legacy -inkey key.pem -in cert.pem -out cert.p12\n（错误码 \(status)）"
         }
         return "无法识别的文件格式（前几字节：\(data.prefix(4).map { String(format: "%02x", $0) }.joined(separator: " "))）。需要 p12/pfx。"
     }
 
     private func refresh() {
-        isConfigured = (identity != nil && provisioningData != nil)
+        isConfigured = ((identity != nil || p12VerifiedByFallback) && provisioningData != nil)
     }
 
     // MARK: - Accessors used by CodeSigner
