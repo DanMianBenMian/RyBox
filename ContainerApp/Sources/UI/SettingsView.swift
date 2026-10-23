@@ -5,28 +5,28 @@ import UniformTypeIdentifiers
 /// Hosts the signing identity (p12 + mobileprovision) the import→sign→run
 /// chain depends on, plus desktop/Dock customization and about info.
 struct SettingsView: View {
-    @State private var showP12 = false
-    @State private var showProv = false
     @State private var p12Password = ""
     @State private var p12Name: String = "未选择"
     @State private var provName: String = "未选择"
     @State private var message: String = ""
+
+    /// Staged file contents (imported only when the user taps "应用配置").
     @State private var stagedP12: Data?
     @State private var stagedProv: Data?
 
     @ObservedObject private var store = CertificateStore.shared
     @ObservedObject private var desktop = DesktopStore.shared
+    @ObservedObject private var firm = FirmwareImporter.shared
     @EnvironmentObject private var env: RuntimeEnvironment
 
     var body: some View {
         Form {
             signingSection
+            firmwareSection
             desktopSection
             aboutSection
         }
         .navigationTitle("设置")
-        .fileImporter(isPresented: $showP12, allowedContentTypes: [.item]) { handle($0, isP12: true) }
-        .fileImporter(isPresented: $showProv, allowedContentTypes: [.item]) { handle($0, isP12: false) }
     }
 
     // MARK: 签名身份
@@ -41,9 +41,9 @@ struct SettingsView: View {
                     .lineLimit(1)
             }
             .contentShape(Rectangle())
-            .onTapGesture { showP12 = true }
+            .onTapGesture { pickP12() }
 
-            SecureField("p12 密码", text: $p12Password)
+            SecureField("p12 密码（无密码可直接留空）", text: $p12Password)
 
             HStack {
                 Text("描述文件")
@@ -53,18 +53,21 @@ struct SettingsView: View {
                     .lineLimit(1)
             }
             .contentShape(Rectangle())
-            .onTapGesture { showProv = true }
+            .onTapGesture { pickProv() }
 
             Button {
                 apply()
             } label: {
-                if stagedP12 == nil || stagedProv == nil || p12Password.isEmpty {
+                if stagedP12 == nil || stagedProv == nil {
                     Text("应用配置（需先选择证书与描述文件）").foregroundColor(.secondary)
                 } else {
                     Text("应用配置").bold()
                 }
             }
-            .disabled(stagedP12 == nil || stagedProv == nil || p12Password.isEmpty)
+            // NOTE: an EMPTY password is allowed — plenty of distribution p12
+            // files are exported without one, and requiring text here used to
+            // silently block the whole configuration step.
+            .disabled(stagedP12 == nil || stagedProv == nil)
 
             HStack {
                 Text("状态")
@@ -90,6 +93,87 @@ struct SettingsView: View {
             Text(store.isConfigured
                  ? "支持分发证书（无 get-task-allow）：GUI 走 LiveContainer 进程内模型，CLI 在微内核内直接运行。"
                  : "请先选择 p12 与 mobileprovision 并点「应用配置」，否则导入 App 时会因未配置证书而失败。")
+        }
+    }
+
+    // MARK: 系统固件（系统环境来源）
+
+    private var firmwareSection: some View {
+        Section {
+            HStack {
+                Text("状态")
+                Spacer()
+                Label(firm.phase.label,
+                      systemImage: firm.isSatisfied ? "checkmark.circle.fill"
+                                                    : "exclamationmark.circle")
+                    .foregroundStyle(firm.isSatisfied ? Color.green : Color.orange)
+                    .font(.footnote)
+            }
+
+            if let r = firm.report {
+                HStack {
+                    Text("来源")
+                    Spacer()
+                    Text(r.source).foregroundColor(.secondary).lineLimit(1)
+                }
+                if let v = r.version {
+                    HStack {
+                        Text("系统版本")
+                        Spacer()
+                        Text("\(v)\(r.build.map { " (\($0))" } ?? "")")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                HStack {
+                    Text("已还原")
+                    Spacer()
+                    Text("\(r.installedFiles) 个文件 / \(Self.mb(r.installedBytes)) MB")
+                        .foregroundColor(.secondary)
+                }
+                ForEach(r.notes, id: \.self) { note in
+                    Text(note).font(.caption).foregroundColor(.secondary)
+                }
+            }
+
+            if firm.phase == .scanning || firm.phase == .extracting {
+                ProgressView(value: max(firm.progress, 0.05))
+                Text(firm.message).font(.caption).foregroundColor(.secondary)
+            } else if case .failed = firm.phase {
+                Text(firm.message).font(.caption).foregroundColor(.red)
+            }
+
+            Button {
+                pickFirmware()
+            } label: {
+                Label(firm.isSatisfied ? "重新导入固件" : "导入固件（.ryboxenv / .ipsw）",
+                      systemImage: "square.and.arrow.down.on.square")
+            }
+        } header: {
+            Text("系统固件")
+        } footer: {
+            Text("固件不打包进 IPA（否则会变成数 GB）。.ryboxenv 是电脑上预处理好的系统环境包（已解密 AEA / DMG / APFS），导入即完整还原 /usr /System；直接导入 .ipsw 时 RyBox 就地读取其中未加密的 manifest、kernelcache 与 trustcache。")
+        }
+    }
+
+    private static func mb(_ bytes: Int64) -> String {
+        String(format: "%.1f", Double(bytes) / 1024 / 1024)
+    }
+
+    private func pickFirmware() {
+        DocPicker.present(asCopy: false) { result in
+            switch result {
+            case .success(let url):
+                let ext = url.pathExtension.lowercased()
+                guard ext == "ryboxenv" || ext == "ipsw" else {
+                    firm.message = "请选择 .ryboxenv 或 .ipsw 文件（当前：\(url.lastPathComponent)）"
+                    firm.phase = .failed
+                    return
+                }
+                firm.ingest(url)
+            case .failure(let e):
+                firm.message = "选择失败：\(e.localizedDescription)"
+                firm.phase = .failed
+            }
         }
     }
 
@@ -125,7 +209,7 @@ struct SettingsView: View {
         } header: {
             Text("桌面与 Dock")
         } footer: {
-            Text("长按桌面图标进入编辑模式：拖动调整位置、拖到 Dock 添加、点 − 删除。")
+            Text("长按桌面空白处进入编辑模式：拖动调整位置、两个应用叠放建文件夹、拖到 Dock 添加、点 − 删除。长按应用图标可打开菜单。")
         }
     }
 
@@ -167,21 +251,37 @@ struct SettingsView: View {
 
     // MARK: Picker handling
 
-    private func handle(_ result: Result<URL, Error>, isP12: Bool) {
-        switch result {
-        case .success(let url):
-            let ok = url.startAccessingSecurityScopedResource()
-            defer { if ok { url.stopAccessingSecurityScopedResource() } }
-            let ext = url.pathExtension.lowercased()
-            let want = isP12 ? "p12" : "mobileprovision"
-            guard ext == want else {
-                message = "请选择 .\(want) 文件（当前：\(url.lastPathComponent)）"
-                return
+    private func pickP12() {
+        DocPicker.present { result in
+            switch result {
+            case .success(let url):
+                handle(url, isP12: true)
+            case .failure(let e):
+                message = "选择失败：\(e.localizedDescription)"
             }
-            guard let data = try? Data(contentsOf: url) else {
-                message = "读取文件失败"
-                return
+        }
+    }
+
+    private func pickProv() {
+        DocPicker.present { result in
+            switch result {
+            case .success(let url):
+                handle(url, isP12: false)
+            case .failure(let e):
+                message = "选择失败：\(e.localizedDescription)"
             }
+        }
+    }
+
+    private func handle(_ url: URL, isP12: Bool) {
+        let ext = url.pathExtension.lowercased()
+        let want = isP12 ? "p12" : "mobileprovision"
+        guard ext == want else {
+            message = "请选择 .\(want) 文件（当前：\(url.lastPathComponent)）"
+            return
+        }
+        do {
+            let data = try Data(contentsOf: url)
             if isP12 {
                 stagedP12 = data
                 p12Name = url.lastPathComponent
@@ -190,18 +290,14 @@ struct SettingsView: View {
                 provName = url.lastPathComponent
             }
             message = "已暂存，点「应用配置」完成导入"
-        case .failure(let e):
-            message = "选择失败：\(e.localizedDescription)"
+        } catch {
+            message = "读取文件失败：\(error.localizedDescription)"
         }
     }
 
     private func apply() {
         guard let p12 = stagedP12, let prov = stagedProv else {
             message = "请先选择 p12 与 mobileprovision"
-            return
-        }
-        guard !p12Password.isEmpty else {
-            message = "请输入 p12 密码"
             return
         }
         let okP12 = store.importP12(p12, password: p12Password)
