@@ -217,7 +217,7 @@ final class DesktopStore: ObservableObject {
     }
 
     private static func loadPositions() -> [String: CGPoint] {
-        guard let dict = defaults.dictionary(forKey: Key.positions) as? [String: [Double]] else { return [:] }
+        guard let dict = UserDefaults.standard.dictionary(forKey: Key.positions) as? [String: [Double]] else { return [:] }
         var out: [String: CGPoint] = [:]
         for (k, v) in dict where v.count == 2 {
             out[k] = CGPoint(x: v[0], y: v[1])
