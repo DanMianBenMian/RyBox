@@ -5,12 +5,12 @@ import Security
 /// is just a sentence for the user. This wrapper keeps `Result<Void,
 /// RyMessageError>` type-correct while still allowing `.failure("…")` — a bare
 /// `String` would not compile here.
-struct RyMessageError: LocalizedError, ExpressibleByStringLiteral {
-    let message: String
-    init(_ message: String) { self.message = message }
-    init(stringLiteral value: String) { self.message = value }
-    var errorDescription: String? { message }
-    var localizedDescription: String { message }
+public struct RyMessageError: LocalizedError, ExpressibleByStringLiteral {
+    public let message: String
+    public init(_ message: String) { self.message = message }
+    public init(stringLiteral value: String) { self.message = value }
+    public var errorDescription: String? { message }
+    public var localizedDescription: String { message }
 }
 
 /// Holds the user-imported signing identity + provisioning profile.
