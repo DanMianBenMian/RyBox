@@ -36,6 +36,17 @@ jobs:
           echo "app_path=$APP" >> "$GITHUB_OUTPUT"
           echo "found: $APP"
 
+      - name: Stage preinstalled apps
+        run: |
+          set -eo pipefail
+          APP="${{ steps.locate.outputs.app_path }}"
+          # Preinstalled IPAs (real Sileo) ride inside the app bundle. Must be
+          # staged BEFORE codesign, or the added files invalidate the seal.
+          mkdir -p "$APP/Preinstalled"
+          cp preinstalled/Sileo.ipa "$APP/Preinstalled/Sileo.ipa"
+          echo "staged preinstalled:"
+          ls -la "$APP/Preinstalled"
+
       - name: Ad-hoc sign + package IPA
         run: |
           set -eo pipefail
