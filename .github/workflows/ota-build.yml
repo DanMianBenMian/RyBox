@@ -5,7 +5,9 @@ on:
     branches: [main]
 jobs:
   build:
-    runs-on: macos-latest
+    # macos-15 (Xcode 16): macos-latest's runner pool was congested for 25+ min
+    # on 2026-10-23. Our target is iOS 17 / Swift 5.9 — Xcode 16 covers it.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
