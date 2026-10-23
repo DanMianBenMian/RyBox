@@ -9,6 +9,19 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
+// ---- shims needed to flip the guest Mach-O header filetype ----
+// TPRO write-enable shims are implemented in litehook.c (same target); declared
+// here because litehook.h doesn't expose them. We use the public vm_protect()
+// (not the private builtin_vm_protect) for the non-PPL case.
+void os_thread_self_restrict_tpro_to_rw(void);
+void os_thread_self_restrict_tpro_to_ro(void);
+
+// MH_EXECUTE_SYM (the "_mh_execute_header" name dyld uses for the main
+// executable) is not part of the public iOS SDK headers.
+#ifndef MH_EXECUTE_SYM
+#define MH_EXECUTE_SYM "_mh_execute_header"
+#endif
+
 // ----------------------------------------------------------------------------
 // State
 // ----------------------------------------------------------------------------
@@ -58,18 +71,17 @@ static int Ry_NSGetExecutablePath(char *buf, uint32_t *bufsize) {
 // ----------------------------------------------------------------------------
 static void overwriteAppExecutableFileType(void) {
     struct mach_header_64 *h = (struct mach_header_64 *)orig_dyld_get_image_header(appMainImageIndex);
-    kern_return_t k = builtin_vm_protect(mach_task_self(),
-                                         (vm_address_t)h, sizeof(*h), false,
-                                         PROT_READ | PROT_WRITE | VM_PROT_COPY);
+    kern_return_t k = vm_protect(mach_task_self(),
+                                 (vm_address_t)h, sizeof(*h), false,
+                                 PROT_READ | PROT_WRITE);
     if (k != KERN_SUCCESS) {
-        // TPRO-protected: temporarily drop to RW.
+        // PPL/TPRO-protected page: temporarily drop the thread to RW.
         os_thread_self_restrict_tpro_to_rw();
         h->filetype = MH_EXECUTE;
         os_thread_self_restrict_tpro_to_ro();
     } else {
         h->filetype = MH_EXECUTE;
-        builtin_vm_protect(mach_task_self(),
-                           (vm_address_t)h, sizeof(*h), false, PROT_READ);
+        vm_protect(mach_task_self(), (vm_address_t)h, sizeof(*h), false, PROT_READ);
     }
     appExecutableFileTypeOverwritten = true;
 }
@@ -155,11 +167,14 @@ static int Ry_UIApplicationMain(int argc, char *argv[],
             if (sbName.length) {
                 UIStoryboard *sb = [UIStoryboard storyboardWithName:sbName bundle:main];
                 w.rootViewController = [sb instantiateInitialViewController];
-            } else if (NSString *pc = info[@"NSPrincipalClass"]) {
-                Class vc = NSClassFromString(pc);
-                w.rootViewController = vc ? [[vc alloc] init] : [UIViewController new];
             } else {
-                w.rootViewController = [UIViewController new];
+                NSString *pc = info[@"NSPrincipalClass"];
+                if (pc.length) {
+                    Class vc = NSClassFromString(pc);
+                    w.rootViewController = vc ? [[vc alloc] init] : [UIViewController new];
+                } else {
+                    w.rootViewController = [UIViewController new];
+                }
             }
         }
         w.windowLevel = UIWindowLevelAlert; // above the container
