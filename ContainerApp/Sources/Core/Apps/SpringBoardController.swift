@@ -6,7 +6,7 @@ import UIKit
 ///
 /// "Home" means: eject any in-process guest window (process stays alive) and ask
 /// the home screen to dismiss any presented panel — always returning to the
-/// SpringBoard. This is the unified "弹出 App" entry (see HomeButtonWindow).
+/// SpringBoard. This is the unified "弹出 App" entry (see GuestChromeWindow).
 final class SpringBoardController: ObservableObject {
     static let shared = SpringBoardController()
 
