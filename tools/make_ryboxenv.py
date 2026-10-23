@@ -168,7 +168,8 @@ def pack(from_dir: str, out: str, include_system_apps: bool,
     count = 0
     zf = zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6)
     try:
-        zf.writestr("ryboxenv.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        # The manifest is written ONCE, at the end, once file/byte counts are
+        # known (writing it twice would leave a duplicate zip entry).
         for p, base in iter_files(from_dir, include_system_apps,
                                   skip_larger_than=skip_larger_than):
             rel = os.path.relpath(p, base).replace(os.sep, "/")
