@@ -76,10 +76,13 @@ struct BootGateView: View {
         VStack(alignment: .leading, spacing: 14) {
             stepHeader(index: 1, title: "签名证书", done: certDone)
 
-            row(title: "证书文件（.p12）", value: p12Name) { pickP12() }
+            row(title: "证书（p12 / pfx）", value: p12Name) { pickP12() }
             SecureField("p12 密码（可为空）", text: $p12Password)
                 .textFieldStyle(.roundedBorder)
             row(title: "描述文件（.mobileprovision）", value: provName) { pickProv() }
+            Text("两栏都能选任意文件，RyBox 按内容自动判断它是证书还是描述文件。")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.6))
 
             Button {
                 applyCert()
@@ -224,21 +227,15 @@ struct BootGateView: View {
 
     // MARK: Actions
 
+    /// Pick a certificate file. The file's ROLE is detected from its CONTENT,
+    /// not from its extension: .p12 / .pfx / .pem-converted / no-extension files
+    /// all work, and picking a .mobileprovision here just fills the other slot
+    /// instead of failing.
     private func pickP12() {
+        message = "正在打开文件选择器…"
         DocPicker.present { result in
             switch result {
-            case .success(let url):
-                guard url.pathExtension.lowercased() == "p12" else {
-                    message = "请选择 .p12 文件（当前：\(url.lastPathComponent)）"
-                    return
-                }
-                do {
-                    stagedP12 = try Data(contentsOf: url)
-                    p12Name = url.lastPathComponent
-                    message = "已选择证书文件"
-                } catch {
-                    message = "读取失败：\(error.localizedDescription)"
-                }
+            case .success(let url): stageCertFile(url)
             case .failure(let e):
                 message = "选择失败：\(e.localizedDescription)"
             }
@@ -246,61 +243,85 @@ struct BootGateView: View {
     }
 
     private func pickProv() {
+        message = "正在打开文件选择器…"
         DocPicker.present { result in
             switch result {
-            case .success(let url):
-                guard url.pathExtension.lowercased() == "mobileprovision" else {
-                    message = "请选择 .mobileprovision 文件（当前：\(url.lastPathComponent)）"
-                    return
-                }
-                do {
-                    stagedProv = try Data(contentsOf: url)
-                    provName = url.lastPathComponent
-                    message = "已选择描述文件"
-                } catch {
-                    message = "读取失败：\(error.localizedDescription)"
-                }
+            case .success(let url): stageCertFile(url)
             case .failure(let e):
                 message = "选择失败：\(e.localizedDescription)"
             }
         }
     }
 
-    private func applyCert() {
-        guard let p12 = stagedP12, let prov = stagedProv else {
-            message = "请先选择 p12 与 mobileprovision"
-            return
+    private func stageCertFile(_ url: URL) {
+        do {
+            let data = try Data(contentsOf: url)
+            let name = url.lastPathComponent
+            if Self.looksLikeProvisioning(data) {
+                stagedProv = data
+                provName = name
+                message = "已识别为描述文件：\(name)"
+            } else {
+                stagedP12 = data
+                p12Name = name
+                message = "已识别为证书：\(name)（\(data.count) 字节）"
+            }
+        } catch {
+            message = "读取失败：\(error.localizedDescription)"
         }
+    }
+
+    private static func looksLikeProvisioning(_ data: Data) -> Bool {
+        guard let s = String(data: data.prefix(1 << 20), encoding: .isoLatin1) else { return false }
+        if s.contains("mobileprovision") { return true }
+        if s.contains("<?xml"),
+           (s.contains("TeamIdentifier") || s.contains("ProvisionedDevices")
+            || s.contains("Entitlements") || s.contains("AppIDName")) { return true }
+        return false
+    }
+
+    private func applyCert() {
+        guard stagedP12 != nil else { message = "请先选择证书（p12 / pfx）"; return }
+        guard stagedProv != nil else { message = "请先选择描述文件（.mobileprovision）"; return }
+        let p12 = stagedP12!, prov = stagedProv!, pw = p12Password
         busy = true
         message = "正在导入证书…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let okP12 = CertificateStore.shared.importP12(p12, password: p12Password)
-            CertificateStore.shared.importProvisioning(prov)
+            let r12 = CertificateStore.shared.importP12(p12, password: pw)
+            let rpv = CertificateStore.shared.importProvisioning(prov)
             DispatchQueue.main.async {
-                busy = false
-                message = okP12
-                    ? "证书已就绪（p12 导入成功）"
-                    : "p12 导入失败：密码错误、文件损坏，或不是 PKCS#12 格式"
+                self.busy = false
+                switch r12 {
+                case .success:
+                    if case .failure(let m) = rpv {
+                        self.message = "证书已就绪，但描述文件有问题：\(m)"
+                    } else {
+                        self.message = "证书已就绪（p12 导入成功）"
+                    }
+                case .failure(let m):
+                    self.message = m
+                }
             }
         }
     }
 
     private func pickFirmware() {
-        // asCopy: false — read the 10 GB IPSW in place instead of duplicating
-        // it into our container.
-        DocPicker.present(asCopy: false) { result in
+        message = "正在打开文件选择器…"
+        // asCopy: TRUE is mandatory here. The open-in-place mode (asCopy:false)
+        // looks better for a 10 GB IPSW, but on iPadOS 27 beta the picker never
+        // delivers the selection, so the import silently stalls. The system
+        // copies the file into our container instead.
+        DocPicker.present(asCopy: true) { result in
             switch result {
             case .success(let url):
-                let ext = url.pathExtension.lowercased()
-                guard ext == "ryboxenv" || ext == "ipsw" else {
-                    fw.message = "请选择 .ryboxenv 或 .ipsw 文件（当前：\(url.lastPathComponent)）"
-                    fw.phase = .failed
-                    return
-                }
-                fw.ingest(url)
+                // No extension gate: FirmwareImporter decides by CONTENT
+                // (ryboxenv.json = env package, BuildManifest.plist = IPSW), so
+                // an unknown suffix can never make a file un-pickable.
+                self.fw.message = "已选择：\(url.lastPathComponent)"
+                self.fw.ingest(url)
             case .failure(let e):
-                fw.message = "选择失败：\(e.localizedDescription)"
-                fw.phase = .failed
+                self.fw.message = "选择失败：\(e.localizedDescription)"
+                self.fw.phase = .failed
             }
         }
     }
