@@ -1,31 +1,31 @@
 import SwiftUI
 
 /// Full-screen app page. Tapping a desktop/dock icon zooms this in over the
-/// SpringBoard; the floating liquid-glass Home key (SpringBoardView) stays
-/// above it, and the ✕ button in the nav bar closes the page.
+/// SpringBoard.
+///
+/// There is NO close button: the floating liquid-glass Home key rendered by
+/// SpringBoardView sits above this page and always returns home.
+///
+/// `onOpenItem` lets a page swap itself for another item (a folder opening one
+/// of its members, exactly like iOS). `onDismiss` closes the page from inside
+/// (a folder that just dissolved).
 struct FullScreenAppView: View {
     let item: DesktopItem
+    var onOpenItem: ((DesktopItem) -> Void)? = nil
+    var onDismiss: (() -> Void)? = nil
 
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle(item.name)
+                .navigationTitle(isFolder ? "" : item.name)
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button {
-                            NotificationCenter.default.post(
-                                name: SpringBoardController.goHomeNotification, object: nil)
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 27))
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
                 .toolbarBackground(.visible, for: .navigationBar)
         }
+    }
+
+    private var isFolder: Bool {
+        if case .folder = item.kind { return true }
+        return false
     }
 
     @ViewBuilder
@@ -41,6 +41,10 @@ struct FullScreenAppView: View {
             }
         case .guest(let app):
             GuestLaunchView(app: app)
+        case .folder(let f):
+            FolderView(folderID: f.id,
+                       onOpenMember: { member in onOpenItem?(member) },
+                       onDismiss: { onDismiss?() })
         }
     }
 }
@@ -64,6 +68,13 @@ struct GuestLaunchView: View {
             Text(app.bundleIdentifier)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
+            if let note = app.signNote {
+                Text("未签名：\(note)")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+            }
             Text(app.isGUI
                  ? "GUI App 将以 LiveContainer 模式在 RyBox 进程内启动。启动成功后本容器界面会被 guest 窗口接管，用悬浮「主屏」键返回。"
                  : "CLI 工具在微内核内以子进程运行，输出见「终端」。")
