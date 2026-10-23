@@ -1,0 +1,55 @@
+name: ota-build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -eo pipefail
+          xcodebuild -project RyBox.xcodeproj \
+            -scheme RyBox \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Locate built app
+        id: locate
+        run: |
+          set -eo pipefail
+          APP=$(find "$PWD/build" -name "RyBox.app" -type d | head -1)
+          if [ -z "$APP" ]; then echo "ERROR: RyBox.app not found"; exit 1; fi
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+          echo "found: $APP"
+
+      - name: Ad-hoc sign + package IPA
+        run: |
+          set -eo pipefail
+          APP="${{ steps.locate.outputs.app_path }}"
+          ENT="ContainerApp/ContainerApp.entitlements"
+          codesign --force --deep --sign - --entitlements "$ENT" "$APP"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -r "$APP" Payload/RyBox.app
+          zip -r RyBox.ipa Payload
+          ls -la RyBox.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RyBox.ipa
+          path: RyBox.ipa
