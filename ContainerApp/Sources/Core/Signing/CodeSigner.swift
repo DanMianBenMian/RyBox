@@ -111,7 +111,7 @@ public final class CodeSigner {
         var pid: pid_t = 0
         var fa: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&fa)
-        var a: [UnsafeMutablePointer<CChar>?] = ([[path] + args]).map { $0.withCString(strdup) }
+        var a: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { $0.withCString(strdup) }
         a.append(nil)
         var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { $0.withCString(strdup) }
         e.append(nil)
