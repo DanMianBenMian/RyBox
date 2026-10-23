@@ -1,0 +1,123 @@
+import Foundation
+import Compression
+
+/// Imports an .ipa: unzip -> parse Info.plist -> classify GUI vs CLI ->
+/// sign every Mach-O with the distribution cert -> register in the app library.
+public final class AppImporter: ObservableObject {
+    public static let shared = AppImporter()
+    private init() {}
+
+    @Published public private(set) var lastImported: ImportedApp?
+    @Published public private(set) var importedApps: [ImportedApp] = []
+
+    private let fm = FileManager.default
+
+    public enum ImportError: Error, LocalizedError {
+        case unzipFailed(Int32)
+        case noAppBundle
+        case plistMissing
+        case signFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .unzipFailed(let c): return "解压失败（unzip 退出码 \(c)）"
+            case .noAppBundle: return "IPA 内未找到 .app"
+            case .plistMissing: return "缺少 Info.plist"
+            case .signFailed(let m): return m
+            }
+        }
+    }
+
+    /// Import an .ipa from `url` (caller handles security-scoped access).
+    public func importApp(from url: URL) -> Result<ImportedApp, Error> {
+        let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        // 1) unzip via system unzip (present on iOS at /usr/bin/unzip)
+        let rc = runUnzip(archive: url.path, into: tmp.path)
+        guard rc == 0 else { return .failure(ImportError.unzipFailed(rc)) }
+
+        // 2) locate .app
+        let payload = tmp.appendingPathComponent("Payload")
+        guard let appName = try? fm.contentsOfDirectory(atPath: payload.path)?
+                .first(where: { $0.hasSuffix(".app") }),
+              let appURL = try? fm.contentsOfDirectory(at: payload, includingPropertiesForKeys: nil)
+                .first(where: { $0.lastPathComponent == appName }) else {
+            return .failure(ImportError.noAppBundle)
+        }
+
+        // 3) parse Info.plist
+        let plistURL = appURL.appendingPathComponent("Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                as? [String: Any],
+              let exe = plist["CFBundleExecutable"] as? String,
+              let bid = plist["CFBundleIdentifier"] as? String else {
+            return .failure(ImportError.plistMissing)
+        }
+
+        let isGUI = plist["UIApplicationSceneManifest"] != nil
+                   || plist["UILaunchStoryboardName"] != nil
+                   || plist["CFBundleIcons"] != nil
+
+        let displayName = (plist["CFBundleName"] as? String)
+                       ?? (plist["CFBundleDisplayName"] as? String)
+                       ?? (bid as NSString).lastPathComponent
+
+        let exePath = appURL.appendingPathComponent(exe).path
+
+        // Make sure the virtual root (incl. Apps/) exists.
+        VirtualRoot.shared.ensure()
+
+        // 4) sign (distribution cert) — signs the whole bundle in place,
+        //    embeds provisioning profile, derives entitlements.
+        switch CodeSigner.shared.sign(bundleAt: appURL.path) {
+        case .failure(let e): return .failure(ImportError.signFailed(e.localizedDescription))
+        case .success: break
+        }
+
+        // Ensure the main executable is marked executable (zip may drop the bit).
+        chmod(exePath, 0o755)
+
+        // 5) move into Documents/root/Apps/<bid>.app  (keep the .app extension
+        //    so dlopen / UIStoryboard / the signer resolve the bundle correctly)
+        let destRoot = VirtualRoot.shared.rootURL
+            .appendingPathComponent("Apps/\(bid).app")
+        try? fm.removeItem(at: destRoot)
+        try? fm.createDirectory(at: destRoot.deletingLastPathComponent(),
+                                withIntermediateDirectories: true)
+        try? fm.moveItem(at: appURL, to: destRoot)
+
+        let app = ImportedApp(name: displayName,
+                              bundleIdentifier: bid,
+                              executablePath: destRoot.appendingPathComponent(exe).path,
+                              isGUI: isGUI,
+                              containerPath: destRoot.path)
+
+        DispatchQueue.main.async {
+            self.lastImported = app
+            if !self.importedApps.contains(app) { self.importedApps.append(app) }
+        }
+        return .success(app)
+    }
+
+    private func runUnzip(archive: String, into dir: String) -> Int32 {
+        var pid: pid_t = 0
+        var fa: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fa)
+        let exe = "/usr/bin/unzip"
+        var a: [UnsafeMutablePointer<CChar>?] = [
+            strdup(exe), strdup("-o"), strdup("-q"),
+            strdup(archive), strdup("-d"), strdup(dir)
+        ]
+        a.append(nil)
+        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { strdup($0) }
+        e.append(nil)
+        let rc = posix_spawn(&pid, exe, &fa, nil, &a, &e)
+        a.forEach { free($0) }; e.forEach { free($0) }
+        posix_spawn_file_actions_destroy(&fa)
+        guard rc == 0 else { return rc }
+        var st: Int32 = 0
+        waitpid(pid, &st, 0)
+        return st
+    }
+}
