@@ -95,11 +95,16 @@ public final class AppImporter: ObservableObject {
                                 withIntermediateDirectories: true)
         try? fm.moveItem(at: appURL, to: destRoot)
 
+        // 5b) locate the app's icon so the SpringBoard can draw the real
+        //     artwork (and so themes can replace it by bundle id).
+        let iconPath = Self.extractIconPath(in: destRoot, plist: plist)
+
         let app = ImportedApp(name: displayName,
                               bundleIdentifier: bid,
                               executablePath: destRoot.appendingPathComponent(exe).path,
                               isGUI: isGUI,
                               containerPath: destRoot.path,
+                              iconPath: iconPath,
                               signNote: signNote)
 
         DispatchQueue.main.async {
@@ -119,6 +124,49 @@ public final class AppImporter: ObservableObject {
                 self.lastImported = nil
             }
         }
+    }
+
+    /// Find the bundle's icon PNG.
+    ///
+    /// `Assets.car` (the modern asset catalog) is not parseable here, so this
+    /// tries the classic keys first and then falls back to the largest PNG in
+    /// the bundle — which for a repacked IPA is virtually always the app icon.
+    static func extractIconPath(in bundle: URL, plist: [String: Any]) -> String? {
+        let fm = FileManager.default
+        var named: [String] = []
+        if let file = plist["CFBundleIconFile"] as? String { named.append(file) }
+        if let files = plist["CFBundleIconFiles"] as? [String] { named.append(contentsOf: files) }
+        if let primary = (plist["CFBundleIcons"] as? [String: Any])?["CFBundlePrimaryIcon"] as? [String: Any],
+           let files = primary["CFBundleIconFiles"] as? [String] { named.append(contentsOf: files) }
+
+        for n in named {
+            let base = (n as NSString).deletingPathExtension
+            for ext in ["png", "jpg"] {
+                for suffix in ["@3x", "@2x", ""] {
+                    let candidate = bundle.appendingPathComponent("\(base)\(suffix).\(ext)")
+                    if fm.fileExists(atPath: candidate.path) { return candidate.path }
+                }
+            }
+        }
+
+        // Fallback: the biggest PNG whose name mentions the icon, else the
+        // biggest PNG overall.
+        let pngs = (try? fm.subpathsOfDirectory(atPath: bundle.path))?
+            .filter { ($0 as NSString).pathExtension.lowercased() == "png" } ?? []
+        var best: String?
+        var bestSize: Int = -1
+        var genericBest: String?
+        var genericSize: Int = -1
+        for rel in pngs {
+            let full = bundle.appendingPathComponent(rel)
+            guard let size = (try? full.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { continue }
+            let lower = rel.lowercased()
+            if lower.contains("icon") || lower.contains("appicon") {
+                if size > bestSize { bestSize = size; best = full.path }
+            }
+            if size > genericSize { genericSize = size; genericBest = full.path }
+        }
+        return best ?? genericBest
     }
 
     private func runUnzip(archive: String, into dir: String) -> Int32 {
