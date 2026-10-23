@@ -25,6 +25,20 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Downgrade project format for the installed Xcode
+        # brew's xcodegen is always the newest release and writes objectVersion
+        # 77 (Xcode 16+), while this image ships Xcode 15.4 — which refuses the
+        # project with "future Xcode project file format (77)". Rewrite the two
+        # version keys to the Xcode 14/15 dialect instead of pinning an old
+        # xcodegen (whose archives are not fetchable from here).
+        run: |
+          set -eo pipefail
+          PBX=RyBox.xcodeproj/project.pbxproj
+          sed -i '' 's/objectVersion = .*;/objectVersion = 56;/' "$PBX"
+          sed -i '' 's/compatibilityVersion = .*;/compatibilityVersion = "Xcode 14.0";/' "$PBX"
+          grep -m1 "objectVersion" "$PBX"
+          grep -m1 "compatibilityVersion" "$PBX"
+
       - name: Build (unsigned)
         run: |
           set -eo pipefail
