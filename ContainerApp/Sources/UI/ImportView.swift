@@ -3,12 +3,13 @@ import UniformTypeIdentifiers
 
 /// The "导入 App" entry point inside the environment.
 ///
-/// Picker note: we accept `.item` (any file) instead of a custom
-/// UTType(filenameExtension: "ipa") — the dynamic type makes the Files picker
-/// show .ipa files as NON-selectable on some iOS builds (tap does nothing).
-/// We validate the extension + zip magic ourselves after selection.
+/// Picker note: we present a UIKit UIDocumentPickerViewController directly
+/// (DocPicker) with `.item` content types — the SwiftUI `.fileImporter`
+/// modifier opened the picker but never delivered selections on iPadOS 27
+/// beta, and a custom UTType(filenameExtension: "ipa") filter made .ipa files
+/// non-selectable in the Files app. We validate the extension + zip magic
+/// ourselves after selection.
 struct ImportView: View {
-    @State private var showPicker = false
     @State private var status: String = "尚未导入"
     @State private var busy = false
 
@@ -26,7 +27,7 @@ struct ImportView: View {
                 .padding(.horizontal)
 
             Button {
-                showPicker = true
+                pick()
             } label: {
                 if busy { ProgressView().padding(.horizontal) }
                 else { Text("选择 IPA 导入").bold() }
@@ -48,40 +49,53 @@ struct ImportView: View {
         }
         .padding()
         .navigationTitle("导入")
-        .fileImporter(isPresented: $showPicker,
-                      allowedContentTypes: [.item]) { result in
+    }
+
+    private func pick() {
+        status = "正在打开文件选择器…"
+        DocPicker.present { result in
             switch result {
             case .success(let url):
-                let ok = url.startAccessingSecurityScopedResource()
-                defer { if ok { url.stopAccessingSecurityScopedResource() } }
-
-                guard url.pathExtension.lowercased() == "ipa" else {
-                    status = "请选择 .ipa 文件（当前：\(url.lastPathComponent)）"
-                    return
-                }
-                // zip magic check — an IPA must be a zip archive.
-                if let fh = try? FileHandle(forReadingFrom: url),
-                   let magic = try? fh.read(upToCount: 2), magic != Data("PK".utf8) {
-                    status = "文件不是有效的 IPA（缺少 zip 头）"
-                    return
-                }
-
-                busy = true
-                status = "导入中…"
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let r = AppImporter.shared.importApp(from: url)
-                    DispatchQueue.main.async {
-                        busy = false
-                        switch r {
-                        case .success(let app):
-                            status = "成功：\(app.name)（\(app.isGUI ? "GUI" : "CLI")），已添加到桌面"
-                        case .failure(let e):
-                            status = "失败：\(e.localizedDescription)"
-                        }
-                    }
-                }
+                status = "已选择：\(url.lastPathComponent)"
+                handlePicked(url)
             case .failure(let e):
                 status = "选择失败：\(e.localizedDescription)"
+            }
+        }
+    }
+
+    private func handlePicked(_ url: URL) {
+        guard url.pathExtension.lowercased() == "ipa" else {
+            status = "请选择 .ipa 文件（当前：\(url.lastPathComponent)）"
+            return
+        }
+        // asCopy gives a local tmp URL — copy to a stable path before importing.
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("import-\(UUID().uuidString).ipa")
+        do {
+            let data = try Data(contentsOf: url)
+            if data.count < 4 || data.prefix(2) != Data("PK".utf8) {
+                status = "文件不是有效的 IPA（缺少 zip 头）"
+                return
+            }
+            try data.write(to: dst)
+        } catch {
+            status = "读取文件失败：\(error.localizedDescription)"
+            return
+        }
+
+        busy = true
+        status = "导入中…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = AppImporter.shared.importApp(from: dst)
+            DispatchQueue.main.async {
+                busy = false
+                switch r {
+                case .success(let app):
+                    status = "成功：\(app.name)（\(app.isGUI ? "GUI" : "CLI")），已添加到桌面"
+                case .failure(let e):
+                    status = "失败：\(e.localizedDescription)"
+                }
             }
         }
     }
