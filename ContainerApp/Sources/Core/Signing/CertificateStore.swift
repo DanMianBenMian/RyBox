@@ -1,6 +1,18 @@
 import Foundation
 import Security
 
+/// `Result`'s Failure must conform to `Error`, but every failure in this module
+/// is just a sentence for the user. This wrapper keeps `Result<Void,
+/// RyMessageError>` type-correct while still allowing `.failure("…")` — a bare
+/// `String` would not compile here.
+struct RyMessageError: LocalizedError, ExpressibleByStringLiteral {
+    let message: String
+    init(_ message: String) { self.message = message }
+    init(stringLiteral value: String) { self.message = value }
+    var errorDescription: String? { message }
+    var localizedDescription: String { message }
+}
+
 /// Holds the user-imported signing identity + provisioning profile.
 /// Supports BOTH development and DISTRIBUTION certificates (Ad Hoc / Enterprise).
 /// Distribution certs lack get-task-allow (no JIT) — acceptable for a runtime env.
@@ -34,7 +46,7 @@ public final class CertificateStore: ObservableObject {
     ///     that iOS's SecPKCS12Import cannot read at all.
     /// The empty passphrase is tried as a fallback because a lot of
     /// distribution p12 files simply have none.
-    public func importP12(_ data: Data, password: String) -> Result<Void, String> {
+    public func importP12(_ data: Data, password: String) -> Result<Void, RyMessageError> {
         guard !data.isEmpty else { return .failure("文件是空的（0 字节）") }
 
         var candidates = [password]
@@ -54,14 +66,14 @@ public final class CertificateStore: ObservableObject {
             guard let items = items,
                   let first = (items as NSArray).firstObject as? NSDictionary,
                   let raw = first[kSecImportItemIdentity as String] else {
-                lastStatus = errSecInvalidCertificate
+                lastStatus = errSecParam
                 continue
             }
             // A conditional downcast to a CoreFoundation type always
             // "succeeds", so Swift rejects `as? SecIdentity`. Verify the type
             // ID instead, then bridge — that actually catches a malformed p12.
             guard CFGetTypeID(raw as CFTypeRef) == SecIdentityGetTypeID() else {
-                lastStatus = errSecInvalidCertificate
+                lastStatus = errSecParam
                 continue
             }
             self.identity = (raw as! SecIdentity)
@@ -89,15 +101,15 @@ public final class CertificateStore: ObservableObject {
                 refresh()
                 return .success(())
             case .failure(let m):
-                if lastFallback.isEmpty { lastFallback = m }
+                if lastFallback.isEmpty { lastFallback = m.message }
             }
         }
         // Prefer the built-in decoder's reason: it knows far more about the
         // actual bytes than a bare OSStatus does.
         let fallbackHint = lastFallback.isEmpty
             ? "" : "\n（RyBox 内置解码器：\(lastFallback)）"
-        return .failure(Self.diagnoseP12(data, status: lastStatus,
-                                         password: password) + fallbackHint)
+        return .failure(RyMessageError(Self.diagnoseP12(data, status: lastStatus,
+                                         password: password) + fallbackHint))
     }
 
     private static func describe(identity: SecIdentity?) -> String {
@@ -110,7 +122,7 @@ public final class CertificateStore: ObservableObject {
     }
 
     /// Import a .mobileprovision (embedded entitlements are read from it).
-    public func importProvisioning(_ data: Data) -> Result<Void, String> {
+    public func importProvisioning(_ data: Data) -> Result<Void, RyMessageError> {
         guard !data.isEmpty else { return .failure("文件是空的（0 字节）") }
         self.provisioningData = data
         guard let plist = provisioningPlist() else {
