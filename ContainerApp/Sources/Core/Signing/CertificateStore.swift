@@ -26,9 +26,14 @@ public final class CertificateStore: ObservableObject {
 
         let arr = items as NSArray
         guard let first = arr.firstObject as? NSDictionary,
-              let ident = first[kSecImportItemIdentity as String] as? SecIdentity else {
+              let raw = first[kSecImportItemIdentity as String] else {
             return false
         }
+        // A conditional downcast to a CoreFoundation type always "succeeds", so
+        // Swift rejects `as? SecIdentity`. Verify the type ID instead, then
+        // bridge — that actually catches a malformed p12.
+        guard CFGetTypeID(raw as CFTypeRef) == SecIdentityGetTypeID() else { return false }
+        let ident = raw as! SecIdentity
         self.identity = ident
         self.p12Data = data
         self.p12Password = password
