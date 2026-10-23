@@ -80,9 +80,10 @@ struct BootGateView: View {
             SecureField("p12 密码（可为空）", text: $p12Password)
                 .textFieldStyle(.roundedBorder)
             row(title: "描述文件（.mobileprovision）", value: provName) { pickProv() }
-            Text("两栏都能选任意文件，RyBox 按内容自动判断它是证书还是描述文件。")
+            Text("两栏都能选任意文件，RyBox 按内容自动判断它是证书还是描述文件。支持 OpenSSL 3 新式加密的 p12（PBES2 / AES-256-CBC），密码可为空。")
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.6))
+                .fixedSize(horizontal: false, vertical: true)
 
             Button {
                 applyCert()
@@ -101,6 +102,12 @@ struct BootGateView: View {
                       systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.footnote)
+                if let info = cert.certificateInfo {
+                    Text(info)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             if !message.isEmpty {
                 Text(message)
