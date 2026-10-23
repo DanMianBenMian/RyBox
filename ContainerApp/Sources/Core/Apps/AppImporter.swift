@@ -72,9 +72,15 @@ public final class AppImporter: ObservableObject {
 
         // 4) sign (distribution cert) — signs the whole bundle in place,
         //    embeds provisioning profile, derives entitlements.
-        switch CodeSigner.shared.sign(bundleAt: appURL.path) {
-        case .failure(let e): return .failure(ImportError.signFailed(e.localizedDescription))
-        case .success: break
+        //
+        //    If the on-device signer is unavailable we still register the app:
+        //    it shows up on the desktop and can be inspected, and the launcher
+        //    states plainly that AMFI may refuse to run it. (iOS has no public
+        //    API to re-sign a Mach-O, so RyBox needs the bundled "codesign"
+        //    helper for this step — see codesign-helper-README.txt.)
+        var signNote: String?
+        if case .failure(let e) = CodeSigner.shared.sign(bundleAt: appURL.path) {
+            signNote = e.localizedDescription
         }
 
         // Ensure the main executable is marked executable (zip may drop the bit).
@@ -93,7 +99,8 @@ public final class AppImporter: ObservableObject {
                               bundleIdentifier: bid,
                               executablePath: destRoot.appendingPathComponent(exe).path,
                               isGUI: isGUI,
-                              containerPath: destRoot.path)
+                              containerPath: destRoot.path,
+                              signNote: signNote)
 
         DispatchQueue.main.async {
             self.lastImported = app
