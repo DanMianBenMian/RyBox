@@ -1,5 +1,19 @@
 import UIKit
 
+/// A transparent, full-screen container view that ONLY lets its own subviews
+/// (the Home button / eject button) receive touches; every other touch passes
+/// THROUGH to the window(s) beneath. Without this, a full-screen overlay window
+/// at a high window level swallows ALL taps and the UI below (SpringBoard,
+/// sheets, document pickers, file-system navigation, guest UI) goes dead.
+final class PassThroughView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        // If the only thing hit is this transparent container itself, let the
+        // touch fall through to windows below.
+        return (hit === self) ? nil : hit
+    }
+}
+
 /// A floating "virtual Home button" that stays ABOVE both the container UI and
 /// any in-process guest window. Tapping it returns to the SpringBoard
 /// (SpringBoardController.goHome) without terminating the process.
@@ -21,6 +35,7 @@ final class HomeButtonWindow {
         win.isUserInteractionEnabled = true
 
         let vc = UIViewController()
+        vc.view = PassThroughView()   // only the Home button is tappable; the rest passes through
         vc.view.backgroundColor = .clear
 
         let isIPad = UITraitCollection.current.horizontalSizeClass == .regular
