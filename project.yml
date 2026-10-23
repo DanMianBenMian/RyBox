@@ -44,6 +44,7 @@ targets:
       - path: ContainerApp/Sources
         # litehook.c / litehook.h are vendored here (MIT, single-file), so no
         # external submodule or -lchoma link is needed for this build.
-    entitlements: ContainerApp/ContainerApp.entitlements
+    entitlements:
+      path: ContainerApp/ContainerApp.entitlements
     dependencies: []
     postCompileScripts: []
