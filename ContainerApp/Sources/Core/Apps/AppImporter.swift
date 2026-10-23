@@ -17,7 +17,7 @@ public final class AppImporter: ObservableObject {
         case noAppBundle
         case plistMissing
         case signFailed(String)
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self {
             case .unzipFailed(let c): return "解压失败（unzip 退出码 \(c)）"
             case .noAppBundle: return "IPA 内未找到 .app"
@@ -38,9 +38,11 @@ public final class AppImporter: ObservableObject {
 
         // 2) locate .app
         let payload = tmp.appendingPathComponent("Payload")
-        guard let appName = try? fm.contentsOfDirectory(atPath: payload.path)?
-                .first(where: { $0.hasSuffix(".app") }),
-              let appURL = try? fm.contentsOfDirectory(at: payload, includingPropertiesForKeys: nil)
+        let appNames = (try? fm.contentsOfDirectory(atPath: payload.path)) ?? []
+        guard let appName = appNames.first(where: { $0.hasSuffix(".app") }) else {
+            return .failure(ImportError.noAppBundle)
+        }
+        guard let appURL = (try? fm.contentsOfDirectory(at: payload, includingPropertiesForKeys: nil))?
                 .first(where: { $0.lastPathComponent == appName }) else {
             return .failure(ImportError.noAppBundle)
         }
@@ -110,7 +112,7 @@ public final class AppImporter: ObservableObject {
             strdup(archive), strdup("-d"), strdup(dir)
         ]
         a.append(nil)
-        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { strdup($0) }
+        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { $0.withCString(strdup) }
         e.append(nil)
         let rc = posix_spawn(&pid, exe, &fa, nil, &a, &e)
         a.forEach { free($0) }; e.forEach { free($0) }
