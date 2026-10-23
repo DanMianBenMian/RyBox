@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unsigned / ad-hoc build: get-task-allow lets a free Apple ID sideload + debug. -->
+    <key>get-task-allow</key>
+    <true/>
+</dict>
+</plist>
