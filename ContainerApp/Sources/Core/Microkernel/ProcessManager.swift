@@ -40,15 +40,16 @@ public final class ProcessManager: ObservableObject {
         var pid: pid_t = 0
         var fileActions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&fileActions)
-        guard let fileActions = fileActions else { return nil }
+        guard fileActions != nil else { return nil }
+        var fa: posix_spawn_file_actions_t = fileActions!
 
         var outPipe: [Int32] = [0, 0]
         if captureOutput {
             pipe(&outPipe)
-            posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], 1)
-            posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], 2)
-            posix_spawn_file_actions_addclose(&fileActions, outPipe[0])
-            posix_spawn_file_actions_addclose(&fileActions, outPipe[1])
+            posix_spawn_file_actions_adddup2(&fa, outPipe[1], 1)
+            posix_spawn_file_actions_adddup2(&fa, outPipe[1], 2)
+            posix_spawn_file_actions_addclose(&fa, outPipe[0])
+            posix_spawn_file_actions_addclose(&fa, outPipe[1])
         }
 
         var argsC: [UnsafeMutablePointer<CChar>?] =
@@ -68,10 +69,10 @@ public final class ProcessManager: ObservableObject {
         if let wd = workingDirectory, !wd.isEmpty { envC.append(strdup("PWD=\(wd)")) }
         envC.append(nil)
 
-        let rc = posix_spawn(&pid, path, &fileActions, nil, &argsC, &envC)
+        let rc = posix_spawn(&pid, path, &fa, nil, &argsC, &envC)
         argsC.forEach { free($0) }
         envC.forEach { free($0) }
-        posix_spawn_file_actions_destroy(&fileActions)
+        posix_spawn_file_actions_destroy(&fa)
 
         guard rc == 0 else { return nil }
 
