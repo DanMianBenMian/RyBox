@@ -14,7 +14,13 @@ public final class VirtualRoot {
 
     public func ensure() {
         let fm = FileManager.default
-        for sub in ["bin", "usr", "var", "Apps", "Library", "tmp"] {
+        // Library/Themes is where theming engines look for packages, so it has
+        // to exist before the first scan — otherwise a user dropping a theme in
+        // through Files would have nowhere to put it.
+        for sub in ["bin", "usr", "var", "Apps", "Library", "tmp",
+                    "Library/Themes", "Library/Caches",
+                    "Library/MobileSubstrate/DynamicLibraries",
+                    "var/mobile/Library/Preferences"] {
             try? fm.createDirectory(at: rootURL.appendingPathComponent(sub),
                                     withIntermediateDirectories: true)
         }
