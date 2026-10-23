@@ -2,3 +2,4 @@
 #import "RyMachOPatcher.h"
 #import "RyDyldHooks.h"
 #import "RyUnzip.h"
+#import "RyP12Crypto.h"
