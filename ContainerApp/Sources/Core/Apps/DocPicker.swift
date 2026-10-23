@@ -21,14 +21,16 @@ enum DocPicker {
         case unreadable(String)
         public var errorDescription: String? {
             switch self {
-            case noHost: return "找不到可用的视图控制器来打开文件选择器"
-            case unreadable(let n): return "无法读取所选文件：\(n)"
+            case .noHost: return "找不到可用的视图控制器来打开文件选择器"
+            case .unreadable(let n): return "无法读取所选文件：\(n)"
             }
         }
     }
 
     /// Strong ref: UIDocumentPickerViewController holds its delegate WEAKLY.
-    private static var retainedDelegate: PickerDelegate?
+    /// `fileprivate` (not `private`) so PickerDelegate can release it from
+    /// its own callbacks.
+    fileprivate static var retainedDelegate: PickerDelegate?
 
     /// Present the picker. `completion` runs on the main thread.
     /// - Parameter asCopy: true = import a copy (small files); false = open the
