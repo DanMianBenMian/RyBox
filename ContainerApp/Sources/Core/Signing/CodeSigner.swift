@@ -20,7 +20,7 @@ public final class CodeSigner {
         case helperMissing
         case stageFailed
         case signFailed(Int32, String)
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self {
             case .notConfigured:
                 return "未配置证书（请先在「设置」导入 p12 + mobileprovision）"
@@ -111,9 +111,9 @@ public final class CodeSigner {
         var pid: pid_t = 0
         var fa: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&fa)
-        var a: [UnsafeMutablePointer<CChar>?] = ([[path] + args]).map { strdup($0) }
+        var a: [UnsafeMutablePointer<CChar>?] = ([[path] + args]).map { $0.withCString(strdup) }
         a.append(nil)
-        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { strdup($0) }
+        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { $0.withCString(strdup) }
         e.append(nil)
         let rc = posix_spawn(&pid, path, &fa, nil, &a, &e)
         a.forEach { free($0) }; e.forEach { free($0) }
@@ -121,7 +121,7 @@ public final class CodeSigner {
         guard rc == 0 else { return rc }
         var st: Int32 = 0
         waitpid(pid, &st, 0)
-        if WIFEXITED(st) { return Int32(WEXITSTATUS(st)) }
-        return -1
+        let exited = (st & 0x7f) == 0
+        return exited ? Int32((st >> 8) & 0xff) : -1
     }
 }
