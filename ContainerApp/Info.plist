@@ -46,6 +46,24 @@
                 <array><string>ipa</string></array>
             </dict>
         </dict>
+        <!-- RyBox system-environment package (built on a computer with
+             tools/build_ryboxenv.py). Declaring it here means the Files app
+             shows it as a known archive type instead of an opaque blob.
+             NOTE: pickers still filter with UTType.item only — filtering by a
+             custom UTI makes files unselectable on iPadOS 27 beta. -->
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.rybox.ryboxenv</string>
+            <key>UTTypeDescription</key>
+            <string>RyBox System Environment</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.zip-archive</string><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>ryboxenv</string></array>
+            </dict>
+        </dict>
     </array>
     <key>CFBundleURLTypes</key>
     <array>
