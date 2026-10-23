@@ -14,8 +14,9 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         VirtualRoot.shared.ensure()
         Task { await RuntimeEnvironment.shared.detect() }
-        // Install the preinstalled Sileo IPA (idempotent; honest failure state).
-        PreinstalledStore.shared.bootstrapIfNeeded()
+        // NOTE: Sileo is NO LONGER installed here. It now runs from the boot
+        // gate / ContentView once a certificate is configured, so it gets
+        // signed with the user's identity instead of staying unsigned forever.
 
         let content = ContentView().environmentObject(RuntimeEnvironment.shared)
         let vc = UIHostingController(rootView: content)
