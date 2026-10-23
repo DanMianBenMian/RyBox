@@ -17,7 +17,7 @@ public final class RyLaunchCoordinator: ObservableObject {
 
     public enum LaunchError: Error, LocalizedError {
         case guestNotFound
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self { case .guestNotFound: return "找不到 guest App" }
         }
     }
