@@ -38,7 +38,7 @@ enum RyP12 {
 
     /// Decode one p12 with ONE candidate passphrase.
     /// Returns .failure with a reason that is shown to the user as-is.
-    static func decode(_ data: Data, password: String) -> Result<Outcome, String> {
+    static func decode(_ data: Data, password: String) -> Result<Outcome, RyMessageError> {
         let a = ASN1(data)
         guard let pfx = a.at(0) else {
             return .failure("文件无法按 DER 解析（不是 p12/pfx）")
