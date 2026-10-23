@@ -38,8 +38,9 @@ public final class ProcessManager: ObservableObject {
                              environment: environment)
 
         var pid: pid_t = 0
-        var fileActions = posix_spawn_file_actions_t()
+        var fileActions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&fileActions)
+        guard let fileActions = fileActions else { return nil }
 
         var outPipe: [Int32] = [0, 0]
         if captureOutput {
@@ -51,7 +52,7 @@ public final class ProcessManager: ObservableObject {
         }
 
         var argsC: [UnsafeMutablePointer<CChar>?] =
-            ([[path] + arguments]).map { $0.withCString(strdup) }
+            ([path] + arguments).map { $0.withCString(strdup) }
         argsC.append(nil)
 
         var envC: [UnsafeMutablePointer<CChar>?] = []
