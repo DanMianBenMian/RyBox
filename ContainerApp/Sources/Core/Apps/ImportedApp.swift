@@ -10,6 +10,9 @@ public struct ImportedApp: Identifiable, Hashable {
     /// false = CLI tool / daemon run inside the microkernel.
     public let isGUI: Bool
     public let containerPath: String
+    /// Path to the app's own icon PNG inside the bundle (nil when the bundle
+    /// carries none). Themes override this at render time via ThemeEngine.
+    public let iconPath: String?
     /// Why this app could NOT be re-signed with the user's cert (nil = signed).
     /// The app is still registered and browsable; launching it may be refused
     /// by AMFI until a signing helper ships inside the bundle.
