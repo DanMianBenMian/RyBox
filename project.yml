@@ -1,0 +1,49 @@
+# XcodeGen spec — generates RyBox.xcodeproj
+# RyBox = self-contained iOS microkernel container (LiveContainer in-process GUI model).
+#
+# Build layout: this project.yml lives at the Xcode project root; the app sources
+# live in the ContainerApp/ subfolder (standard Xcode grouping), so all source
+# paths are relative to this file's directory.
+name: RyBox
+options:
+  bundleIdPrefix: com.rybox
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    ENABLE_BITCODE: false
+    VALID_ARCHS: "arm64"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # JAILED flag drives dual-mode compile: set to empty for a jailbroken build.
+    OTHER_SWIFT_FLAGS: "-DJAILED"
+    # ---- Unsigned cloud build (GitHub Actions macos runner; ad-hoc re-sign) ----
+    CODE_SIGN_STYLE: "Automatic"
+    CODE_SIGNING_ALLOWED: "NO"
+    # iPhone + iPad (the user explicitly wants the iPad layout).
+    TARGETED_DEVICE_FAMILY: "1,2"
+    # ---- Hand-maintained Info.plist (route A) ----
+    # Do NOT declare an `info:` block: XcodeGen rewrites that file on every
+    # `generate`, silently dropping our custom keys (URL scheme, UILaunchScreen,
+    # UTImportedTypeDeclarations…) while the build still succeeds. Instead point
+    # INFOPLIST_FILE here and disable the auto generator.
+    INFOPLIST_FILE: "ContainerApp/Info.plist"
+    GENERATE_INFOPLIST_FILE: "NO"
+    # C/ObjC guest-loader bridging header (exposes RyMachOPatcher / RyDyldHooks).
+    SWIFT_OBJC_BRIDGING_HEADER: "ContainerApp/Sources/Core/GuestLoader/RyBox-Bridging-Header.h"
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+targets:
+  RyBox:
+    type: application
+    platform: iOS
+    sources:
+      - path: ContainerApp/Sources
+        # litehook.c / litehook.h are vendored here (MIT, single-file), so no
+        # external submodule or -lchoma link is needed for this build.
+    entitlements: ContainerApp/ContainerApp.entitlements
+    dependencies: []
+    postCompileScripts: []
