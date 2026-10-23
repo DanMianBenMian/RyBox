@@ -26,7 +26,7 @@ public final class CertificateStore: ObservableObject {
 
         let arr = items as NSArray
         guard let first = arr.firstObject as? NSDictionary,
-              let ident = first[kSecImportItemIdentity as String] as! SecIdentity? else {
+              let ident = first[kSecImportItemIdentity as String] as? SecIdentity else {
             return false
         }
         self.identity = ident
