@@ -301,12 +301,12 @@ struct BootGateView: View {
                 switch r12 {
                 case .success:
                     if case .failure(let m) = rpv {
-                        self.message = "证书已就绪，但描述文件有问题：\(m)"
+                        self.message = "证书已就绪，但描述文件有问题：\(m.message)"
                     } else {
                         self.message = "证书已就绪（p12 导入成功）"
                     }
                 case .failure(let m):
-                    self.message = m
+                    self.message = m.message
                 }
             }
         }
