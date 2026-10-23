@@ -312,10 +312,10 @@ struct SettingsView: View {
             case .success:
                 message = "配置成功：证书 + 描述文件已就绪"
             case .failure(let m):
-                message = "证书已就绪，但描述文件有问题：\(m)"
+                message = "证书已就绪，但描述文件有问题：\(m.message)"
             }
         case .failure(let m):
-            message = m      // detailed diagnosis (key-only cert / PEM / OpenSSL 3 p12 / wrong password)
+            message = m.message      // detailed diagnosis (key-only cert / PEM / OpenSSL 3 p12 / wrong password)
         }
     }
 }
