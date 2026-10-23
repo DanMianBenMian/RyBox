@@ -38,25 +38,20 @@ public final class ProcessManager: ObservableObject {
                              environment: environment)
 
         var pid: pid_t = 0
-        var fileActions: posix_spawn_file_actions_t?
+        var fileActions = posix_spawn_file_actions_t()
         posix_spawn_file_actions_init(&fileActions)
-
-        // Optional working directory for the child (iOS 13+).
-        if let wd = workingDirectory, #available(iOS 13.0, *) {
-            posix_spawn_file_actions_addchdir_np(&fileActions, wd)
-        }
 
         var outPipe: [Int32] = [0, 0]
         if captureOutput {
             pipe(&outPipe)
-            posix_spawn_file_actions_adddup2(fileActions, outPipe[1], 1)
-            posix_spawn_file_actions_adddup2(fileActions, outPipe[1], 2)
-            posix_spawn_file_actions_addclose(fileActions, outPipe[0])
-            posix_spawn_file_actions_addclose(fileActions, outPipe[1])
+            posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], 1)
+            posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], 2)
+            posix_spawn_file_actions_addclose(&fileActions, outPipe[0])
+            posix_spawn_file_actions_addclose(&fileActions, outPipe[1])
         }
 
         var argsC: [UnsafeMutablePointer<CChar>?] =
-            ([[path] + arguments]).map { strdup($0) }
+            ([[path] + arguments]).map { $0.withCString(strdup) }
         argsC.append(nil)
 
         var envC: [UnsafeMutablePointer<CChar>?] = []
@@ -67,6 +62,9 @@ public final class ProcessManager: ObservableObject {
         }
         // Only append a default PATH if the caller didn't supply one.
         if !sawPath { envC.append(strdup("PATH=/usr/bin:/bin")) }
+        // iOS has no posix_spawn_file_actions_addchdir_np; approximate the child
+        // working directory by exporting PWD (honored by most CLI tools).
+        if let wd = workingDirectory, !wd.isEmpty { envC.append(strdup("PWD=\(wd)")) }
         envC.append(nil)
 
         let rc = posix_spawn(&pid, path, &fileActions, nil, &argsC, &envC)
