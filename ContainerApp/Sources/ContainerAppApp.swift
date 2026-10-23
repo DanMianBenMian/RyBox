@@ -14,6 +14,8 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         VirtualRoot.shared.ensure()
         Task { await RuntimeEnvironment.shared.detect() }
+        // Install the preinstalled Sileo IPA (idempotent; honest failure state).
+        PreinstalledStore.shared.bootstrapIfNeeded()
 
         let content = ContentView().environmentObject(RuntimeEnvironment.shared)
         let vc = UIHostingController(rootView: content)
