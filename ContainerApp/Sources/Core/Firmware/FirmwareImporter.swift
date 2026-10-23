@@ -210,6 +210,11 @@ final class FirmwareImporter: ObservableObject {
             self.message = Self.summary(rep)
         }
         try? fm.removeItem(at: tmp)
+        // The picker hands us a COPY inside our own container (asCopy: true).
+        // Once the tree is extracted that copy is dead weight — a .ryboxenv can
+        // be hundreds of MB — so drop it. Never touch anything outside tmp.
+        let tmpRoot = fm.temporaryDirectory.path
+        if url.path.hasPrefix(tmpRoot) { try? fm.removeItem(at: url) }
     }
 
     // MARK: - Helpers
