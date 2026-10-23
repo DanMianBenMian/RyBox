@@ -38,7 +38,7 @@ enum RyBoxGuestBundle {
 /// Swizzle +[NSBundle mainBundle] so the guest's Info.plist / resources are used
 /// while RyBox is running AS the guest. This is the core LiveContainer trick:
 /// the guest believes it is the main app.
-private enum GuestBundleOverride {
+@objc private final class GuestBundleOverride {
     static var overriddenURL: URL?
 
     static func set(_ url: URL) {
@@ -47,15 +47,15 @@ private enum GuestBundleOverride {
     }
 
     private static func swizzle() {
-        guard let original = class_getClassMethod(NSBundle.self, #selector(getter: NSBundle.main)),
-              let replacement = class_getClassMethod(Self.self, #selector(guestMain)) else { return }
+        guard let original = class_getClassMethod(Bundle.self, #selector(getter: Bundle.main)),
+              let replacement = class_getClassMethod(GuestBundleOverride.self, #selector(guestMain)) else { return }
         method_exchangeImplementations(original, replacement)
     }
 
-    @objc static func guestMain() -> NSBundle {
-        if let u = overriddenURL, let b = NSBundle(url: u) {
+    @objc static func guestMain() -> Bundle {
+        if let u = overriddenURL, let b = Bundle(url: u) {
             return b
         }
-        return NSBundle.main
+        return Bundle.main
     }
 }
