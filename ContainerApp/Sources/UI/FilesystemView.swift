@@ -144,7 +144,7 @@ struct FilePreviewSheet: View {
         if let s = String(data: data, encoding: .utf8) {
             text = s
         } else {
-            text = "二进制文件（\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)））"
+            text = "二进制文件（\(ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file))）"
         }
     }
 }
