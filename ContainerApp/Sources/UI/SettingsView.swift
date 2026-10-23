@@ -17,6 +17,7 @@ struct SettingsView: View {
     @ObservedObject private var store = CertificateStore.shared
     @ObservedObject private var desktop = DesktopStore.shared
     @ObservedObject private var firm = FirmwareImporter.shared
+    @ObservedObject private var theme = ThemeEngine.shared
     @EnvironmentObject private var env: RuntimeEnvironment
 
     var body: some View {
@@ -24,6 +25,7 @@ struct SettingsView: View {
             signingSection
             firmwareSection
             desktopSection
+            themeSection
             aboutSection
         }
         .navigationTitle("设置")
@@ -208,6 +210,79 @@ struct SettingsView: View {
             Text("桌面与 Dock")
         } footer: {
             Text("长按桌面空白处进入编辑模式：拖动调整位置、两个应用叠放建文件夹、拖到 Dock 添加、点 − 删除。长按应用图标可打开菜单。")
+        }
+    }
+
+    // MARK: 主题（/Library/Themes）
+
+    private var themeSection: some View {
+        Section {
+            if theme.themes.isEmpty {
+                Text("还没有主题。把 .theme 目录或主题 zip 放进 /Library/Themes，或在下面导入。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(theme.themes) { t in
+                    HStack(spacing: 10) {
+                        Image(systemName: theme.isEnabled(t.id)
+                              ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(theme.isEnabled(t.id) ? .green : .secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(t.name).font(.system(size: 15))
+                            if let a = t.author {
+                                Text(a).font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if let img = theme.icon(forBundleID: "com.rybox.sileo"),
+                           theme.isEnabled(t.id) {
+                            Image(uiImage: img)
+                                .resizable()
+                                .frame(width: 26, height: 26)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { theme.setEnabled(t.id, enabled: !theme.isEnabled(t.id)) }
+                }
+            }
+
+            Button { pickTheme() } label: {
+                Label("导入主题（zip）", systemImage: "square.and.arrow.down.on.square")
+            }
+
+            Button {
+                SpringBoardController.shared.reloadLibrary()
+                message = "资源库已刷新"
+            } label: {
+                Label("注销资源库", systemImage: "arrow.triangle.2.circlepath")
+            }
+
+            Button(role: .destructive) {
+                SpringBoardController.shared.respring()
+                message = "正在注销 SpringBoard…"
+            } label: {
+                Label("注销 SpringBoard", systemImage: "power")
+            }
+        } header: {
+            Text("主题与资源库")
+        } footer: {
+            Text("主题格式与 WinterBoard / SnowBoard 一致：IconBundles/<bundle id>.png、Bundles/<bundle id>/、UIImages/（DockBackground、FolderBackground…）、HomeWallpaper.png、LockWallpaper.png。多个主题可叠加，越靠后优先级越高。「注销资源库」重新扫描并清空图标缓存，「注销 SpringBoard」则会像真机注销一样重建外壳并回到锁屏。")
+        }
+    }
+
+    private func pickTheme() {
+        message = "正在打开文件选择器…"
+        DocPicker.present { result in
+            switch result {
+            case .success(let url):
+                switch ThemeEngine.shared.importTheme(from: url) {
+                case .success(let t): message = "已导入并启用主题：\(t.name)"
+                case .failure(let e): message = "主题导入失败：\(e.localizedDescription)"
+                }
+            case .failure(let e):
+                message = "选择失败：\(e.localizedDescription)"
+            }
         }
     }
 
