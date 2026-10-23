@@ -17,38 +17,97 @@ public final class CertificateStore: ObservableObject {
     /// Team id extracted from the provisioning profile (e.g. "ABCDE12345").
     @Published public private(set) var teamIdentifier: String?
 
-    /// Import a .p12 (distribution or development) using its password.
-    public func importP12(_ data: Data, password: String) -> Bool {
-        let opts = [kSecImportExportPassphrase as String: password] as CFDictionary
-        var items: CFArray?
-        let status = SecPKCS12Import(data as CFData, opts, &items)
-        guard status == errSecSuccess, let items = items else { return false }
+    /// Import a .p12 / .pfx (distribution or development) using its password.
+    ///
+    /// Real-world certificate files fail here for three very different reasons,
+    /// so the failure is diagnosed instead of just returning false:
+    ///   * the user has a .cer (public cert only — no private key),
+    ///   * the file is PEM text instead of DER,
+    ///   * the p12 uses the modern OpenSSL 3 encryption (AES-256-CBC + PBKDF2)
+    ///     that iOS's SecPKCS12Import cannot read at all.
+    /// The empty passphrase is tried as a fallback because a lot of
+    /// distribution p12 files simply have none.
+    public func importP12(_ data: Data, password: String) -> Result<Void, String> {
+        guard !data.isEmpty else { return .failure("文件是空的（0 字节）") }
 
-        let arr = items as NSArray
-        guard let first = arr.firstObject as? NSDictionary,
-              let raw = first[kSecImportItemIdentity as String] else {
-            return false
+        var candidates = [password]
+        if !password.isEmpty { candidates.append("") }
+        if password.isEmpty { candidates.append("") }
+        candidates = Array(NSOrderedSet(array: candidates).array.compactMap { $0 as? String })
+
+        var lastStatus: OSStatus = errSecSuccess
+        for pw in candidates {
+            let opts = [kSecImportExportPassphrase as String: pw] as CFDictionary
+            var items: CFArray?
+            let status = SecPKCS12Import(data as CFData, opts, &items)
+            if status != errSecSuccess {
+                lastStatus = status
+                continue
+            }
+            guard let items = items,
+                  let first = (items as NSArray).firstObject as? NSDictionary,
+                  let raw = first[kSecImportItemIdentity as String] else {
+                lastStatus = errSecInvalidCertificate
+                continue
+            }
+            // A conditional downcast to a CoreFoundation type always
+            // "succeeds", so Swift rejects `as? SecIdentity`. Verify the type
+            // ID instead, then bridge — that actually catches a malformed p12.
+            guard CFGetTypeID(raw as CFTypeRef) == SecIdentityGetTypeID() else {
+                lastStatus = errSecInvalidCertificate
+                continue
+            }
+            self.identity = (raw as! SecIdentity)
+            self.p12Data = data
+            self.p12Password = pw
+            refresh()
+            return .success(())
         }
-        // A conditional downcast to a CoreFoundation type always "succeeds", so
-        // Swift rejects `as? SecIdentity`. Verify the type ID instead, then
-        // bridge — that actually catches a malformed p12.
-        guard CFGetTypeID(raw as CFTypeRef) == SecIdentityGetTypeID() else { return false }
-        let ident = raw as! SecIdentity
-        self.identity = ident
-        self.p12Data = data
-        self.p12Password = password
-        refresh()
-        return true
+        return .failure(Self.diagnoseP12(data, status: lastStatus, password: password))
     }
 
     /// Import a .mobileprovision (embedded entitlements are read from it).
-    public func importProvisioning(_ data: Data) {
+    public func importProvisioning(_ data: Data) -> Result<Void, String> {
+        guard !data.isEmpty else { return .failure("文件是空的（0 字节）") }
         self.provisioningData = data
-        if let plist = provisioningPlist(),
-           let teams = plist["TeamIdentifier"] as? [String], let t = teams.first {
+        guard let plist = provisioningPlist() else {
+            self.provisioningData = nil
+            refresh()
+            return .failure("不是有效的描述文件：里面没有找到 plist。请确认选的是 .mobileprovision（不是 .cer/.p12）。")
+        }
+        if let teams = plist["TeamIdentifier"] as? [String], let t = teams.first {
             teamIdentifier = t
         }
         refresh()
+        return .success(())
+    }
+
+    // MARK: - Diagnostics
+
+    /// Tell the user WHY their certificate file was rejected (and how to fix it).
+    private static func diagnoseP12(_ data: Data, status: OSStatus, password: String) -> String {
+        if let text = String(data: data.prefix(256), encoding: .utf8),
+           text.contains("BEGIN CERTIFICATE") || text.contains("BEGIN RSA PRIVATE KEY") {
+            return "这是 PEM 文本格式，iOS 需要 PKCS#12（.p12）。用 openssl 转换：\nopenssl pkcs12 -export -legacy -inkey key.pem -in cert.pem -out cert.p12"
+        }
+        if let text = String(data: data.prefix(4096), encoding: .isoLatin1),
+           text.contains("<?xml") || text.contains("mobileprovision") {
+            return "这个文件是描述文件（mobileprovision），请放到「描述文件」那一栏，证书栏要选 p12。"
+        }
+        if data.prefix(2) == Data("PK".utf8) {
+            return "这是 zip/IPA 文件，不是证书。"
+        }
+        if data.first == 0x30 {
+            // DER. A lone certificate still parses as one; a p12 will not.
+            if SecCertificateCreateWithData(nil, data as CFData) != nil {
+                return "这是 .cer 公钥证书，里面没有私钥，无法用来签名。请在钥匙串里把「证书 + 私钥」一起导出为 .p12（或 .pfx）。"
+            }
+            let hint = password.isEmpty
+                ? "（密码留空）若这个 p12 设了密码，请填上。"
+                : "密码可能不对。"
+            return "PKCS#12 解析失败：\(hint) 另一个常见原因是文件用了 iOS 不支持的新式加密（OpenSSL 3.x 默认 AES-256-CBC + PBKDF2），需用旧式加密重新导出：\nopenssl pkcs12 -export -legacy -inkey key.pem -in cert.pem -out cert.p12\n（错误码 \(status)）"
+        }
+        return "无法识别的文件格式（前几字节：\(data.prefix(4).map { String(format: "%02x", $0) }.joined(separator: " "))）。需要 p12/pfx。"
     }
 
     private func refresh() {
