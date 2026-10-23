@@ -3,11 +3,19 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+# Every Contents API push is its own commit, so a multi-file update queues one
+# run per file. Cancel the superseded ones: only the newest commit matters and
+# the macOS runner pool is the scarce resource here.
+concurrency:
+  group: ota-build-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
-    # macos-15 (Xcode 16): macos-latest's runner pool was congested for 25+ min
+    # macos-14: macOS runner pools jam — macos-latest stalled 25+ min on
+    # 2026-10-23 and macos-15 started failing instantly (runner_id=0, no
+    # capacity) on 2026-10-24. Xcode 15/16 on macos-14 still covers iOS 17.
     # on 2026-10-23. Our target is iOS 17 / Swift 5.9 — Xcode 16 covers it.
-    runs-on: macos-15
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
