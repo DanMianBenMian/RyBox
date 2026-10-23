@@ -61,28 +61,10 @@ final class GuestWindowHost {
         installEjectOverlay()
     }
 
-    /// "弹出 App" floating button: dismiss the guest, return to container.
+    /// "弹出 App" floating chrome: dismiss the guest, return to container.
+    /// Only used while a guest UI is on screen (the container is hidden then).
     private func installEjectOverlay() {
-        let overlay = UIWindow(frame: UIScreen.main.bounds)
-        overlay.windowLevel = .alert + 1
-        let vc = UIViewController()
-        vc.view = PassThroughView()   // keep the guest UI beneath interactive
-        vc.view.backgroundColor = .clear
-        let btn = UIButton(type: .system)
-        btn.setTitle("弹出 App", for: .normal)
-        btn.addTarget(self, action: #selector(ejectTapped), for: .touchUpInside)
-        btn.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.9)
-        btn.layer.cornerRadius = 16
-        btn.translatesAutoresizingMaskIntoConstraints = false
-        vc.view.addSubview(btn)
-        NSLayoutConstraint.activate([
-            btn.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -16),
-            btn.bottomAnchor.constraint(equalTo: vc.view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
-        ])
-        overlay.rootViewController = vc
-        overlay.isHidden = false
-        overlay.makeKeyAndVisible()
-        self.overlayWindow = overlay
+        GuestChromeWindow.shared.install()
     }
 
     @objc private func ejectTapped() {
@@ -91,7 +73,8 @@ final class GuestWindowHost {
 
     /// Dismiss the guest entirely; the container window beneath is restored.
     func dismissGuest() {
-        // Hide the eject overlay and any guest-level windows.
+        // Hide the guest-runtime chrome and any guest-level windows.
+        GuestChromeWindow.shared.teardown()
         overlayWindow?.isHidden = true
         overlayWindow = nil
         scaffoldWindow?.isHidden = true
