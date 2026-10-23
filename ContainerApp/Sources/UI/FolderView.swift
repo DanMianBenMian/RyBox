@@ -55,12 +55,7 @@ struct FolderView: View {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 34, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 34, style: .continuous)
-                        .strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
-                )
+            folderBackground
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
         )
@@ -103,6 +98,25 @@ struct FolderView: View {
         }
     }
 
+    /// Themes may ship a `FolderBackground` image; otherwise it is the usual
+    /// blurred panel.
+    @ViewBuilder
+    private var folderBackground: some View {
+        if let img = ThemeEngine.shared.uiImage("FolderBackground") {
+            Image(uiImage: img)
+                .resizable()
+                .scaledToFill()
+                .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+        } else {
+            RoundedRectangle(cornerRadius: 34, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 34, style: .continuous)
+                        .strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
+                )
+        }
+    }
+
     // MARK: Member grid
 
     private var grid: some View {
@@ -139,16 +153,9 @@ private struct FolderMemberIcon: View {
     var body: some View {
         VStack(spacing: 6) {
             ZStack(alignment: .topTrailing) {
-                RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
-                    .fill(LinearGradient(colors: [item.tint.opacity(0.92), item.tint],
-                                         startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: size, height: size)
-                    .overlay(
-                        Image(systemName: item.symbol)
-                            .font(.system(size: size * 0.44, weight: .medium))
-                            .foregroundStyle(.white)
-                    )
-                    .shadow(color: .black.opacity(0.22), radius: 5, y: 3)
+                // Themed icons apply inside folders too — same IconArtwork the
+                // home screen uses.
+                IconArtwork(item: item, size: size)
 
                 if editMode {
                     Button(action: onRemove) {
