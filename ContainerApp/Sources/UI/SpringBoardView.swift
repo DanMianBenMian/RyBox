@@ -107,7 +107,7 @@ struct SpringBoardView: View {
     }
 
     // MARK: - Dock (built-in tools)
-    private var dock: someView {
+    private var dock: some View {
         HStack(spacing: isIPad ? 30 : 22) {
             ForEach(BuiltinTool.allCases) { tool in
                 AppIcon(name: tool.title, systemImage: tool.icon, isGUI: false, size: iconSize) {
