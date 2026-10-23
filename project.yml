@@ -33,6 +33,8 @@ settings:
     GENERATE_INFOPLIST_FILE: "NO"
     # C/ObjC guest-loader bridging header (exposes RyMachOPatcher / RyDyldHooks).
     SWIFT_OBJC_BRIDGING_HEADER: "ContainerApp/Sources/Core/GuestLoader/RyBox-Bridging-Header.h"
+    # App icon (single 1024x1024 universal asset in Sources/Assets.xcassets).
+    ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
   configs:
     Debug:
       SWIFT_OPTIMIZATION_LEVEL: "-Onone"
