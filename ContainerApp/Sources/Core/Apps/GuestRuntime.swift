@@ -42,19 +42,22 @@ enum GuestRuntime {
         // touched from there.
         DispatchQueue.global(qos: .userInitiated).async {
             // 1) Patch the guest executable in place (MH_EXECUTE -> MH_DYLIB, PAGEZERO).
+            os_log("RyBox: fs  READ   %{public}@ (guest executable)", exePath)
             let patchRC = RyPatchGuestExecutable(exePath)
             guard patchRC == 0 else {
-                os_log("RyBox: Mach-O patch failed (rc=%d) for %@", patchRC, exePath)
+                os_log("RyBox: Mach-O patch failed (rc=%d) for %{public}@", patchRC, exePath)
                 DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
                 return
             }
+            os_log("RyBox: fs  WRITE  %{public}@ (Mach-O patched MH_EXECUTE->MH_DYLIB)", exePath)
 
             // 2) Re-sign the patched binary (JIT-less; required by AMFI).
             if case .failure(let err) = CodeSigner.shared.sign(bundleAt: bundleURL.path) {
-                os_log("RyBox: guest re-sign failed: %@", err.localizedDescription)
+                os_log("RyBox: guest re-sign failed: %{public}@", err.localizedDescription)
                 DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
                 return
             }
+            os_log("RyBox: ks  WRITE  %{public}@ (bundle re-signed)", bundleURL.path)
 
             DispatchQueue.main.async {
                 // 3) Redirect mainBundle + set the guest executable path for the hooks.
@@ -67,6 +70,7 @@ enum GuestRuntime {
 
                 // 5) dlopen + jump to the guest entry. The guest UIApplicationMain is
                 //    intercepted and hosted; by the time this returns the guest UI is up.
+                os_log("RyBox: ks  EXEC   %{public}@ (guest entry point)", exePath)
                 if RyLaunchGuestExecutable(exePath) == nil {
                     os_log("RyBox: guest dlopen/launch failed")
                     GuestWindowHost.shared.presentScaffold(bundleURL)
