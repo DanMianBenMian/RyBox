@@ -195,6 +195,17 @@ final class ThemeEngine: ObservableObject {
         enabledIDs.move(fromOffsets: offsets, toOffset: destination)
     }
 
+    /// Permanently delete a theme package from /Library/Themes. Removes its
+    /// directory, drops it from the enabled set, and rescans + clears caches so
+    /// its artwork disappears immediately (no respring needed). Irreversible.
+    @discardableResult
+    func deleteTheme(_ id: String) -> Bool {
+        guard let theme = themes.first(where: { $0.id == id }) else { return false }
+        try? fm.removeItem(at: theme.directory)
+        reload()
+        return true
+    }
+
     // MARK: - Import
 
     /// Unpack a theme archive (.zip/.theme zip) into `/Library/Themes`.
