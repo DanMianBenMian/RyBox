@@ -29,12 +29,12 @@ enum GuestRuntime {
     static func launchInProcess(_ app: ImportedApp) {
         let exePath = app.executablePath
         guard FileManager.default.fileExists(atPath: exePath) else {
-            RyLog.shared.log("guest 可执行文件不存在：\(exePath)", .error, "guest")
+            RyLog.shared.log("guest 可执行文件不存在：\(exePath)", level: .error, tag: "guest")
             return
         }
         let bundleURL = URL(fileURLWithPath: exePath).deletingLastPathComponent()
 
-        RyLog.shared.log("准备启动 \(app.name)（\(app.bundleIdentifier)）", .info, "guest")
+        RyLog.shared.log("准备启动 \(app.name)（\(app.bundleIdentifier)）", level: .info, tag: "guest")
 
         // Heavy, potentially slow work (Mach-O patch + re-sign of the whole
         // bundle) runs OFF the main thread so the UI never freezes while a guest
@@ -44,22 +44,22 @@ enum GuestRuntime {
         // touched from there.
         DispatchQueue.global(qos: .userInitiated).async {
             // 1) Patch the guest executable in place (MH_EXECUTE -> MH_DYLIB, PAGEZERO).
-            RyLog.shared.log("fs  READ   \(exePath) (guest executable)", .debug, "guest")
+            RyLog.shared.log("fs  READ   \(exePath) (guest executable)", level: .debug, tag: "guest")
             let patchRC = RyPatchGuestExecutable(exePath)
             guard patchRC == 0 else {
-                RyLog.shared.log("Mach-O 补丁失败 (rc=\(patchRC))：\(exePath)", .error, "guest")
+                RyLog.shared.log("Mach-O 补丁失败 (rc=\(patchRC))：\(exePath)", level: .error, tag: "guest")
                 DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
                 return
             }
-            RyLog.shared.log("fs  WRITE  \(exePath) (Mach-O patched MH_EXECUTE->MH_DYLIB)", .info, "guest")
+            RyLog.shared.log("fs  WRITE  \(exePath) (Mach-O patched MH_EXECUTE->MH_DYLIB)", level: .info, tag: "guest")
 
             // 2) Re-sign the patched binary (JIT-less; required by AMFI).
             if case .failure(let err) = CodeSigner.shared.sign(bundleAt: bundleURL.path) {
-                RyLog.shared.log("guest 重新签名失败：\(err.localizedDescription)", .error, "guest")
+                RyLog.shared.log("guest 重新签名失败：\(err.localizedDescription)", level: .error, tag: "guest")
                 DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
                 return
             }
-            RyLog.shared.log("ks  WRITE  \(bundleURL.path) (bundle re-signed)", .info, "guest")
+            RyLog.shared.log("ks  WRITE  \(bundleURL.path) (bundle re-signed)", level: .info, tag: "guest")
 
             DispatchQueue.main.async {
                 // Make this guest's ORIGINAL entitlements the active set, so the
@@ -77,9 +77,9 @@ enum GuestRuntime {
 
                 // 5) dlopen + jump to the guest entry. The guest UIApplicationMain is
                 //    intercepted and hosted; by the time this returns the guest UI is up.
-                RyLog.shared.log("ks  EXEC   \(exePath) (guest entry point)", .info, "guest")
+                RyLog.shared.log("ks  EXEC   \(exePath) (guest entry point)", level: .info, tag: "guest")
                 if RyLaunchGuestExecutable(exePath) == nil {
-                    RyLog.shared.log("guest dlopen/启动失败", .error, "guest")
+                    RyLog.shared.log("guest dlopen/启动失败", level: .error, tag: "guest")
                     GuestWindowHost.shared.presentScaffold(bundleURL)
                 }
             }
