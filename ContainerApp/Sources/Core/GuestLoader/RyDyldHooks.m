@@ -11,6 +11,7 @@
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
+#import <Security/SecTask.h>
 #import <objc/runtime.h>
 
 // ---- shims needed to flip the guest Mach-O header filetype ----
@@ -230,7 +231,7 @@ static id ryDecodeEntitlementAnswer(const char *ans) {
 NS_RETURNS_RETAINED
 static id ry_SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error) {
     if (entitlement) {
-        const char *name = [(NSString *)entitlement UTF8String];
+        const char *name = [(__bridge NSString *)entitlement UTF8String];
         char *ans = RyEntitlementAnswer(name);
         if (ans) {
             id val = ryDecodeEntitlementAnswer(ans);
@@ -260,12 +261,12 @@ static CFDictionaryRef ry_SecTaskCopyValuesForEntitlements(SecTaskRef task, CFAr
         for (CFIndex i = 0; i < n; i++) {
             CFStringRef key = (CFStringRef)CFArrayGetValueAtIndex(entitlements, i);
             if (!key) continue;
-            const char *name = [(NSString *)key UTF8String];
+            const char *name = [(__bridge NSString *)key UTF8String];
             char *ans = RyEntitlementAnswer(name);
             if (ans) {
                 id val = ryDecodeEntitlementAnswer(ans);
                 free(ans);
-                if (val) out[(NSString *)key] = val;
+                if (val) out[(__bridge NSString *)key] = val;
             }
         }
     }
