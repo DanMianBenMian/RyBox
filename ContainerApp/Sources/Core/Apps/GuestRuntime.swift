@@ -34,34 +34,44 @@ enum GuestRuntime {
         }
         let bundleURL = URL(fileURLWithPath: exePath).deletingLastPathComponent()
 
-        // 1) Patch the guest executable in place (MH_EXECUTE -> MH_DYLIB, PAGEZERO).
-        let patchRC = RyPatchGuestExecutable(exePath)
-        guard patchRC == 0 else {
-            os_log("RyBox: Mach-O patch failed (rc=%d) for %@", patchRC, exePath)
-            GuestWindowHost.shared.presentScaffold(bundleURL) // visible fallback
-            return
-        }
+        // Heavy, potentially slow work (Mach-O patch + re-sign of the whole
+        // bundle) runs OFF the main thread so the UI never freezes while a guest
+        // binary is being prepared — a large IPA signature previously blocked the
+        // main thread and made the launch look "frozen". Only the dyld/UIKit
+        // hooking + dlopen stays on the main thread, because UIKit expects to be
+        // touched from there.
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 1) Patch the guest executable in place (MH_EXECUTE -> MH_DYLIB, PAGEZERO).
+            let patchRC = RyPatchGuestExecutable(exePath)
+            guard patchRC == 0 else {
+                os_log("RyBox: Mach-O patch failed (rc=%d) for %@", patchRC, exePath)
+                DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
+                return
+            }
 
-        // 2) Re-sign the patched binary (JIT-less; required by AMFI).
-        if case .failure(let err) = CodeSigner.shared.sign(bundleAt: bundleURL.path) {
-            os_log("RyBox: guest re-sign failed: %@", err.localizedDescription)
-            GuestWindowHost.shared.presentScaffold(bundleURL)
-            return
-        }
+            // 2) Re-sign the patched binary (JIT-less; required by AMFI).
+            if case .failure(let err) = CodeSigner.shared.sign(bundleAt: bundleURL.path) {
+                os_log("RyBox: guest re-sign failed: %@", err.localizedDescription)
+                DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
+                return
+            }
 
-        // 3) Redirect mainBundle + set the guest executable path for the hooks.
-        RyBoxGuestBundle.activate(bundleURL)
-        RySetGuestMainExecutablePath(exePath)
+            DispatchQueue.main.async {
+                // 3) Redirect mainBundle + set the guest executable path for the hooks.
+                RyBoxGuestBundle.activate(bundleURL)
+                RySetGuestMainExecutablePath(exePath)
 
-        // 4) Install dyld / UIKit hooks (best installed before the guest's
-        //    dlopen-time symbol resolution).
-        RyInstallGuestDyldHooks()
+                // 4) Install dyld / UIKit hooks (best installed before the guest's
+                //    dlopen-time symbol resolution).
+                RyInstallGuestDyldHooks()
 
-        // 5) dlopen + jump to the guest entry. The guest UIApplicationMain is
-        //    intercepted and hosted; by the time this returns the guest UI is up.
-        if RyLaunchGuestExecutable(exePath) == nil {
-            os_log("RyBox: guest dlopen/launch failed")
-            GuestWindowHost.shared.presentScaffold(bundleURL)
+                // 5) dlopen + jump to the guest entry. The guest UIApplicationMain is
+                //    intercepted and hosted; by the time this returns the guest UI is up.
+                if RyLaunchGuestExecutable(exePath) == nil {
+                    os_log("RyBox: guest dlopen/launch failed")
+                    GuestWindowHost.shared.presentScaffold(bundleURL)
+                }
+            }
         }
     }
 
