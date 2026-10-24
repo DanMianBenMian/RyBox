@@ -30,6 +30,12 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         VirtualRoot.shared.ensure()
+        // Install the filesystem-redirect layer and point it at the virtual root.
+        // Hooks are GATED (disabled until a guest is active), so RyBox's own file
+        // operations are never affected at launch — only a guest's absolute path
+        // opens get routed into the jbroot.
+        ry_fs_install_hooks()
+        ry_fs_set_root(VirtualRoot.shared.rootURL.path)
         // Populate the virtual root with the bundled minimal jbroot (dpkg/apt +
         // standard /usr /var layout). Non-blocking and idempotent; if the asset
         // is missing it logs and continues (Sileo still installs, tools absent).
