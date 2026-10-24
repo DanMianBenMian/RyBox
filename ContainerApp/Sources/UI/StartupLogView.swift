@@ -31,7 +31,7 @@ struct StartupLogView: View {
         lines.append("[\(stamp())] \(msg)")
         // Mirror into the container-wide live log, so the 「日志」 app and the
         // floating ball show the whole boot sequence too.
-        RyLog.shared.log(msg, .info, "boot")
+        RyLog.shared.log(msg, level: .info, tag: "boot")
     }
 
     var body: some View {
