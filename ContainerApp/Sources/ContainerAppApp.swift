@@ -33,7 +33,7 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
         Task { await RuntimeEnvironment.shared.detect() }
         // Live log: the container's own start-up trace, so the 日志 app (and the
         // floating ball) show the real boot sequence.
-        RyLog.shared.log("RyBox 启动 · bundle=\(Bundle.main.bundleIdentifier ?? "?")", .info, "boot")
+        RyLog.shared.log("RyBox 启动 · bundle=\(Bundle.main.bundleIdentifier ?? "?")", level: .info, tag: "boot")
         // NOTE: Sileo is NO LONGER installed here. It now runs from the boot
         // gate / ContentView once a certificate is configured, so it gets
         // signed with the user's identity instead of staying unsigned forever.
@@ -79,7 +79,7 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
         self.window = win
         Self.containerWindow = win
         if let scene = scene { Self.hostScene = scene }
-        RyLog.shared.log("容器窗口已创建 (scene=\(scene != nil ? "yes" : "fallback"))", .info, "boot")
+        RyLog.shared.log("容器窗口已创建 (scene=\(scene != nil ? "yes" : "fallback"))", level: .info, tag: "boot")
     }
 }
 
@@ -101,10 +101,10 @@ final class RyBoxSceneDelegate: UIResponder, UIWindowSceneDelegate {
         // UIWindow(windowScene:), the correct iOS 13+ initializer.
         (UIApplication.shared.delegate as? RyBoxAppDelegate)?.installContainerWindow(to: windowScene)
         self.window = RyBoxAppDelegate.containerWindow
-        RyLog.shared.log("scene 已连接 · connectedScenes=\(UIApplication.shared.connectedScenes.count)", .info, "ui")
+        RyLog.shared.log("scene 已连接 · connectedScenes=\(UIApplication.shared.connectedScenes.count)", level: .info, tag: "ui")
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
-        RyLog.shared.log("scene 断开连接", .warn, "ui")
+        RyLog.shared.log("scene 断开连接", level: .warn, tag: "ui")
     }
 }
