@@ -293,7 +293,7 @@ public final class CertificateStore: ObservableObject {
         // [certificates], [crls], signerInfos. Locate encapContentInfo by its
         // `data` OID instead of hardcoding index 2, so an optional field or a
         // slightly different encoding can't break the walk.
-        var encap: RyASN1.Reader.Element?
+        var encap: RyASN1.Element?
         for kid in r.children(signedData) {
             guard kid.tag == RyASN1.SEQUENCE else { continue }
             let ek = r.children(kid)
