@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// On-device signing engine.
 ///
@@ -101,45 +102,58 @@ public final class CodeSigner {
             .appendingPathComponent("embedded.mobileprovision")
         try? prov.write(to: embeddedURL)
 
-        // 4) delegate Mach-O signing to the bundled on-device signer (in-process).
-        //    Prefer the decoded-DER entry whenever the p12 needed RyBox's own
-        //    decoder; that path does not depend on SecPKCS12Import at all.
-        var rc: Int32 = -1
+        // 4) Build the identity material (leaf cert + private key DER) and the
+        //    trust chain, team, and entitlements — all decoded in Swift. The
+        //    in-C profile parser cannot read a CMS-wrapped binary plist, so the
+        //    Swift side now does the decoding and feeds the signer everything.
+        var certDER: Data? = nil
+        var keyDER: Data? = nil
+        var keyIsEC = false
         if CertificateStore.shared.usesFallbackIdentity,
-           let cert = CertificateStore.shared.fallbackCertDER(),
-           let key = CertificateStore.shared.fallbackKeyDER() {
-            let certURL = tmp.appendingPathComponent("cert.der")
-            let keyURL = tmp.appendingPathComponent("key.der")
-            guard (try? cert.write(to: certURL)) != nil,
-                  (try? key.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
+           let c = CertificateStore.shared.fallbackCertDER(),
+           let k = CertificateStore.shared.fallbackKeyDER() {
             RyLog.shared.log("sign  使用内置 PKCS#12 解码器（OpenSSL 3 p12）",
                              level: .info, tag: "sign")
-            rc = rysign_sign_bundle_with_der(path, certURL.path, keyURL.path,
-                                             CertificateStore.shared.fallbackKeyIsEC() ? 1 : 0,
-                                             provURL.path, entsURL.path)
-        } else {
-            // Legacy-encrypted p12: SecPKCS12Import can open it, so stage the
-            // raw bytes + password and let C import them.
-            let p12URL = tmp.appendingPathComponent("id.p12")
-            guard let p12 = CertificateStore.shared.p12RawData(),
-                  let pw = CertificateStore.shared.p12Passphrase(),
-                  (try? p12.write(to: p12URL)) != nil else { return .failure(.stageFailed) }
-            rc = rysign_sign_bundle(path, p12URL.path, pw, provURL.path, entsURL.path)
-            // Belt and braces: if C's importer refused a file Swift's importer
-            // accepted (or vice versa), retry through the decoder material.
-            if rc == 3, let cert = CertificateStore.shared.fallbackCertDER(),
-               let key = CertificateStore.shared.fallbackKeyDER() {
-                let certURL = tmp.appendingPathComponent("cert.der")
-                let keyURL = tmp.appendingPathComponent("key.der")
-                if (try? cert.write(to: certURL)) != nil, (try? key.write(to: keyURL)) != nil {
-                    RyLog.shared.log("sign  SecPKCS12Import 失败，回退到内置解码器",
-                                     level: .warn, tag: "sign")
-                    rc = rysign_sign_bundle_with_der(path, certURL.path, keyURL.path,
-                                                     CertificateStore.shared.fallbackKeyIsEC() ? 1 : 0,
-                                                     provURL.path, entsURL.path)
+            certDER = c; keyDER = k; keyIsEC = CertificateStore.shared.fallbackKeyIsEC()
+        } else if let identity = CertificateStore.shared.identityRef() {
+            var cert: SecCertificate? = nil
+            SecIdentityCopyCertificate(identity, &cert)
+            if let cert = cert { certDER = SecCertificateCopyData(cert) as Data }
+            var key: SecKey? = nil
+            SecIdentityCopyPrivateKey(identity, &key)
+            if let key = key {
+                keyDER = SecKeyCopyExternalRepresentation(key, nil) as Data?
+                if let attrs = SecKeyCopyAttributes(key) as? [String: Any],
+                   let t = attrs[kSecAttrKeyType as String] as? String {
+                    keyIsEC = (t == (kSecAttrKeyTypeECSECPrimeRandom as String))
                 }
             }
         }
+        guard let certDER = certDER, let keyDER = keyDER else {
+            return .failure(.stageFailed)
+        }
+
+        // 4a) stage leaf cert + key DER (entsURL / profileEnts already staged above)
+        let certURL = tmp.appendingPathComponent("cert.der")
+        let keyURL = tmp.appendingPathComponent("key.der")
+        guard (try? certDER.write(to: certURL)) != nil,
+              (try? keyDER.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
+
+        // 4b) team + full cert chain (intermediate + root) from the profile
+        let team = CertificateStore.shared.teamIdentifier ?? ""
+        let certsDir = tmp.appendingPathComponent("chain")
+        try? fm.createDirectory(at: certsDir, withIntermediateDirectories: true)
+        if let chain = CertificateStore.shared.provisioningCertificates() {
+            for (i, c) in chain.enumerated() {
+                try? c.write(to: certsDir.appendingPathComponent("\(i).der"))
+            }
+        }
+
+        // 4c) delegate Mach-O signing to the robust in-process signer. All profile
+        //     material is pre-decoded by Swift; the signer only embeds the profile.
+        let rc: Int32 = rysign_sign_bundle_robust(path, certURL.path, keyURL.path,
+                                                 keyIsEC ? 1 : 0, provURL.path, entsURL.path,
+                                                 team, certsDir.path)
         if rc != 0 {
             return .failure(.signFailed(rc, signFailureReason(rc)))
         }
