@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <dirent.h>
 
 #include <CommonCrypto/CommonDigest.h>
