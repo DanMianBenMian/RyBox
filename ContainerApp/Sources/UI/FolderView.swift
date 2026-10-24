@@ -100,6 +100,13 @@ struct FolderView: View {
 
     /// Themes may ship a `FolderBackground` image; otherwise it is the usual
     /// blurred panel.
+    ///
+    /// The panel must be DARK: the folder title and the member names are drawn
+    /// in white on top of it, so a plain `.ultraThinMaterial` (which is nearly
+    /// white over a light wallpaper) makes the text unreadable — the
+    /// "文件夹背景太白了，看不清文字" report. We therefore use the regular
+    /// material plus an explicit dark tint, which keeps the blur (毛玻璃) and
+    /// restores the contrast.
     @ViewBuilder
     private var folderBackground: some View {
         if let img = ThemeEngine.shared.uiImage("FolderBackground") {
@@ -107,9 +114,17 @@ struct FolderView: View {
                 .resizable()
                 .scaledToFill()
                 .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 34, style: .continuous)
+                        .fill(Color.black.opacity(0.45))
+                )
         } else {
             RoundedRectangle(cornerRadius: 34, style: .continuous)
-                .fill(.ultraThinMaterial)
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 34, style: .continuous)
+                        .fill(Color.black.opacity(0.42))
+                )
                 .overlay(
                     RoundedRectangle(cornerRadius: 34, style: .continuous)
                         .strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
