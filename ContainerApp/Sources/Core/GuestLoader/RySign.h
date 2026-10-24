@@ -1,5 +1,12 @@
 #ifndef RySign_h
 #define RySign_h
+
+// `SecKeyRef` below must be a complete type wherever this header lands — it is
+// pulled into Swift through the bridging header, where nothing guarantees that
+// Security.framework arrived first.
+#include <Security/Security.h>
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -60,6 +67,36 @@ int rysign_sign_bundle_robust(const char *bundlePath,
                               const char *entitlementsPath,
                               const char *team,
                               const char *certsDir);
+
+/// Sign a bundle with a SecKey the CALLER already holds (preferred path).
+///
+/// `rysign_sign_bundle_robust` above has to reconstruct the private key from
+/// raw DER with `SecKeyCreateWithData`, and that reconstructed key is the one
+/// thing that keeps failing on device: the refurbished SecKey can come back
+/// unable to perform the algorithm the certificate expects, so
+/// `SecKeyCreateSignature` refuses — identically for a development and a
+/// distribution certificate. Passing the live SecKey skips the round-trip
+/// entirely, which is why RyBox uses this entry whenever it has a real
+/// SecIdentity (the normal case).
+///
+/// `privKey` is retained for the duration of the call; the caller keeps
+/// ownership. Same exit codes as `rysign_sign_bundle_robust`.
+int rysign_sign_bundle_with_key(const char *bundlePath,
+                                SecKeyRef privKey,
+                                const char *leafCertDerPath,
+                                const char *provPath,
+                                const char *entitlementsPath,
+                                const char *team,
+                                const char *certsDir);
+
+/// The Security-framework status code of the last failing Sec* call (e.g. the
+/// OSStatus `SecKeyCreateSignature` returned). 0 when nothing has failed.
+int rysign_last_osstatus(void);
+
+/// One-line, user-facing description of the last failure, as UTF-8. Empty when
+/// the last call succeeded. OWNERSHIP: static buffer, valid until the next
+/// signing call — copy it immediately (Swift: `String(cString:)`).
+const char *rysign_last_diag(void);
 
 /// Override the CodeDirectory identifier used for every Mach-O signed by this
 /// module.
