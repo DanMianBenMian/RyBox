@@ -1,13 +1,13 @@
 import SwiftUI
 
-/// RyBox first-run gate: the container cannot behave like a system until it
-/// has (1) a signing identity and (2) a firmware to restore the environment
-/// from. Both steps are MANDATORY — the desktop is not reachable before them.
+/// RyBox first-run gate. The container needs a signing identity before it can
+/// behave like a system — every guest (including the built-in Sileo) is signed
+/// with the user's certificate, so the "进入系统" step is gated on that alone.
 ///
-///   1. 证书   : .p12 (+ password) + .mobileprovision  -> CertificateStore
-///   2. 固件   : .ryboxenv (complete env package) or .ipsw (raw Apple archive)
-///               -> FirmwareImporter unpacks into the virtual root
-///   3. 进入系统 : Sileo is installed automatically right after.
+/// The virtual root (jbroot) is populated AUTOMATICALLY at launch from a bundled
+/// Procursus bootstrap package (`Preinstalled/ProcursusBootstrap.zip`), so there
+/// is no longer a manual "导入固件" step. The user never has to supply a system
+/// image; RyBox ships a minimal, standard jbroot instead.
 struct BootGate {
     private static let key = "rybox.boot.completed"
     static var isCompleted: Bool { UserDefaults.standard.bool(forKey: key) }
@@ -18,7 +18,6 @@ struct BootGateView: View {
     let onFinish: () -> Void
 
     @ObservedObject private var cert = CertificateStore.shared
-    @ObservedObject private var fw = FirmwareImporter.shared
 
     @State private var p12Password = ""
     @State private var p12Name = "未选择"
@@ -29,7 +28,6 @@ struct BootGateView: View {
     @State private var busy = false
 
     private var certDone: Bool { cert.isConfigured }
-    private var fwDone: Bool { fw.isSatisfied }
 
     var body: some View {
         ZStack {
@@ -41,22 +39,13 @@ struct BootGateView: View {
             ScrollView {
                 VStack(spacing: 22) {
                     header
-                    firmwareCard
                     certCard
+                    jbrootCard
                     enterButton
                     Spacer(minLength: 20)
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 30)
-            }
-
-            // Black-background white-text deploy log while the firmware is being
-            // unpacked (user asked for this exact look during deployment).
-            if fw.phase == .scanning || fw.phase == .extracting {
-                DeployLogView()
-                    .ignoresSafeArea()
-                    .transition(.opacity)
-                    .animation(.easeInOut(duration: 0.2), value: fw.phase)
             }
         }
     }
@@ -71,7 +60,7 @@ struct BootGateView: View {
             Text("RyBox 初始设置")
                 .font(.title.bold())
                 .foregroundStyle(.white)
-            Text("需要先准备签名证书与系统固件，RyBox 才能还原出一个可用的系统环境。")
+            Text("只需配置签名证书，RyBox 即会自带一个最小 jbroot（dpkg / apt / 标准 /usr /var 布局），无需再导入任何系统固件。")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.75))
                 .multilineTextAlignment(.center)
@@ -83,7 +72,7 @@ struct BootGateView: View {
 
     private var certCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            stepHeader(index: 2, title: "签名证书", done: certDone)
+            stepHeader(index: 1, title: "签名证书", done: certDone)
 
             row(title: "证书（p12 / pfx）", value: p12Name) { pickP12() }
             SecureField("p12 密码（可为空）", text: $p12Password)
@@ -129,52 +118,25 @@ struct BootGateView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
-    // MARK: Step 2 — firmware
+    // MARK: Step 2 — jbroot (automatic, informational)
 
-    private var firmwareCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            stepHeader(index: 1, title: "系统固件", done: fwDone)
+    private var jbrootCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            stepHeader(index: 2, title: "虚拟根（jbroot）", done: true)
 
-            Text("导入 .ryboxenv 系统环境包（推荐，电脑上预处理好的完整 /usr /System 目录树），或直接导入 .ipsw 原厂固件（RyBox 会就地读取其中未加密的 manifest / kernelcache / trustcache）。")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.72))
+            Label("启动时自动解压内置 Procursus bootstrap", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .font(.footnote)
+
+            Text("RyBox 不再从 IPSW / .ryboxenv 还原真实系统文件，而是自带一个最小、标准 jbroot（含 dpkg、apt、/usr、/var 与包管理数据库）。Sileo 打开后直接调用 jbroot 里的工具与数据库，无需任何手动步骤。")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
 
-            Button {
-                pickFirmware()
-            } label: {
-                Label(fwDone ? "重新导入固件" : "选择固件（.ryboxenv / .ipsw）",
-                      systemImage: "square.and.arrow.down.on.square")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(fwDone ? .gray : .blue)
-
-            if fw.phase == .scanning || fw.phase == .extracting {
-                ProgressView(value: max(fw.progress, 0.05))
-                    .progressViewStyle(.linear)
-                Text(fw.message)
-                    .font(.caption)
+            if let info = JbRoot.shared.statusLine {
+                Text(info)
+                    .font(.caption2)
                     .foregroundStyle(.white.opacity(0.85))
-            } else if let r = fw.report {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label(r.kind == "ryboxenv" ? "系统环境已完整还原" : "固件已导入（部分）",
-                          systemImage: r.aeaVolumes.isEmpty ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .font(.footnote)
-                        .foregroundStyle(r.aeaVolumes.isEmpty ? .green : .orange)
-                    Text(FirmwareImporter.summary(r))
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.8))
-                    ForEach(r.notes, id: \.self) { note in
-                        Text(note)
-                            .font(.caption2)
-                            .foregroundStyle(.white.opacity(0.65))
-                    }
-                }
-            } else if case .failed = fw.phase {
-                Text(fw.message)
-                    .font(.caption)
-                    .foregroundStyle(.red)
             }
         }
         .padding(18)
@@ -196,10 +158,10 @@ struct BootGateView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.green)
-            .disabled(!(certDone && fwDone))
+            .disabled(!certDone)
 
-            if !(certDone && fwDone) {
-                Text(certDone ? "还需导入固件" : "还需配置证书")
+            if !certDone {
+                Text("还需配置证书")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.7))
             }
@@ -317,27 +279,6 @@ struct BootGateView: View {
                 case .failure(let m):
                     self.message = m.message
                 }
-            }
-        }
-    }
-
-    private func pickFirmware() {
-        message = "正在打开文件选择器…"
-        // asCopy: TRUE is mandatory here. The open-in-place mode (asCopy:false)
-        // looks better for a 10 GB IPSW, but on iPadOS 27 beta the picker never
-        // delivers the selection, so the import silently stalls. The system
-        // copies the file into our container instead.
-        DocPicker.present(asCopy: true) { result in
-            switch result {
-            case .success(let url):
-                // No extension gate: FirmwareImporter decides by CONTENT
-                // (ryboxenv.json = env package, BuildManifest.plist = IPSW), so
-                // an unknown suffix can never make a file un-pickable.
-                self.fw.message = "已选择：\(url.lastPathComponent)"
-                self.fw.ingest(url)
-            case .failure(let e):
-                self.fw.message = "选择失败：\(e.localizedDescription)"
-                self.fw.phase = .failed
             }
         }
     }
