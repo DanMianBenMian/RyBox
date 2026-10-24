@@ -10,11 +10,6 @@ import Foundation
 public final class CodeSigner {
     public static let shared = CodeSigner()
 
-    /// Bundled helper filename. Must sit at the app root so
-    /// `Bundle.main.url(forAuxiliaryExecutable:)` (or the bundle-root fallback)
-    /// resolves it.
-    private let helperName = "codesign"
-
     public enum SignError: Error, LocalizedError {
         case notConfigured
         case helperMissing
@@ -41,12 +36,12 @@ public final class CodeSigner {
     ///   2. embed the provisioning profile as `embedded.mobileprovision`
     ///      (AMFI requires the running code's profile to match the signature)
     ///   3. derive guest entitlements from the provisioning profile
-    ///   4. delegate the Mach-O signing to the bundled helper (in-place contract)
+    ///   4. delegate the Mach-O signing to the bundled signer (in-process C
+    ///      routine `rysign_sign_bundle`, compiled into this target)
     ///
     /// - Parameter path: absolute path to the guest `.app` bundle.
     public func sign(bundleAt path: String) -> Result<Void, SignError> {
         guard CertificateStore.shared.isConfigured else { return .failure(.notConfigured) }
-        guard let helper = resolveHelper() else { return .failure(.helperMissing) }
 
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory
@@ -61,7 +56,7 @@ public final class CodeSigner {
               let pw = CertificateStore.shared.p12Passphrase(),
               (try? p12.write(to: p12URL)) != nil else { return .failure(.stageFailed) }
 
-        // 1) stage provisioning
+        // 2) stage provisioning
         let provURL = tmp.appendingPathComponent("profile.mobileprovision")
         guard let prov = CertificateStore.shared.provisioningRawData(),
               (try? prov.write(to: provURL)) != nil else { return .failure(.stageFailed) }
@@ -74,54 +69,18 @@ public final class CodeSigner {
             try? entsData.write(to: entsURL)
         }
 
-        // 2) embed provisioning profile inside the guest bundle
+        // 4) embed provisioning profile inside the guest bundle
         let embeddedURL = URL(fileURLWithPath: path)
             .appendingPathComponent("embedded.mobileprovision")
         try? prov.write(to: embeddedURL)
 
-        // 4) invoke helper — in-place contract (see codesign-helper-README.txt):
-        //    <helper> --p12 <p12> --password <pw> --prov <prov>
-        //             [--entitlements <ents>] --bundle <bundle>
-        var args: [String] = [
-            "--p12", p12URL.path,
-            "--password", pw,
-            "--prov", provURL.path
-        ]
-        if fm.fileExists(atPath: entsURL.path) {
-            args += ["--entitlements", entsURL.path]
-        }
-        args += ["--bundle", path]
-
-        let rc = spawnHelper(helper.path, args: args)
+        // 5) delegate Mach-O signing to the bundled on-device signer (in-process).
+        //    rysign_sign_bundle() re-signs every Mach-O in the bundle with the
+        //    staged identity + profile so the guest passes AMFI when dlopen'd.
+        let rc = rysign_sign_bundle(path, p12URL.path, pw, provURL.path, entsURL.path)
         if rc != 0 {
-            return .failure(.signFailed(rc, helper.lastPathComponent))
+            return .failure(.signFailed(rc, "rysign"))
         }
         return .success(())
-    }
-
-    /// Resolve the bundled helper: prefer `forAuxiliaryExecutable`, then fall
-    /// back to the app-bundle root (iOS keeps auxiliary binaries there).
-    private func resolveHelper() -> URL? {
-        if let u = Bundle.main.url(forAuxiliaryExecutable: helperName) { return u }
-        let alt = Bundle.main.bundleURL.appendingPathComponent(helperName)
-        return FileManager.default.fileExists(atPath: alt.path) ? alt : nil
-    }
-
-    private func spawnHelper(_ path: String, args: [String]) -> Int32 {
-        var pid: pid_t = 0
-        var fa: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fa)
-        var a: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { $0.withCString(strdup) }
-        a.append(nil)
-        var e: [UnsafeMutablePointer<CChar>?] = ["PATH=/usr/bin:/bin"].map { $0.withCString(strdup) }
-        e.append(nil)
-        let rc = posix_spawn(&pid, path, &fa, nil, &a, &e)
-        a.forEach { free($0) }; e.forEach { free($0) }
-        posix_spawn_file_actions_destroy(&fa)
-        guard rc == 0 else { return rc }
-        var st: Int32 = 0
-        waitpid(pid, &st, 0)
-        let exited = (st & 0x7f) == 0
-        return exited ? Int32((st >> 8) & 0xff) : -1
     }
 }
