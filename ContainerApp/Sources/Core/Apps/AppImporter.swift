@@ -151,6 +151,13 @@ public final class AppImporter: ObservableObject {
             EntitlementPolicy.shared.recordOriginal(bundleID: bid, entitlements: originalEntitlements)
             RyLog.shared.log("\(bid) 原始 entitlements：\(originalEntitlements.keys.sorted().joined(separator: ", "))",
                              level: .info, tag: "sign")
+            // "打标记": every privileged key the app declared is taken over by
+            // RyBox — stripped from the signature, allocated at runtime.
+            let taken = EntitlementPolicy.shared.takenOverKeys(bundleID: bid)
+            if !taken.isEmpty {
+                RyLog.shared.log("\(bid) 特殊权限接管 \(taken.count) 项（签名已剥离，运行时由 RyBox 分配，可在设置中开关）：\(taken.joined(separator: ", "))",
+                                 level: .info, tag: "sign")
+            }
         }
 
         var signNote: String?
