@@ -2,8 +2,8 @@ import UIKit
 
 /// Coordinates the on-screen windows for the in-process guest:
 ///   - hides the container (SpringBoard) window when a guest UI comes up,
-///   - installs the "弹出 App" eject overlay above the guest,
-///   - restores the container window when the guest is ejected.
+///   - installs the floating Home-key chrome above the guest,
+///   - restores the container window when the guest is dismissed.
 ///
 /// The guest's actual UIWindow is created by the UIApplicationMain interception
 /// hook in RyDyldHooks.m (it loads the guest's storyboard / principal VC). This
@@ -24,10 +24,10 @@ final class GuestWindowHost {
     }
 
     /// Called from the dyld hook: the guest UIWindow is already key+visible.
-    /// Hide the container window and show the eject button.
+    /// Hide the container window and show the floating Home-key chrome.
     @objc private func onGuestDidLaunch() {
         RyBoxAppDelegate.containerWindow?.isHidden = true
-        installEjectOverlay()
+        installGuestChrome()
     }
 
     /// Fallback: when the guest cannot be patched/signed/launched, still present
@@ -58,17 +58,13 @@ final class GuestWindowHost {
         win.makeKeyAndVisible()
         self.scaffoldWindow = win
         RyBoxAppDelegate.containerWindow?.isHidden = true
-        installEjectOverlay()
+        installGuestChrome()
     }
 
-    /// "弹出 App" floating chrome: dismiss the guest, return to container.
-    /// Only used while a guest UI is on screen (the container is hidden then).
-    private func installEjectOverlay() {
+    /// Floating Home-key chrome shown while a guest owns the screen. The virtual
+    /// Home key (tap) tears the guest down and returns to the SpringBoard.
+    private func installGuestChrome() {
         GuestChromeWindow.shared.install()
-    }
-
-    @objc private func ejectTapped() {
-        RyLaunchCoordinator.shared.ejectToContainer()
     }
 
     /// Dismiss the guest entirely; the container window beneath is restored.
