@@ -18,6 +18,11 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
     /// hide/restore it when a guest UI takes over the screen.
     static var containerWindow: UIWindow?
 
+    /// The host's UIWindowScene. Every window RyBox creates must be bound to a
+    /// scene on iOS 13+ or it is never rendered — that is why the floating
+    /// "主屏" button used to disappear the moment the guest took over.
+    static var hostScene: UIWindowScene?
+
     /// True once a window exists (scene path or fallback). Guards the fallback so
     /// we never end up with two windows.
     private static var hasWindow: Bool { containerWindow != nil }
@@ -26,6 +31,9 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         VirtualRoot.shared.ensure()
         Task { await RuntimeEnvironment.shared.detect() }
+        // Live log: the container's own start-up trace, so the 日志 app (and the
+        // floating ball) show the real boot sequence.
+        RyLog.shared.log("RyBox 启动 · bundle=\(Bundle.main.bundleIdentifier ?? "?")", .info, "boot")
         // NOTE: Sileo is NO LONGER installed here. It now runs from the boot
         // gate / ContentView once a certificate is configured, so it gets
         // signed with the user's identity instead of staying unsigned forever.
@@ -61,11 +69,17 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
             win = UIWindow(windowScene: scene)
         } else {
             win = UIWindow(frame: UIScreen.main.bounds)
+            // Bind the fallback window to a scene too, otherwise it never draws.
+            if let s = GuestWindowHost.hostWindowScene() {
+                win.windowScene = s
+            }
         }
         win.rootViewController = vc
         win.makeKeyAndVisible()
         self.window = win
         Self.containerWindow = win
+        if let scene = scene { Self.hostScene = scene }
+        RyLog.shared.log("容器窗口已创建 (scene=\(scene != nil ? "yes" : "fallback"))", .info, "boot")
     }
 }
 
@@ -81,10 +95,16 @@ final class RyBoxSceneDelegate: UIResponder, UIWindowSceneDelegate {
                willConnectTo session: UISceneSession,
                options connectionOptions: UIScene.ConnectionOptions) {
         guard let windowScene = scene as? UIWindowScene else { return }
+        RyBoxAppDelegate.hostScene = windowScene
         // Reuse the exact same construction as the app-delegate fallback so both
         // paths render an identical shell — but bind the window to THIS scene via
         // UIWindow(windowScene:), the correct iOS 13+ initializer.
         (UIApplication.shared.delegate as? RyBoxAppDelegate)?.installContainerWindow(to: windowScene)
         self.window = RyBoxAppDelegate.containerWindow
+        RyLog.shared.log("scene 已连接 · connectedScenes=\(UIApplication.shared.connectedScenes.count)", .info, "ui")
+    }
+
+    func sceneDidDisconnect(_ scene: UIScene) {
+        RyLog.shared.log("scene 断开连接", .warn, "ui")
     }
 }
