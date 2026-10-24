@@ -30,6 +30,10 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         VirtualRoot.shared.ensure()
+        // Populate the virtual root with the bundled minimal jbroot (dpkg/apt +
+        // standard /usr /var layout). Non-blocking and idempotent; if the asset
+        // is missing it logs and continues (Sileo still installs, tools absent).
+        JbRoot.shared.bootstrap()
         Task { await RuntimeEnvironment.shared.detect() }
         // Live log: the container's own start-up trace, so the 日志 app (and the
         // floating ball) show the real boot sequence.
