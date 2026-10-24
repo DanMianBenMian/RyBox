@@ -237,6 +237,12 @@ struct SpringBoardView: View {
                 .tag(store.pageCount)
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
+        // Explicit horizontal page swipe. The App Library page embeds a vertical
+        // ScrollView whose pan gesture competes with the TabView's built-in
+        // paging, which is why the last page (App Library) was unreachable by
+        // swipe. This gesture drives `page` directly and coexists with the
+        // TabView (both target the same value), so the library is always reachable.
+        .simultaneousGesture(pageSwipe)
         .overlay(alignment: .bottom) {
             pageDots
                 .padding(.bottom, dockHeight + 22)
@@ -247,6 +253,22 @@ struct SpringBoardView: View {
             }
         )
         .onPreferenceChange(FramePreferenceKey.self) { gridFrame = $0 }
+    }
+
+    /// Horizontal swipe that moves between home pages AND the App Library page.
+    private var pageSwipe: some Gesture {
+        DragGesture(minimumDistance: 24)
+            .onEnded { v in
+                guard !store.editMode else { return }
+                // Only a clear, predominantly-horizontal swipe pages.
+                guard abs(v.translation.width) > 60,
+                      abs(v.translation.width) > abs(v.translation.height) else { return }
+                let next = v.translation.width < 0 ? page + 1 : page - 1
+                let clamped = max(0, min(pageCount - 1, next))
+                if clamped != page {
+                    withAnimation(.easeInOut(duration: 0.28)) { page = clamped }
+                }
+            }
     }
 
     private var pageDots: some View {
