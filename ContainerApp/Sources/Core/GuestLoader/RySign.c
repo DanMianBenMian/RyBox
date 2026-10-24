@@ -49,6 +49,24 @@
 static const unsigned char *g_prov = NULL;
 static size_t g_prov_len = 0;
 
+// ---- CodeDirectory identifier override (LiveContainer parity) -------------
+// LiveContainer drives ZSign with `bundleId: NSBundle.mainBundle.bundleIdentifier`
+// — the HOST app's identifier, NOT the guest's. The guest is signed with the
+// host's certificate AND the host's provisioning profile, so the identifier
+// written into the CodeDirectory has to be the one that profile authorises.
+// Using the guest's own CFBundleIdentifier here is what made the signature
+// disagree with the profile. `NULL` keeps the guest's own id as a fallback.
+static const char *g_ident_override = NULL;
+
+void rysign_set_code_identity(const char *ident) {
+    if (g_ident_override){ free((void*)g_ident_override); g_ident_override = NULL; }
+    if (ident && ident[0]){
+        size_t n = strlen(ident) + 1;
+        char *copy = malloc(n);
+        if (copy){ memcpy(copy, ident, n); g_ident_override = copy; }
+    }
+}
+
 // ---- DER builders --------------------------------------------------------
 typedef struct { unsigned char *p; size_t len; size_t cap; } Buf;
 static void buf_init(Buf *b){ b->p = malloc(64); b->len = 0; b->cap = 64; }
@@ -513,18 +531,26 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     uint32_t old_sizeofcmds = hdr->sizeofcmds;
     size_t cmds_end = header_size + old_sizeofcmds;
 
-    // strip any pre-existing LC_CODE_SIGNATURE (re-signing safety)
+    // strip any pre-existing LC_CODE_SIGNATURE (re-signing safety) AND drop the
+    // orphaned superblob it pointed at. RyBox patches + re-signs on EVERY
+    // launch, so without the truncation each pass left one dead signature
+    // behind and the executable grew by ~16 bytes + one CMS blob per launch.
     {
         struct load_command *lc = (struct load_command*)(buf + header_size);
         uint32_t n = old_ncmds;
         for (uint32_t i=0;i<n;i++){
             if (lc->cmd == LC_CODE_SIGNATURE){
+                struct linkedit_data_command *sig = (struct linkedit_data_command*)lc;
+                uint32_t soff = sig->dataoff, ssize = sig->datasize;
                 uint32_t csz = lc->cmdsize;
                 size_t rest = old_sizeofcmds - (((unsigned char*)lc - (buf+header_size)) + csz);
                 memmove(lc, (unsigned char*)lc + csz, rest);
                 old_ncmds--; old_sizeofcmds -= csz;
                 cmds_end = header_size + old_sizeofcmds;
                 hdr->ncmds = old_ncmds; hdr->sizeofcmds = old_sizeofcmds;
+                if (ssize > 0 && soff >= cmds_end && (size_t)soff + ssize <= *len){
+                    *len = soff;
+                }
                 break;
             }
             lc = (struct load_command*)((unsigned char*)lc + lc->cmdsize);
@@ -557,6 +583,58 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
             struct section_64 *sects = (struct section_64*)(seg + 1);
             for (uint32_t s=0;s<seg->nsects;s++){
                 if (sects[s].offset >= (uint32_t)cmds_end) sects[s].offset += (uint32_t)LC_SIZE;
+            }
+        }
+        // EVERY other load command that stores a FILE offset has to move with
+        // the body. The old code only fixed LC_SEGMENT_64/section_64, which
+        // left these 16 bytes stale:
+        //
+        //   * LC_DYLD_CHAINED_FIXUPS.dataoff  -> dyld read the chained-fixups
+        //     blob from 16 bytes before the real one. On a modern Swift app
+        //     (Sileo, anything linked with the Xcode 15+ linker) that blob is
+        //     what every pointer rebind is derived from, so the guest came up
+        //     with a garbage bind table and never showed a window.
+        //   * LC_SYMTAB.symoff / stroff       -> symbol lookups resolve wrong.
+        //   * LC_DYLD_INFO(_ONLY).*_off       -> legacy rebase/bind tables.
+        //   * LC_FUNCTION_STARTS / LC_DATA_IN_CODE / LC_DYLD_EXPORTS_TRIE.
+        //   * LC_MAIN.entryoff                -> the guest's entry point, which
+        //     is exactly the address RyLaunchGuestExecutable jumps to. A stale
+        //     entryoff lands 16 bytes into the middle of some other function.
+        //
+        // A `codesign`-style signer never has this problem because it appends
+        // the LC_CODE_SIGNATURE command into the header's free space and the
+        // superblob at the end of the file instead of shifting the body.
+        else if (lc->cmd == LC_MAIN){
+            struct entry_point_command *ep = (struct entry_point_command*)lc;
+            if (ep->entryoff >= (uint64_t)cmds_end) ep->entryoff += LC_SIZE;
+        }
+        else if (lc->cmd == LC_SYMTAB){
+            struct symtab_command *st = (struct symtab_command*)lc;
+            if (st->symoff >= cmds_end) st->symoff += LC_SIZE;
+            if (st->stroff >= cmds_end) st->stroff += LC_SIZE;
+        }
+        else if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY){
+            struct dyld_info_command *di = (struct dyld_info_command*)lc;
+            if (di->rebase_off    && di->rebase_off    >= cmds_end) di->rebase_off    += LC_SIZE;
+            if (di->bind_off      && di->bind_off      >= cmds_end) di->bind_off      += LC_SIZE;
+            if (di->weak_bind_off && di->weak_bind_off >= cmds_end) di->weak_bind_off += LC_SIZE;
+            if (di->lazy_bind_off && di->lazy_bind_off >= cmds_end) di->lazy_bind_off += LC_SIZE;
+            if (di->export_off    && di->export_off    >= cmds_end) di->export_off    += LC_SIZE;
+        }
+        else if (lc->cmd == LC_CODE_SIGNATURE || lc->cmd == LC_FUNCTION_STARTS ||
+                 lc->cmd == LC_DATA_IN_CODE    || lc->cmd == LC_DYLD_CHAINED_FIXUPS ||
+                 lc->cmd == LC_DYLD_EXPORTS_TRIE){
+            struct linkedit_data_command *ld = (struct linkedit_data_command*)lc;
+            if (ld->dataoff >= cmds_end) ld->dataoff += LC_SIZE;
+        }
+        else if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64){
+            // FairPlay-encrypted binaries cannot be re-signed meaningfully; the
+            // import path is expected to reject them. Say so rather than
+            // silently producing a broken signature.
+            struct encryption_info_command *ei = (struct encryption_info_command*)lc;
+            if (ei->cryptid != 0){
+                fprintf(stderr, "rysign: WARNING binary is FairPlay-encrypted "
+                                "(cryptid=%u); its signature will not validate\n", ei->cryptid);
             }
         }
         lc = (struct load_command*)((unsigned char*)lc + lc->cmdsize);
@@ -773,7 +851,11 @@ static int sign_bundle_with_leaf_key(const char *bundlePath,
         free(prov); if(ent)free(ent);
         return 5;
     }
-    int rc = sign_macho_file_at(exe_path, leaf, privKey, team, bid, ent, ent_len);
+    // LiveContainer parity: the CodeDirectory identifier is the HOST app's
+    // bundle id (the identity the provisioning profile authorises). Fall back
+    // to the guest's own CFBundleIdentifier when Swift never set an override.
+    const char *ident = (g_ident_override && g_ident_override[0]) ? g_ident_override : bid;
+    int rc = sign_macho_file_at(exe_path, leaf, privKey, team, ident, ent, ent_len);
     if (rc != 0){
         fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc);
         free(prov); if(ent)free(ent);
@@ -786,7 +868,7 @@ static int sign_bundle_with_leaf_key(const char *bundlePath,
     const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };
     for (int s=0;s<3;s++){
         char d[2048]; snprintf(d,sizeof(d),"%s/%s",bundlePath,subdirs[s]);
-        sign_walk(d, leaf, privKey, team, bid, ent, ent_len);
+        sign_walk(d, leaf, privKey, team, ident, ent, ent_len);
     }
 
     // 6. embed provisioning profile (AMFI requires profile to match signature)
