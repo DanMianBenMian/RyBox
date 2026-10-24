@@ -81,9 +81,10 @@ public final class RyLog: ObservableObject {
 
     /// Log a line. Safe from any thread.
     ///
-    /// The signature is `log(_ message:, level:, tag:)` — the level and tag are
-    /// ALWAYS labelled. An unlabelled positional overload would make every
-    /// call site ambiguous (`log("x", .info, "tag")` could match either).
+    /// The level and tag are ALWAYS labelled (`log("text", level: .warn, tag:
+    /// "guest")`). A positional overload was tried and removed: with default
+    /// arguments on the labelled version, `log("x", .info, "tag")` became an
+    /// ambiguous call and failed to compile across every call site.
     public func log(_ message: String, level: Level = .info, tag: String = "app") {
         append(message: message, level: level, tag: tag)
     }
