@@ -9,7 +9,26 @@
 #include <sys/stat.h>
 
 #include <mach-o/loader.h>
+#if __has_include(<mach-o/fixups.h>)
 #include <mach-o/fixups.h>
+#else
+// The iOS SDK (tested on iPhoneOS 17.5) does NOT ship <mach-o/fixups.h>; the
+// chained-fixups structs are only in the macOS SDK. Declare the two structs we
+// actually touch, straight from dyld's open-source definition.
+struct dyld_chained_fixups_header {
+    uint32_t fixes_version;       // 0
+    uint32_t starts_offset;       // offset of dyld_chained_starts_in_image
+    uint32_t imports_offset;      // offset of imports
+    uint32_t symbols_offset;      // offset of symbol strings
+    uint32_t imports_count;       // number of imported symbols
+    uint32_t symbol_pool_count;
+    uint32_t addr_divide_factor;  // 0 => 1
+};
+struct dyld_chained_starts_in_image {
+    uint32_t seg_count;
+    uint32_t seg_info_offset[1];  // each entry is an offset into chain_data
+};
+#endif
 #include <mach-o/fat.h>
 #include <mach-o/arch.h>
 #include <libkern/OSByteOrder.h>
