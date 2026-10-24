@@ -32,6 +32,15 @@ enum RyP12 {
         let subject: String
         /// True when the file used the modern (OpenSSL 3) algorithms.
         let isModernEncryption: Bool
+        /// Leaf certificate, DER. Hand this straight to
+        /// `SecCertificateCreateWithData` — no need for a `SecIdentity`.
+        let certDER: Data
+        /// Private key in the exact form Security's `SecKeyCreateWithData`
+        /// wants: PKCS#1 `RSAPrivateKey` for RSA, SEC1 `ECPrivateKey` for EC
+        /// (i.e. the INNER key, not the PKCS#8 wrapper).
+        let keyDER: Data
+        /// "rsa" or "ec".
+        let keyType: String
     }
 
     // MARK: - Entry point
@@ -137,7 +146,10 @@ enum RyP12 {
                                 scheme: usedScheme.isEmpty ? "未加密 / 系统已解析" : usedScheme,
                                 keyDescription: keyInfo.description,
                                 subject: subject,
-                                isModernEncryption: usedScheme.contains("PBES2")))
+                                isModernEncryption: usedScheme.contains("PBES2"),
+                                certDER: Data(certBytes),
+                                keyDER: Data(keyInfo.inner),
+                                keyType: keyInfo.keyType))
     }
 
     // MARK: - ASN.1
@@ -435,13 +447,24 @@ enum RyP12 {
 
     // MARK: - Private key
 
-    /// Validate the decrypted PKCS#8 PrivateKeyInfo. Returns nil when the
-    /// structure is wrong (the usual sign of a wrong password).
+    /// Validate the decrypted PKCS#8 PrivateKeyInfo and hand back the pieces the
+    /// on-device signer needs. Returns nil when the structure is wrong (the usual
+    /// sign of a wrong password).
+    ///
+    /// `inner` is the PKCS#1 `RSAPrivateKey` (RSA) or SEC1 `ECPrivateKey` (EC) —
+    /// exactly what `SecKeyCreateWithData` accepts, so the C signer can rebuild a
+    /// usable `SecKey` from it without a `SecIdentity` ever existing.
     ///
     /// `key` may legitimately come back nil for EC keys on some iOS versions
     /// even though the DER is fine — we still accept those, because getting a
     /// parseable PKCS#8 out of the ciphertext already proves the password.
-    private static func inspectPrivateKey(pkcs8: [UInt8]) -> (description: String, key: SecKey?)? {
+    private struct KeyMaterial {
+        let description: String
+        let keyType: String      // "rsa" / "ec"
+        let inner: [UInt8]
+    }
+
+    private static func inspectPrivateKey(pkcs8: [UInt8]) -> KeyMaterial? {
         let a = ASN1(Data(pkcs8))
         guard let top = a.at(0), top.tag == SEQUENCE else { return nil }
         let kids = a.children(top)
@@ -453,8 +476,10 @@ enum RyP12 {
 
         var attrs: [String: Any] = [kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
         var description = ""
+        var keyType = "rsa"
 
         if algOid == oidRSA {
+            keyType = "rsa"
             attrs[kSecAttrKeyType as String] = kSecAttrKeyTypeRSA
             var bits = 2048
             let rsa = ASN1(Data(inner))
@@ -471,6 +496,7 @@ enum RyP12 {
             attrs[kSecAttrKeySizeInBits as String] = bits
             description = "RSA \(bits)"
         } else if algOid == oidEC {
+            keyType = "ec"
             attrs[kSecAttrKeyType as String] = kSecAttrKeyTypeECSECPrimeRandom
             var bits = 256
             var curveName = "P-256"
@@ -497,7 +523,7 @@ enum RyP12 {
         // Returns nil (rather than throwing) when Security dislikes the blob;
         // for EC keys that happens on some iOS versions even with valid DER,
         // which is why a nil key here is not treated as a hard failure.
-        let key = SecKeyCreateWithData(Data(inner) as CFData, attrs as CFDictionary, &error)
-        return (description, key)
+        _ = SecKeyCreateWithData(Data(inner) as CFData, attrs as CFDictionary, &error)
+        return KeyMaterial(description: description, keyType: keyType, inner: inner)
     }
 }
