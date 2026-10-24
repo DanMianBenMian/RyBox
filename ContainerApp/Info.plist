@@ -24,9 +24,31 @@
     <true/>
     <key>UILaunchScreen</key>
     <dict/>
-    <!-- Classic (non-scene) UIApplicationMain lifecycle: do NOT declare a
-         UIApplicationSceneManifest. UIRequiresFullScreen keeps the iPad layout
-         from letterboxing into an iPhone-sized frame. -->
+    <!-- Scene-based UIApplicationMain lifecycle. RyBox itself is scene-capable so
+         it owns a real UIWindowScene — in-process GUI guests (LiveContainer model)
+         attach their window to THIS scene and drive their own SceneDelegate, which
+         is the only way a modern scene-based guest app can build its real UI inside
+         RyBox's process. Without a host scene there is nothing to attach to and
+         scene guests show only their launch storyboard. -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>Default Configuration</string>
+                    <key>UISceneDelegateClassName</key>
+                    <string>$(PRODUCT_MODULE_NAME).RyBoxSceneDelegate</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
+    <!-- UIRequiresFullScreen keeps the iPad layout from letterboxing into an
+         iPhone-sized frame. -->
     <key>UIRequiresFullScreen</key>
     <true/>
     <key>UIApplicationSupportsIndirectInputEvents</key>
