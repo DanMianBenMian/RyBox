@@ -1,12 +1,15 @@
 #import "RyDyldHooks.h"
 
 #import "litehook.h"
+#import "RyLogBridge.h"
+#import "RyEntitlementHook.h"
 #import <dlfcn.h>
 #import <string.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
+#import <Security/Security.h>
 #import <objc/runtime.h>
 
 // ---- shims needed to flip the guest Mach-O header filetype ----
@@ -38,6 +41,60 @@ static volatile bool gGuestLaunching = false;
 // SpringBoard window and install the eject overlay.
 static NSString *const kRyGuestDidLaunch = @"rybox.guestDidLaunch";
 
+// Notification posted when the guest FAILED to produce any UI. Swift uses it
+// to restore the SpringBoard window instead of leaving the user on a black
+// screen with no way back.
+static NSString *const kRyGuestDidFail = @"rybox.guestDidFail";
+
+// ----------------------------------------------------------------------------
+// Retention of the guest's UI objects
+//
+// CRITICAL: `UIApplication.shared.delegate` and `scene.delegate` are WEAK
+// references. The guest's app delegate / scene delegate were created inside
+// an @autoreleasepool in the UIApplicationMain hook; when that pool drained,
+// the objects were deallocated and every window they owned went with them —
+// which is exactly the "black screen, no Home button" symptom.
+//
+// So we hold strong references here for as long as the guest is alive.
+// ----------------------------------------------------------------------------
+static id gGuestAppDelegate = nil;
+static id gGuestSceneDelegate = nil;
+
+/// The window the guest actually put on screen (so Swift can raise it above
+/// the container window).
+static UIWindow *gGuestWindow = nil;
+
+/// Release the retained guest objects (called when the guest is ejected).
+void RyReleaseGuestReferences(void) {
+    gGuestAppDelegate = nil;
+    gGuestSceneDelegate = nil;
+    gGuestWindow = nil;
+}
+
+void *RyGetGuestWindow(void) {
+    return (__bridge void *)gGuestWindow;
+}
+
+static void RyLog(const char *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void RyLog(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    RyLogWrite("info", "guest", buf);
+}
+
+static void RyLogErr(const char *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void RyLogErr(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    RyLogWrite("error", "guest", buf);
+}
+
 // ----------------------------------------------------------------------------
 // Window-scene association (LiveContainer "updateWindowScene" fix)
 //
@@ -62,12 +119,23 @@ static UIWindowScene *RyFirstWindowScene(void) {
 }
 
 /// Bind `w` to the host's window scene if it has none (no-op otherwise).
+///
+/// On iOS 13+ a window WITHOUT a windowScene is not rendered at all — it just
+/// sits there invisible. That is the whole "app opens to a black screen" and
+/// "the Home button vanished" story: the container's own chrome window was
+/// created with a plain frame and never bound to a scene, so it never drew.
 static void RyAttachWindowScene(UIWindow *w) {
-    if (!w || w.windowScene) return;
+    if (!w) return;
+    if (w.windowScene) return;
+    UIWindowScene *best = NULL;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:[UIWindowScene class]]) continue;
         UIWindowScene *ws = (UIWindowScene *)s;
-        if (w.screen == ws.screen) { w.windowScene = ws; break; }
+        if (w.screen == ws.screen) { best = ws; break; }
+        if (!best) best = ws;
+    }
+    if (best) {
+        w.windowScene = best;
     }
 }
 
@@ -137,20 +205,33 @@ static NSString *RyGuestSceneDelegateClassName(void) {
 
 /// Best-effort: run the guest's SceneDelegate so a scene-based app builds its
 /// REAL window inside RyBox's scene. This is the iOS 13+ scene lifecycle the
-/// early-return UIApplicationMain hook otherwise skips. Returns YES when the
-/// guest produced its own on-screen window (so the caller must not add a
-/// fallback window on top of it).
+/// early-return UIApplicationMain hook otherwise skips — the fix for "只有一张启动图".
+///
+/// Returns YES when the guest produced its own on-screen window (so the caller
+/// must not add a fallback window on top of it).
 static BOOL RyDriveGuestSceneDelegate(void) {
     @try {
         NSString *name = RyGuestSceneDelegateClassName();
-        if (!name.length) return NO;
+        if (!name.length) {
+            RyLog("scene delegate class not found in guest manifest");
+            return NO;
+        }
         Class cls = NSClassFromString(name);
-        if (!cls) return NO;
+        if (!cls) {
+            RyLogErr("scene delegate class '%s' not found in guest binary", name.UTF8String);
+            return NO;
+        }
         UIWindowScene *scene = RyFirstWindowScene();
-        if (!scene) return NO;
+        if (!scene) {
+            RyLogErr("no host window scene available for the guest");
+            return NO;
+        }
         id sceneDel = [[cls alloc] init];
         SEL sel = @selector(scene:willConnectToSession:options:);
-        if (![sceneDel respondsToSelector:sel]) return NO;
+        if (![sceneDel respondsToSelector:sel]) {
+            RyLog("scene delegate does not implement willConnectTo");
+            return NO;
+        }
 
         NSUInteger before = UIApplication.sharedApplication.windows.count;
         // Preserve + restore the host scene's delegate: a guest scene delegate
@@ -169,9 +250,30 @@ static BOOL RyDriveGuestSceneDelegate(void) {
         [inv setArgument:&opts atIndex:4];
         [inv invoke];
         scene.delegate = savedDelegate;
-        return UIApplication.sharedApplication.windows.count > before;
+
+        // RETAIN the scene delegate: scene.delegate is weak, so without this
+        // the guest's window is deallocated the moment this scope ends and the
+        // screen goes black.
+        gGuestSceneDelegate = sceneDel;
+
+        NSUInteger after = UIApplication.sharedApplication.windows.count;
+        if (after > before) {
+            // Find the window the guest just created and remember it.
+            UIWindow *w = nil;
+            for (UIWindow *win in UIApplication.sharedApplication.windows) {
+                if (win.windowScene == scene && win != gGuestWindow) { w = win; break; }
+            }
+            gGuestWindow = w;
+            RyLog("scene drive OK: guest created %lu window(s), scene=%s",
+                  (unsigned long)(after - before),
+                  w ? "bound" : "unbound");
+            return YES;
+        }
+        RyLog("scene drive ran but produced no window");
+        return NO;
     } @catch (NSException *e) {
-        NSLog(@"[RyBox] guest scene delegate drive failed: %@", e.reason);
+        RyLogErr("guest scene delegate drive failed: %s",
+                 e.reason ? e.reason.UTF8String : "unknown");
         return NO;
     }
 }
@@ -285,13 +387,25 @@ static int Ry_UIApplicationMain(int argc, char *argv[],
         if (!delCls && principalClassName) delCls = NSClassFromString(principalClassName);
         id<UIApplicationDelegate> delegate = delCls ? [[delCls alloc] init] : nil;
 
-        // Tell the Swift side to hide the SpringBoard window + install the Home chrome.
-        [[NSNotificationCenter defaultCenter] postNotificationName:kRyGuestDidLaunch object:nil];
+        RyLog("guest UIApplicationMain intercepted: delegate=%s principal=%s",
+              delegateClassName ? delegateClassName.UTF8String : "(none)",
+              principalClassName ? principalClassName.UTF8String : "(none)");
+
+        // Keep the guest's app delegate ALIVE. `UIApplication.delegate` is a
+        // weak reference, so without this strong reference the delegate (and
+        // every window it owns) is deallocated right after this scope — the
+        // "app opens to a black screen" bug.
+        gGuestAppDelegate = delegate;
 
         if (delegate) {
             app.delegate = delegate;
             if ([delegate respondsToSelector:@selector(application:didFinishLaunchingWithOptions:)]) {
-                [delegate application:app didFinishLaunchingWithOptions:nil];
+                @try {
+                    [delegate application:app didFinishLaunchingWithOptions:nil];
+                } @catch (NSException *e) {
+                    RyLogErr("guest didFinishLaunching raised: %s",
+                             e.reason ? e.reason.UTF8String : "unknown");
+                }
             }
         }
 
@@ -309,6 +423,8 @@ static int Ry_UIApplicationMain(int argc, char *argv[],
             RyAttachWindowScene(w);
             w.windowLevel = UIWindowLevelAlert; // above the container
             [w makeKeyAndVisible];
+            gGuestWindow = w;
+            RyLog("guest window created by app delegate, shown");
         } else if (!w && !guestOwnsWindow) {
             // Legacy delegate path (or the scene drive failed): build a window here.
             w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
@@ -328,6 +444,27 @@ static int Ry_UIApplicationMain(int argc, char *argv[],
             RyAttachWindowScene(w);   // bind to the host scene so it actually renders
             w.windowLevel = UIWindowLevelAlert; // above the container
             [w makeKeyAndVisible];
+            gGuestWindow = w;
+            RyLog("fallback window built from storyboard/principal class, shown");
+        } else if (guestOwnsWindow && gGuestWindow) {
+            // The scene delegate made its own window — make sure it is bound to
+            // the host scene and sits above the container window, otherwise the
+            // guest renders BEHIND the SpringBoard (looks like a black screen).
+            RyAttachWindowScene(gGuestWindow);
+            gGuestWindow.windowLevel = UIWindowLevelAlert;
+            [gGuestWindow makeKeyAndVisible];
+            RyLog("guest scene window raised above container");
+        }
+
+        if (gGuestWindow && !gGuestWindow.isHidden) {
+            // Tell the Swift side to hide the SpringBoard window + install the
+            // Home chrome. This happens AFTER the guest window is up so the
+            // handover never leaves a gap with nothing on screen.
+            [[NSNotificationCenter defaultCenter] postNotificationName:kRyGuestDidLaunch object:nil];
+            RyLog("guest UI is up, container handed over");
+        } else {
+            RyLogErr("guest produced no visible window — restoring the container");
+            [[NSNotificationCenter defaultCenter] postNotificationName:kRyGuestDidFail object:nil];
         }
     }
     return 0; // do NOT re-enter the run loop; RyBox's loop drives the guest
@@ -386,7 +523,7 @@ void RyInstallGuestDyldHooks(void) {
 void *RyLaunchGuestExecutable(const char *execPath) {
     void *handle = dlopen(execPath, RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
-        NSLog(@"[RyBox] dlopen guest failed: %s", dlerror());
+        RyLogErr("dlopen guest failed: %s", dlerror());
         return NULL;
     }
 
@@ -415,7 +552,7 @@ void *RyLaunchGuestExecutable(const char *execPath) {
         lc = (struct load_command *)((uint8_t *)lc + lc->cmdsize);
     }
     if (entryoff == 0) {
-        NSLog(@"[RyBox] guest has no LC_MAIN");
+        RyLogErr("guest has no LC_MAIN");
         return handle;
     }
 
