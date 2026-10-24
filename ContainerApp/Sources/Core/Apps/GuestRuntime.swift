@@ -29,10 +29,12 @@ enum GuestRuntime {
     static func launchInProcess(_ app: ImportedApp) {
         let exePath = app.executablePath
         guard FileManager.default.fileExists(atPath: exePath) else {
-            os_log("RyBox: guest executable missing: %@", exePath)
+            RyLog.shared.log("guest 可执行文件不存在：\(exePath)", .error, "guest")
             return
         }
         let bundleURL = URL(fileURLWithPath: exePath).deletingLastPathComponent()
+
+        RyLog.shared.log("准备启动 \(app.name)（\(app.bundleIdentifier)）", .info, "guest")
 
         // Heavy, potentially slow work (Mach-O patch + re-sign of the whole
         // bundle) runs OFF the main thread so the UI never freezes while a guest
@@ -42,24 +44,29 @@ enum GuestRuntime {
         // touched from there.
         DispatchQueue.global(qos: .userInitiated).async {
             // 1) Patch the guest executable in place (MH_EXECUTE -> MH_DYLIB, PAGEZERO).
-            os_log("RyBox: fs  READ   %{public}@ (guest executable)", exePath)
+            RyLog.shared.log("fs  READ   \(exePath) (guest executable)", .debug, "guest")
             let patchRC = RyPatchGuestExecutable(exePath)
             guard patchRC == 0 else {
-                os_log("RyBox: Mach-O patch failed (rc=%d) for %{public}@", patchRC, exePath)
+                RyLog.shared.log("Mach-O 补丁失败 (rc=\(patchRC))：\(exePath)", .error, "guest")
                 DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
                 return
             }
-            os_log("RyBox: fs  WRITE  %{public}@ (Mach-O patched MH_EXECUTE->MH_DYLIB)", exePath)
+            RyLog.shared.log("fs  WRITE  \(exePath) (Mach-O patched MH_EXECUTE->MH_DYLIB)", .info, "guest")
 
             // 2) Re-sign the patched binary (JIT-less; required by AMFI).
             if case .failure(let err) = CodeSigner.shared.sign(bundleAt: bundleURL.path) {
-                os_log("RyBox: guest re-sign failed: %{public}@", err.localizedDescription)
+                RyLog.shared.log("guest 重新签名失败：\(err.localizedDescription)", .error, "guest")
                 DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
                 return
             }
-            os_log("RyBox: ks  WRITE  %{public}@ (bundle re-signed)", bundleURL.path)
+            RyLog.shared.log("ks  WRITE  \(bundleURL.path) (bundle re-signed)", .info, "guest")
 
             DispatchQueue.main.async {
+                // Make this guest's ORIGINAL entitlements the active set, so the
+                // container answers the app's entitlement queries with what the
+                // app was actually built for (see EntitlementPolicy).
+                EntitlementPolicy.shared.setActive(bundleID: app.bundleIdentifier)
+
                 // 3) Redirect mainBundle + set the guest executable path for the hooks.
                 RyBoxGuestBundle.activate(bundleURL)
                 RySetGuestMainExecutablePath(exePath)
@@ -70,9 +77,9 @@ enum GuestRuntime {
 
                 // 5) dlopen + jump to the guest entry. The guest UIApplicationMain is
                 //    intercepted and hosted; by the time this returns the guest UI is up.
-                os_log("RyBox: ks  EXEC   %{public}@ (guest entry point)", exePath)
+                RyLog.shared.log("ks  EXEC   \(exePath) (guest entry point)", .info, "guest")
                 if RyLaunchGuestExecutable(exePath) == nil {
-                    os_log("RyBox: guest dlopen/launch failed")
+                    RyLog.shared.log("guest dlopen/启动失败", .error, "guest")
                     GuestWindowHost.shared.presentScaffold(bundleURL)
                 }
             }
@@ -82,5 +89,6 @@ enum GuestRuntime {
     /// Tear down the in-process guest (the "弹出 App" action). Process survives.
     static func eject() {
         GuestWindowHost.shared.dismissGuest()
+        EntitlementPolicy.shared.setActive(bundleID: nil)
     }
 }
