@@ -39,6 +39,27 @@ int rysign_sign_bundle_with_der(const char *bundlePath,
                                 const char *provPath,
                                 const char *entitlementsPath);
 
+/// Re-sign a bundle from identity material whose profile has ALREADY been
+/// decoded by Swift (`CMSDecoder` + `PropertyListSerialization`, which handle
+/// the CMS-wrapped *binary* plist that the in-C parser cannot read).
+///
+/// `leafCertDerPath` / `keyDerPath` are the DER leaf cert + private key,
+/// `entitlementsPath` is an XML plist of the guest entitlements, `team` is the
+/// TeamIdentifier string, and `certsDir` is a directory of `*.der` files (the
+/// rest of the trust chain: intermediate + root). The provisioning profile at
+/// `provPath` is embedded (AMFI requires it) but no longer parsed.
+///
+/// This is the normal path now — `rysign_sign_bundle_with_der` is retained only
+/// for the legacy p12 import.
+int rysign_sign_bundle_robust(const char *bundlePath,
+                              const char *leafCertDerPath,
+                              const char *keyDerPath,
+                              int keyIsEC,
+                              const char *provPath,
+                              const char *entitlementsPath,
+                              const char *team,
+                              const char *certsDir);
+
 /// Override the CodeDirectory identifier used for every Mach-O signed by this
 /// module.
 ///
