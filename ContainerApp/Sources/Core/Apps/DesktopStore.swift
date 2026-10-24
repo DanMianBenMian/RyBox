@@ -5,7 +5,7 @@ import Combine
 /// Built-in RyBox apps. Sileo is PREINSTALLED (shows on the desktop + dock by
 /// default), matching a jailbroken-device home screen.
 enum BuiltinApp: String, CaseIterable, Codable {
-    case sileo, settings, files, terminal, `import`
+    case sileo, settings, files, terminal, `import`, logs
 }
 
 extension BuiltinApp {
@@ -19,6 +19,7 @@ extension BuiltinApp {
         case .files: return "文件"
         case .terminal: return "终端"
         case .import: return "导入"
+        case .logs: return "日志"
         }
     }
 
@@ -29,6 +30,7 @@ extension BuiltinApp {
         case .files: return "folder.fill"
         case .terminal: return "terminal.fill"
         case .import: return "square.and.arrow.down.fill"
+        case .logs: return "text.alignleft"
         }
     }
 
@@ -39,6 +41,7 @@ extension BuiltinApp {
         case .files: return Color(red: 0.20, green: 0.55, blue: 0.95)     // Files blue
         case .terminal: return Color(red: 0.14, green: 0.15, blue: 0.18)  // near-black
         case .import: return Color(red: 0.30, green: 0.72, blue: 0.45)    // green
+        case .logs: return Color(red: 0.20, green: 0.62, blue: 0.86)     // terminal blue
         }
     }
 
@@ -50,6 +53,7 @@ extension BuiltinApp {
         case .files: return .utilities
         case .terminal: return .developer
         case .import: return .utilities
+        case .logs: return .developer
         }
     }
 }
@@ -381,6 +385,7 @@ final class DesktopStore: ObservableObject {
             slots.removeValue(forKey: m)
         }
         reflow()
+        RyLog.shared.log("建立文件夹「\(folder.name)」· 成员 \(members.count) 个", .info, "ui")
         return folder
     }
 
