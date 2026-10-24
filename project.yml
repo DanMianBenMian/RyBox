@@ -35,8 +35,11 @@ settings:
     SWIFT_OBJC_BRIDGING_HEADER: "ContainerApp/Sources/Core/GuestLoader/RyBox-Bridging-Header.h"
     # App icon (single 1024x1024 universal asset in Sources/Assets.xcassets).
     ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
-    # RyUnzip.c inflates IPA entries with zlib (raw deflate).
-    OTHER_LDFLAGS: "-lz"
+    # RyUnzip.c inflates IPA entries with zlib (raw deflate). RySign.c signs
+    # guest Mach-Os in-process with Security + CoreFoundation (CommonCrypto is in
+    # libSystem). Link those frameworks explicitly so the C translation unit
+    # resolves them.
+    OTHER_LDFLAGS: "-lz -framework Security -framework CoreFoundation"
   configs:
     Debug:
       SWIFT_OPTIMIZATION_LEVEL: "-Onone"
