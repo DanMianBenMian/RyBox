@@ -113,6 +113,9 @@ def escapes_root(rel):
 
 def store(z, arcname, data, execbit):
     info = zipfile.ZipInfo(arcname)
+    # NOTE: ZipInfo() defaults compress_type to ZIP_STORED — without this line
+    # the jbroot zip ships UNCOMPRESSED (~125 MB instead of ~40 MB).
+    info.compress_type = zipfile.ZIP_DEFLATED
     # RyUnzip chmods 0755 when the external attr has any exec bit set, else
     # 0644 — mirror the source mode so /usr/bin/dpkg stays runnable.
     info.external_attr = (0o755 if execbit else 0o644) << 16
