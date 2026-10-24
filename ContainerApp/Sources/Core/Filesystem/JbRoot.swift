@@ -29,6 +29,24 @@ final class JbRoot {
         Bundle.main.bundleURL.appendingPathComponent("Preinstalled/\(Self.assetName)")
     }
 
+    /// A jbroot zip the USER imported (Settings → 导入 jbroot 包). Lives in the
+    /// writable Application Support directory — the bundled asset inside the
+    /// .app is read-only. When present it takes priority over the bundled one,
+    /// so a stale embedded bootstrap can be replaced without a new IPA.
+    private var importedURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("RyBoxKeys/imported-jbroot.zip")
+    }
+
+    var hasImportedBootstrap: Bool {
+        FileManager.default.fileExists(atPath: importedURL.path)
+    }
+
+    /// The zip we would extract right now (user import first, bundle second).
+    private var activeSourceURL: URL? {
+        hasImportedBootstrap ? importedURL : (FileManager.default.fileExists(atPath: assetURL.path) ? assetURL : nil)
+    }
+
     /// True once the bootstrap has been extracted (marker file present).
     var isBootstrapped: Bool {
         FileManager.default.fileExists(atPath: markerURL.path)
@@ -41,13 +59,19 @@ final class JbRoot {
     /// Human-readable status for the UI (BootGate / Settings).
     var statusLine: String? {
         let fm = FileManager.default
+        if hasImportedBootstrap {
+            if isBootstrapped {
+                return "正在使用导入的 jbroot 包（已解压到虚拟根目录）。"
+            }
+            return "发现导入的 jbroot 包，将在后台解压。"
+        }
         if fm.fileExists(atPath: assetURL.path) {
             if isBootstrapped {
                 return "内置 bootstrap 已解压到虚拟根目录。"
             }
             return "发现内置 bootstrap，将在后台解压。"
         }
-        return "未找到内置 \(Self.assetName)，包管理工具（dpkg/apt）暂不可用；请在电脑上用 make_jbroot.py 生成后放入 Preinstalled/。"
+        return "未找到内置 \(Self.assetName)，包管理工具（dpkg/apt）暂不可用；可在设置中导入 jbroot zip 包。"
     }
 
     /// Extract the bundled bootstrap into the virtual root. Idempotent — safe to
@@ -71,14 +95,13 @@ final class JbRoot {
             return
         }
 
-        guard fm.fileExists(atPath: assetURL.path) else {
-            RyLog.shared.log("jbroot：未找到内置 \(Self.assetName)，跳过解压（Sileo 仍可安装，但 dpkg/apt 不可用）",
+        guard let source = activeSourceURL else {
+            RyLog.shared.log("jbroot：没有可用的 bootstrap 源（内置资产缺失、也未导入 zip），跳过解压（Sileo 仍可安装，但 dpkg/apt 不可用）",
                              level: .warn, tag: "jbroot")
             return
         }
 
-        RyLog.shared.log("jbroot：开始解压 \(Self.assetName) → \(root.path)", level: .info, tag: "jbroot")
-
+        RyLog.shared.log("jbroot：开始解压 \(source.lastPathComponent) → \(root.path)", level: .info, tag: "jbroot")
         let tmp = fm.temporaryDirectory.appendingPathComponent("jbroot-\(UUID().uuidString)")
         try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tmp) }
@@ -88,7 +111,7 @@ final class JbRoot {
         try? "*\n".write(to: namesFile, atomically: true, encoding: .utf8)
 
         var outBytes: UInt64 = 0
-        let n = ry_unzip_extract_selected(assetURL.path, root.path,
+        let n = ry_unzip_extract_selected(source.path, root.path,
                                           namesFile.path, &outBytes)
         guard n > 0 else {
             RyLog.shared.log("jbroot：解压失败（错误码 \(n)）", level: .error, tag: "jbroot")
@@ -104,6 +127,48 @@ final class JbRoot {
         let mb = Double(outBytes) / 1024 / 1024
         RyLog.shared.log("jbroot：解压完成 \(n) 个条目 / \(String(format: "%.1f", mb)) MB",
                          level: .info, tag: "jbroot")
+    }
+
+    /// Import a user-provided jbroot zip (Settings → DocPicker → zip).
+    ///
+    /// Validates the zip magic and copies the file next to the signing
+    /// material (the bundled asset inside the .app is read-only, so an
+    /// imported bootstrap must live in the writable container). It does NOT
+    /// touch the virtual root by itself — replacing an extracted root is
+    /// destructive (installed debs are lost), so the UI confirms first and
+    /// then calls `reset()` + `bootstrap()`.
+    func importBootstrap(from url: URL) -> Result<String, String> {
+        guard let fh = try? FileHandle(forReadingFrom: url) else {
+            return .failure("打不开所选文件")
+        }
+        let magic = fh.readData(ofLength: 4)
+        try? fh.close()
+        // "PK\x03\x04" = local file header; "PK\x05\x06" = empty archive.
+        guard magic.count == 4, magic[0] == 0x50, magic[1] == 0x4B else {
+            return .failure("不是 zip 文件——需要 make_jbroot.py 生成的 jbroot 包")
+        }
+        let dest = importedURL
+        do {
+            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: dest.path) {
+                try FileManager.default.removeItem(at: dest)
+            }
+            try FileManager.default.copyItem(at: url, to: dest)
+        } catch {
+            return .failure("复制失败：\(error.localizedDescription)")
+        }
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size]) as? Int64 ?? 0
+        let mb = Double(bytes) / 1024 / 1024
+        RyLog.shared.log("jbroot：已导入用户 bootstrap 包（\(String(format: "%.1f", mb)) MB）",
+                         level: .info, tag: "jbroot")
+        return .success("已导入 jbroot 包（\(String(format: "%.1f", mb)) MB）。重置并重新解压后生效。")
+    }
+
+    /// Drop the imported bootstrap and fall back to the bundled asset.
+    func removeImportedBootstrap() {
+        try? FileManager.default.removeItem(at: importedURL)
+        RyLog.shared.log("jbroot：已删除导入的 bootstrap 包", level: .info, tag: "jbroot")
     }
 
     /// Some bootstrap archives nest everything under a single top-level folder
