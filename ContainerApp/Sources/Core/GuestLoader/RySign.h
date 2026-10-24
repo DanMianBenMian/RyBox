@@ -29,7 +29,8 @@ int rysign_sign_bundle(const char *bundlePath,
 ///
 /// RyBox decodes the p12 itself (`RyP12`) precisely because Apple's importer
 /// rejects modern p12 files, so this is the normal path. `keyIsEC` selects the
-/// key type; the CMS builder assumes RSA.
+/// key type; the CMS builder picks the signature algorithm by key type
+/// (RSA → PKCS#1 v1.5 SHA-256, EC → ECDSA X9.62 SHA-256).
 ///
 /// Returns 0 on success, non-zero on failure.
 int rysign_sign_bundle_with_der(const char *bundlePath,
@@ -69,6 +70,14 @@ int rysign_sign_bundle_robust(const char *bundlePath,
 /// empty string) restores the default, which is the guest's own
 /// `CFBundleIdentifier` read from its Info.plist.
 void rysign_set_code_identity(const char *ident);
+
+/// Hand the signer the guest's Info.plist FILE BYTES (special slot -1). If not
+/// called, the signer reads Info.plist from the bundle on disk. Provided so the
+/// Swift side can pass a binary plist's raw bytes directly; the in-C fallback
+/// uses CoreFoundation, which parses BOTH XML and binary plists (this is what
+/// fixed the old rc=6 on Sileo, whose Info.plist is `bplist00`).
+void rysign_set_info_plist(const char *exeName,
+                           const unsigned char *plist, size_t len);
 
 #ifdef __cplusplus
 }
