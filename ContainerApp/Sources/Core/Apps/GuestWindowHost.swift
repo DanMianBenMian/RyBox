@@ -75,13 +75,17 @@ final class GuestWindowHost {
         overlayWindow = nil
         scaffoldWindow?.isHidden = true
         scaffoldWindow = nil
-        for w in UIApplication.shared.windows where w.windowLevel >= .alert {
-            w.isHidden = true
-        }
-        // Restore the container (SpringBoard) window.
-        if let c = RyBoxAppDelegate.containerWindow {
-            c.isHidden = false
-            c.makeKeyAndVisible()
+        // Hide EVERY window except the container (SpringBoard). A scene-based
+        // guest builds its window at .normal level (not .alert), so the old
+        // "windowLevel >= .alert" filter left it on screen after Home.
+        if let container = RyBoxAppDelegate.containerWindow {
+            for w in UIApplication.shared.windows where w !== container {
+                w.isHidden = true
+            }
+            container.isHidden = false
+            container.makeKeyAndVisible()
+        } else {
+            for w in UIApplication.shared.windows { w.isHidden = true }
         }
     }
 }
