@@ -2,6 +2,7 @@
 #import "RyMachOPatcher.h"
 #import "RyDyldHooks.h"
 #import "RyUnzip.h"
+#import "RyFsRedirect.h"
 #import "RyP12Crypto.h"
 #import "RySign.h"
 // Live log + entitlement plumbing (see Core/Logging).
