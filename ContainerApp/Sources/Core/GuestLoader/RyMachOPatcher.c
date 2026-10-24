@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 
 #include <mach-o/loader.h>
+#include <mach-o/fixups.h>
 #include <mach-o/fat.h>
 #include <mach-o/arch.h>
 #include <libkern/OSByteOrder.h>
