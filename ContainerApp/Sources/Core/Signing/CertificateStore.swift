@@ -16,8 +16,24 @@ public struct RyMessageError: LocalizedError, ExpressibleByStringLiteral {
 /// Holds the user-imported signing identity + provisioning profile.
 /// Supports BOTH development and DISTRIBUTION certificates (Ad Hoc / Enterprise).
 /// Distribution certs lack get-task-allow (no JIT) — acceptable for a runtime env.
+///
+/// Persistence: the raw p12 bytes, the provisioning profile and the p12 password
+/// are written to a private `Application Support/RyBoxKeys` directory so the
+/// configuration survives a relaunch. On launch (`init`) they are re-read and
+/// re-imported, which re-populates the in-memory `identity` / `p12VerifiedByFallback`
+/// / `certificateInfo` / `teamIdentifier` / `isConfigured` — previously those were
+/// in-memory only, so re-entering the app "lost" the certificate and the boot gate
+/// refused to proceed.
 public final class CertificateStore: ObservableObject {
     public static let shared = CertificateStore()
+
+    private let fileManager = FileManager.default
+
+    /// Private, sandboxed directory for the signing material.
+    private var keysDir: URL {
+        fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("RyBoxKeys", isDirectory: true)
+    }
 
     private var identity: SecIdentity?
     /// True when SecPKCS12Import couldn't read the file but RyP12 did. In that
@@ -35,6 +51,10 @@ public final class CertificateStore: ObservableObject {
     @Published public private(set) var teamIdentifier: String?
     /// Human readable "what we actually imported" line, shown in the UI.
     @Published public private(set) var certificateInfo: String?
+
+    private init() {
+        load()
+    }
 
     /// Import a .p12 / .pfx (distribution or development) using its password.
     ///
@@ -82,6 +102,7 @@ public final class CertificateStore: ObservableObject {
             self.p12Password = pw
             self.certificateInfo = Self.describe(identity: self.identity)
             refresh()
+            save()
             return .success(())
         }
 
@@ -99,6 +120,7 @@ public final class CertificateStore: ObservableObject {
                 self.p12Password = o.password
                 self.certificateInfo = "\(o.subject) · \(o.keyDescription) · \(o.scheme)"
                 refresh()
+                save()
                 return .success(())
             case .failure(let m):
                 if lastFallback.isEmpty { lastFallback = m.message }
@@ -128,12 +150,14 @@ public final class CertificateStore: ObservableObject {
         guard let plist = provisioningPlist() else {
             self.provisioningData = nil
             refresh()
+            save()
             return .failure("不是有效的描述文件：里面没有找到 plist。请确认选的是 .mobileprovision（不是 .cer/.p12）。")
         }
         if let teams = plist["TeamIdentifier"] as? [String], let t = teams.first {
             teamIdentifier = t
         }
         refresh()
+        save()
         return .success(())
     }
 
@@ -197,5 +221,59 @@ public final class CertificateStore: ObservableObject {
     public func guestEntitlements() -> [String: Any]? {
         guard let plist = provisioningPlist() else { return nil }
         return plist["Entitlements"] as? [String: Any]
+    }
+
+    // MARK: - Persistence
+
+    /// Persist the raw signing material so it survives a relaunch. The p12 holds
+    /// the private key, so the directory is inside the app sandbox
+    /// (Application Support) — only this app can read it.
+    private func save() {
+        do {
+            try fileManager.createDirectory(at: keysDir, withIntermediateDirectories: true)
+            if let d = p12Data { try? d.write(to: keysDir.appendingPathComponent("id.p12")) }
+            if let d = provisioningData { try? d.write(to: keysDir.appendingPathComponent("profile.mobileprovision")) }
+            let meta = ["password": p12Password ?? ""]
+            if let data = try? PropertyListSerialization.data(fromPropertyList: meta,
+                                                             format: .xml, options: 0) {
+                try? data.write(to: keysDir.appendingPathComponent("meta.plist"))
+            }
+        } catch {
+            // Persistence is best-effort; an in-memory session still works.
+        }
+    }
+
+    /// Reload a previously saved configuration on launch. Re-importing from the
+    /// stored bytes rebuilds every in-memory field, so the boot gate and the
+    /// signer see exactly the same state as when the user first imported.
+    private func load() {
+        let p12URL = keysDir.appendingPathComponent("id.p12")
+        let provURL = keysDir.appendingPathComponent("profile.mobileprovision")
+        guard fileManager.fileExists(atPath: p12URL.path),
+              fileManager.fileExists(atPath: provURL.path) else { return }
+        guard let p12 = try? Data(contentsOf: p12URL),
+              let prov = try? Data(contentsOf: provURL) else { return }
+        let pw: String = {
+            guard let data = try? Data(contentsOf: keysDir.appendingPathComponent("meta.plist")),
+                  let dict = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                    as? [String: Any],
+                  let p = dict["password"] as? String else { return "" }
+            return p
+        }()
+        _ = importP12(p12, password: pw)
+        _ = importProvisioning(prov)
+    }
+
+    /// Wipe the saved signing material (used if the user wants to reconfigure).
+    public func reset() {
+        identity = nil
+        p12VerifiedByFallback = false
+        p12Data = nil
+        p12Password = nil
+        provisioningData = nil
+        teamIdentifier = nil
+        certificateInfo = nil
+        refresh()
+        try? fileManager.removeItem(at: keysDir)
     }
 }
