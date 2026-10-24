@@ -32,12 +32,22 @@ public final class CodeSigner {
     /// Re-sign an entire .app bundle IN PLACE with the user's distribution cert.
     ///
     /// Steps:
-    ///   1. stage p12 + provisioning + entitlements plist into a temp dir
+    ///   1. stage provisioning + entitlements plist into a temp dir
     ///   2. embed the provisioning profile as `embedded.mobileprovision`
     ///      (AMFI requires the running code's profile to match the signature)
     ///   3. derive guest entitlements from the provisioning profile
     ///   4. delegate the Mach-O signing to the bundled signer (in-process C
-    ///      routine `rysign_sign_bundle`, compiled into this target)
+    ///      routine `rysign_sign_bundle*`, compiled into this target)
+    ///
+    /// ## Which signer entry is used
+    ///
+    /// `CertificateStore.importP12` first tries `SecPKCS12Import`. When that
+    /// fails (which is the norm for p12 files written by OpenSSL 3: PBES2 +
+    /// AES-256-CBC + PBKDF2-SHA256) it falls back to RyBox's own PKCS#12
+    /// decoder, which decrypts the file and hands back a DER certificate + a
+    /// DER private key. The signer then takes the DER entry point and never
+    /// calls `SecPKCS12Import` at all — that call is what made every guest
+    /// launch die with "签名失败（退出码 3）".
     ///
     /// ## Entitlements
     ///
@@ -65,18 +75,12 @@ public final class CodeSigner {
             return .failure(.stageFailed)
         }
 
-        // 1) stage p12
-        let p12URL = tmp.appendingPathComponent("id.p12")
-        guard let p12 = CertificateStore.shared.p12RawData(),
-              let pw = CertificateStore.shared.p12Passphrase(),
-              (try? p12.write(to: p12URL)) != nil else { return .failure(.stageFailed) }
-
-        // 2) stage provisioning
+        // 1) stage provisioning
         let provURL = tmp.appendingPathComponent("profile.mobileprovision")
         guard let prov = CertificateStore.shared.provisioningRawData(),
               (try? prov.write(to: provURL)) != nil else { return .failure(.stageFailed) }
 
-        // 3) stage entitlements (from provisioning's embedded Entitlements dict)
+        // 2) stage entitlements (from provisioning's embedded Entitlements dict)
         let entsURL = tmp.appendingPathComponent("guest.entitlements.plist")
         let profileEnts = CertificateStore.shared.guestEntitlements() ?? [:]
         EntitlementPolicy.shared.updateProfile(profileEnts)
@@ -85,18 +89,69 @@ public final class CodeSigner {
             try? entsData.write(to: entsURL)
         }
 
-        // 4) embed provisioning profile inside the guest bundle
+        // 3) embed provisioning profile inside the guest bundle
         let embeddedURL = URL(fileURLWithPath: path)
             .appendingPathComponent("embedded.mobileprovision")
         try? prov.write(to: embeddedURL)
 
-        // 5) delegate Mach-O signing to the bundled on-device signer (in-process).
-        //    rysign_sign_bundle() re-signs every Mach-O in the bundle with the
-        //    staged identity + profile so the guest passes AMFI when dlopen'd.
-        let rc = rysign_sign_bundle(path, p12URL.path, pw, provURL.path, entsURL.path)
+        // 4) delegate Mach-O signing to the bundled on-device signer (in-process).
+        //    Prefer the decoded-DER entry whenever the p12 needed RyBox's own
+        //    decoder; that path does not depend on SecPKCS12Import at all.
+        var rc: Int32 = -1
+        if CertificateStore.shared.usesFallbackIdentity,
+           let cert = CertificateStore.shared.fallbackCertDER(),
+           let key = CertificateStore.shared.fallbackKeyDER() {
+            let certURL = tmp.appendingPathComponent("cert.der")
+            let keyURL = tmp.appendingPathComponent("key.der")
+            guard (try? cert.write(to: certURL)) != nil,
+                  (try? key.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
+            RyLog.shared.log("sign  使用内置 PKCS#12 解码器（OpenSSL 3 p12）",
+                             level: .info, tag: "sign")
+            rc = rysign_sign_bundle_with_der(path, certURL.path, keyURL.path,
+                                             CertificateStore.shared.fallbackKeyIsEC() ? 1 : 0,
+                                             provURL.path, entsURL.path)
+        } else {
+            // Legacy-encrypted p12: SecPKCS12Import can open it, so stage the
+            // raw bytes + password and let C import them.
+            let p12URL = tmp.appendingPathComponent("id.p12")
+            guard let p12 = CertificateStore.shared.p12RawData(),
+                  let pw = CertificateStore.shared.p12Passphrase(),
+                  (try? p12.write(to: p12URL)) != nil else { return .failure(.stageFailed) }
+            rc = rysign_sign_bundle(path, p12URL.path, pw, provURL.path, entsURL.path)
+            // Belt and braces: if C's importer refused a file Swift's importer
+            // accepted (or vice versa), retry through the decoder material.
+            if rc == 3, let cert = CertificateStore.shared.fallbackCertDER(),
+               let key = CertificateStore.shared.fallbackKeyDER() {
+                let certURL = tmp.appendingPathComponent("cert.der")
+                let keyURL = tmp.appendingPathComponent("key.der")
+                if (try? cert.write(to: certURL)) != nil, (try? key.write(to: keyURL)) != nil {
+                    RyLog.shared.log("sign  SecPKCS12Import 失败，回退到内置解码器",
+                                     level: .warn, tag: "sign")
+                    rc = rysign_sign_bundle_with_der(path, certURL.path, keyURL.path,
+                                                     CertificateStore.shared.fallbackKeyIsEC() ? 1 : 0,
+                                                     provURL.path, entsURL.path)
+                }
+            }
+        }
         if rc != 0 {
-            return .failure(.signFailed(rc, "rysign"))
+            return .failure(.signFailed(rc, signFailureReason(rc)))
         }
         return .success(())
+    }
+
+    /// Turn a rysign exit code into something a human can act on. The old code
+    /// reported the literal string "rysign", which told the user nothing.
+    private func signFailureReason(_ rc: Int32) -> String {
+        switch rc {
+        case 2:  return "读不到 p12 文件"
+        case 3:  return "系统无法导入这个 p12（多为 OpenSSL 3 加密），内置解码器也没能解开"
+        case 4:  return "读不到描述文件（mobileprovision）"
+        case 5:  return "在 App 包里找不到主可执行文件"
+        case 6:  return "给主可执行文件签名失败"
+        case 7:  return "证书/私钥 DER 无法使用"
+        case 8:  return "私钥无法创建（可能不是 RSA，或 DER 损坏）"
+        case 9:  return "无法用这把私钥签名（SecKeyCreateSignature 拒绝）——证书可能是 EC，或密钥不受信任"
+        default: return "签名器内部错误（rc=\(rc)）"
+        }
     }
 }
