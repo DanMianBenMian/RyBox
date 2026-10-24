@@ -39,6 +39,21 @@ public final class CodeSigner {
     ///   4. delegate the Mach-O signing to the bundled signer (in-process C
     ///      routine `rysign_sign_bundle`, compiled into this target)
     ///
+    /// ## Entitlements
+    ///
+    /// The SIGNED entitlement set is exactly what the user's provisioning
+    /// profile grants — nothing more. AMFI compares the signature's entitlements
+    /// against the profile and REJECTS a signature that claims capabilities
+    /// the profile does not cover, so merging the original app's entitlements
+    /// into the signature would break the guest at dlopen time.
+    ///
+    /// What the app ORIGINALLY had is preserved separately (see
+    /// `EntitlementPolicy`): the container keeps it, hands it to the running
+    /// guest through the entitlement oracle, and exports it to CLI guests via
+    /// `RYBOX_ENTITLEMENTS`. That is how an imported app keeps working with
+    /// the capabilities it was built for even though the container signs it
+    /// with a different identity.
+    ///
     /// - Parameter path: absolute path to the guest `.app` bundle.
     public func sign(bundleAt path: String) -> Result<Void, SignError> {
         guard CertificateStore.shared.isConfigured else { return .failure(.notConfigured) }
@@ -63,8 +78,9 @@ public final class CodeSigner {
 
         // 3) stage entitlements (from provisioning's embedded Entitlements dict)
         let entsURL = tmp.appendingPathComponent("guest.entitlements.plist")
-        if let ents = CertificateStore.shared.guestEntitlements(),
-           let entsData = try? PropertyListSerialization.data(fromPropertyList: ents,
+        let profileEnts = CertificateStore.shared.guestEntitlements() ?? [:]
+        EntitlementPolicy.shared.updateProfile(profileEnts)
+        if let entsData = try? PropertyListSerialization.data(fromPropertyList: profileEnts,
                                                              format: .xml, options: 0) {
             try? entsData.write(to: entsURL)
         }
