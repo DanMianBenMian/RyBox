@@ -8,20 +8,35 @@ import Combine
 /// the log stays reachable while a guest app is running (the guest covers the
 /// whole screen, which is exactly when you need the log most).
 ///
-/// Implementation notes that matter:
-///   * It lives in its OWN `UIWindow` at `.alert + 200` level, so it floats
-///     above both the container window AND any guest window (the guest is
-///     installed at `.alert`).
-///   * The window is created with `UIWindow(windowScene:)` — a window without
-///     a scene is NOT shown on iOS 13+, which is exactly the bug that made
-///     the Home key disappear after RyBox became scene-capable.
-///   * The ball is a plain UIKit view (not SwiftUI) so the touch handling is
-///     unambiguous: a drag moves the ball, a tap expands the log panel, and
-///     every other touch passes straight through to the app underneath.
+/// ## Why this is two TINY windows and not one full-screen one
+///
+/// The first implementation used a single full-screen window with a
+/// `PassThroughView` root and called `makeKeyAndVisible()`. That froze the
+/// entire desktop: the user's words were "他的交互区域把所有控件盖住了，像卡死".
+/// Two separate things went wrong at once:
+///
+///   1. `makeKeyAndVisible()` STOLE the key window from the SpringBoard. A
+///      non-key window still receives touches (UIKit walks visible windows by
+///      `windowLevel`), but once the SpringBoard stopped being key, its
+///      SwiftUI gesture plumbing stopped delivering — drag, long-press menu and
+///      paging all went dead at the same time, which is exactly the report.
+///   2. A full-screen hit surface depends on `hitTest` returning nil for every
+///      point outside the ball. That is fragile: one non-nil answer anywhere
+///      and the whole screen is swallowed.
+///
+/// So each control now lives in a window that is EXACTLY the size of that
+/// control, and NEITHER window is made key. There is no surface left over that
+/// could possibly intercept a touch, and the SpringBoard keeps its key window
+/// (and therefore its gestures) untouched.
 final class FloatingLogBall: NSObject {
     static let shared = FloatingLogBall()
 
-    private var window: UIWindow?
+    private static let ballSize = CGSize(width: 46, height: 46)
+    private static let panelSize = CGSize(width: 320, height: 260)
+
+    private var ballWindow: UIWindow?
+    private var panelWindow: UIWindow?
+
     private var ball: UIView?
     private var ballIcon: UIImageView?
     private var errorDot: UIView?
@@ -42,30 +57,35 @@ final class FloatingLogBall: NSObject {
         super.init()
     }
 
-    var isVisible: Bool { window != nil }
+    var isVisible: Bool { ballWindow != nil }
 
     // MARK: - Show / hide
 
     func show() {
-        guard window == nil else { return }
+        guard ballWindow == nil else { return }
         guard let scene = Self.currentScene() else {
             RyLog.shared.log("浮窗日志球无法开启：没有可用的 windowScene", level: .error, tag: "ui")
             return
         }
 
-        let win = UIWindow(windowScene: scene)
-        win.windowLevel = .alert + 200
-        win.isUserInteractionEnabled = true
-        win.backgroundColor = .clear
+        // Restore the saved position (bottom-right by default) BEFORE building
+        // the windows, because the window frames come from it.
+        if let saved = UserDefaults.standard.object(forKey: posKey) as? [Double],
+           saved.count == 2 {
+            ballCenter = CGPoint(x: saved[0], y: saved[1])
+        } else {
+            let b = UIScreen.main.bounds
+            ballCenter = CGPoint(x: b.maxX - 50, y: b.maxY - 140)
+        }
 
-        let root = PassThroughView()
-        root.backgroundColor = .clear
+        // ---- the ball, in its own 46×46 window -----------------------------
+        let bw = UIWindow(frame: Self.ballFrame(ballCenter))
+        bw.windowScene = scene
+        bw.windowLevel = .alert + 200
+        bw.backgroundColor = .clear
+        // NOTE: `isHidden = false`, NOT `makeKeyAndVisible()`. See the header.
+        bw.isHidden = false
 
-        let vc = UIViewController()
-        vc.view = root
-        win.rootViewController = vc
-
-        // --- the ball ---
         let ball = UIView()
         ball.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.92)
         ball.layer.cornerRadius = 23
@@ -75,8 +95,8 @@ final class FloatingLogBall: NSObject {
         ball.layer.shadowOpacity = 0.35
         ball.layer.shadowRadius = 8
         ball.layer.shadowOffset = CGSize(width: 0, height: 3)
-        ball.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(ball)
+        ball.frame = bw.bounds
+        ball.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
         let icon = UIImageView(image: UIImage(systemName: "terminal.fill"))
         icon.tintColor = .label
@@ -92,8 +112,6 @@ final class FloatingLogBall: NSObject {
         ball.addSubview(dot)
 
         NSLayoutConstraint.activate([
-            ball.widthAnchor.constraint(equalToConstant: 46),
-            ball.heightAnchor.constraint(equalToConstant: 46),
             icon.centerXAnchor.constraint(equalTo: ball.centerXAnchor),
             icon.centerYAnchor.constraint(equalTo: ball.centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 20),
@@ -104,7 +122,20 @@ final class FloatingLogBall: NSObject {
             dot.topAnchor.constraint(equalTo: ball.topAnchor, constant: 1)
         ])
 
-        // --- the log panel ---
+        let bvc = UIViewController()
+        bvc.view = UIView(frame: bw.bounds)
+        bvc.view?.backgroundColor = .clear
+        bvc.view?.addSubview(ball)
+        bw.rootViewController = bvc
+        ballWindow = bw
+
+        // ---- the log panel, in its own 320×260 window ----------------------
+        let pw = UIWindow(frame: Self.panelFrame(ballCenter))
+        pw.windowScene = scene
+        pw.windowLevel = .alert + 200
+        pw.backgroundColor = .clear
+        pw.isHidden = true          // only shown while expanded
+
         let panel = UIView()
         panel.backgroundColor = UIColor.black.withAlphaComponent(0.82)
         panel.layer.cornerRadius = 14
@@ -113,9 +144,8 @@ final class FloatingLogBall: NSObject {
         panel.layer.shadowColor = UIColor.black.cgColor
         panel.layer.shadowOpacity = 0.4
         panel.layer.shadowRadius = 16
-        panel.translatesAutoresizingMaskIntoConstraints = false
-        panel.isHidden = true
-        root.addSubview(panel)
+        panel.frame = pw.bounds
+        panel.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
         let text = UILabel()
         text.numberOfLines = 0
@@ -123,37 +153,30 @@ final class FloatingLogBall: NSObject {
         text.textColor = UIColor.white.withAlphaComponent(0.9)
         text.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(text)
-
         NSLayoutConstraint.activate([
-            panel.widthAnchor.constraint(equalToConstant: 320),
-            panel.heightAnchor.constraint(equalToConstant: 260),
-            panel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            panel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -110),
             text.topAnchor.constraint(equalTo: panel.topAnchor, constant: 8),
             text.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
             text.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
             text.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -8)
         ])
 
-        win.makeKeyAndVisible()
-        window = win
+        let pvc = UIViewController()
+        pvc.view = UIView(frame: pw.bounds)
+        pvc.view?.backgroundColor = .clear
+        pvc.view?.addSubview(panel)
+        pw.rootViewController = pvc
+        panelWindow = pw
+
         self.ball = ball
         self.ballIcon = icon
         self.errorDot = dot
         self.panel = panel
         self.logText = text
+        self.panelVisible = false
 
-        // Restore the saved position (bottom-right by default).
-        if let saved = UserDefaults.standard.object(forKey: posKey) as? [Double],
-           saved.count == 2 {
-            ballCenter = CGPoint(x: saved[0], y: saved[1])
-        } else {
-            let b = UIScreen.main.bounds
-            ballCenter = CGPoint(x: b.maxX - 50, y: b.maxY - 140)
-        }
-        applyBallPosition()
-
-        // Gestures: a tap toggles the panel, a drag moves the ball.
+        // Gestures: a tap toggles the panel, a drag moves the ball. Both live
+        // on the ball itself, inside the ball's own window, so they can never
+        // be confused with a desktop gesture.
         let tap = UITapGestureRecognizer(target: self, action: #selector(onTap))
         ball.addGestureRecognizer(tap)
         let pan = UIPanGestureRecognizer(target: self, action: #selector(onPan(_:)))
@@ -172,9 +195,12 @@ final class FloatingLogBall: NSObject {
 
     func hide() {
         cancellables.removeAll()
-        window?.isHidden = true
-        window?.rootViewController = nil
-        window = nil
+        ballWindow?.isHidden = true
+        ballWindow?.rootViewController = nil
+        ballWindow = nil
+        panelWindow?.isHidden = true
+        panelWindow?.rootViewController = nil
+        panelWindow = nil
         ball = nil
         ballIcon = nil
         errorDot = nil
@@ -188,14 +214,42 @@ final class FloatingLogBall: NSObject {
         isVisible ? hide() : show()
     }
 
+    /// `GuestWindowHost.dismissGuest()` hides EVERY window except the container
+    /// one, which would take the ball down with the guest. Bring it back.
+    func reshow() {
+        guard ballWindow != nil else { return }
+        ballWindow?.isHidden = false
+        panelWindow?.isHidden = panelVisible
+    }
+
+    // MARK: - Frames
+
+    private static func ballFrame(_ center: CGPoint) -> CGRect {
+        CGRect(x: center.x - ballSize.width / 2,
+               y: center.y - ballSize.height / 2,
+               width: ballSize.width, height: ballSize.height)
+    }
+
+    /// The panel sits just above the ball, clamped on screen.
+    private static func panelFrame(_ center: CGPoint) -> CGRect {
+        let b = UIScreen.main.bounds
+        var x = center.x - panelSize.width + ballSize.width / 2 + 8
+        var y = center.y - panelSize.height - 30
+        x = max(12, min(b.maxX - panelSize.width - 12, x))
+        y = max(60, min(b.maxY - panelSize.height - 12, y))
+        return CGRect(x: x, y: y, width: panelSize.width, height: panelSize.height)
+    }
+
+    private func applyFrames() {
+        ballWindow?.frame = Self.ballFrame(ballCenter)
+        panelWindow?.frame = Self.panelFrame(ballCenter)
+    }
+
     // MARK: - Gestures
 
     @objc private func onTap() {
         panelVisible.toggle()
-        UIView.animate(withDuration: 0.22) {
-            self.panel?.alpha = self.panelVisible ? 1 : 0
-            self.panel?.isHidden = !self.panelVisible
-        }
+        panelWindow?.isHidden = !panelVisible
         if panelVisible { refresh(entries: RyLog.shared.entries) }
     }
 
@@ -209,21 +263,17 @@ final class FloatingLogBall: NSObject {
             let now = g.location(in: ball.superview)
             var next = CGPoint(x: ballStart.x + (now.x - dragStart.x),
                                y: ballStart.y + (now.y - dragStart.y))
-            // Keep the ball on screen.
+            // Keep the ball on screen (and clear of the status bar).
             let b = UIScreen.main.bounds
             next.x = max(30, min(b.maxX - 30, next.x))
             next.y = max(80, min(b.maxY - 40, next.y))
             ballCenter = next
-            applyBallPosition()
+            applyFrames()
         case .ended, .cancelled:
             UserDefaults.standard.set([Double(ballCenter.x), Double(ballCenter.y)], forKey: posKey)
         default:
             break
         }
-    }
-
-    private func applyBallPosition() {
-        ball?.center = ballCenter
     }
 
     // MARK: - Live content
