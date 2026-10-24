@@ -31,6 +31,10 @@ struct AppLibraryView: View {
                 VStack(alignment: .leading, spacing: 22) {
                     if isSearching {
                         searchResults
+                    } else if buckets.isEmpty {
+                        // A genuinely empty library must never look like a
+                        // rendering failure — say so, and say what to do.
+                        emptyState
                     } else {
                         ForEach(buckets) { bucket in
                             bucketSection(bucket)
@@ -44,6 +48,21 @@ struct AppLibraryView: View {
             // Tapping the background dismisses the keyboard, like iOS.
             .onTapGesture { searchFocused = false }
         }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "square.grid.2x2")
+                .font(.system(size: 34, weight: .light))
+            Text("资源库是空的")
+                .font(.system(size: 15, weight: .semibold))
+            Text("导入的 App 会出现在这里，也会自动放到主屏。")
+                .font(.system(size: 12.5))
+                .multilineTextAlignment(.center)
+        }
+        .foregroundStyle(.white.opacity(0.62))
+        .frame(maxWidth: .infinity)
+        .padding(.top, 70)
     }
 
     // MARK: Search
