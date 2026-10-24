@@ -1,14 +1,16 @@
 import UIKit
 
 /// A transparent, full-screen container view that ONLY lets its own subviews
-/// (the Home / eject buttons) receive touches; every other touch passes
-/// THROUGH to the window(s) beneath. Used by the guest-runtime chrome window,
-/// which is KEY (so its buttons work) while the guest UI below stays live.
+/// (the Home / eject buttons, the floating log ball) receive touches; every
+/// other touch passes THROUGH to the window(s) beneath. Used by the guest-runtime
+/// chrome window and the floating log ball, which are KEY (so their controls
+/// work) while the app underneath stays live.
 final class PassThroughView: UIView {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
         // If the only thing hit is this transparent container itself, let the
-        // touch fall through to windows below.
+        // touch fall through to windows below. Its SUBVIEWS (buttons, the ball)
+        // still hit normally — that is what makes them usable.
         return (hit === self) ? nil : hit
     }
 }
@@ -35,6 +37,14 @@ final class GuestChromeWindow {
         guard window == nil else { return }
 
         let win = UIWindow(frame: UIScreen.main.bounds)
+        // CRITICAL: bind the window to the host's UIWindowScene. On iOS 13+ a
+        // window WITHOUT a scene is never rendered — it stays invisible, which
+        // is exactly why the Home key disappeared once RyBox became
+        // scene-capable. A window with no scene also cannot become key, so the
+        // button would be dead even if it drew.
+        if let scene = GuestWindowHost.hostWindowScene() {
+            win.windowScene = scene
+        }
         win.windowLevel = .alert + 100
         win.isUserInteractionEnabled = true
 
@@ -64,6 +74,7 @@ final class GuestChromeWindow {
         // else falls through to the guest window beneath.
         win.makeKeyAndVisible()
         self.window = win
+        RyLog.shared.log("guest chrome (主屏 button) installed", .info, "ui")
     }
 
     func teardown() {
