@@ -23,6 +23,25 @@ enum GuestEnvironment {
         if let app = app {
             env["RYBOX_GUEST_BID"] = app.bundleIdentifier
             env["RYBOX_GUEST_HOME"] = app.containerPath
+            // Entitlement simulation for CLI guests: the child process runs with
+            // the CONTAINER's entitlements (it is a fork of RyBox), so an app
+            // that asks "do I have capability X?" would get the wrong answer.
+            // We hand it the app's ORIGINAL entitlement set instead — the same
+            // table the in-process guests query through the entitlement oracle.
+            let original = EntitlementPolicy.shared.original[app.bundleIdentifier] ?? [:]
+            if !original.isEmpty {
+                let simulated = EntitlementPolicy.simulatedEntitlements(
+                    original: original,
+                    profile: EntitlementPolicy.shared.profile)
+                if let data = try? PropertyListSerialization.data(fromPropertyList: simulated,
+                                                                 format: .xml, options: 0),
+                   let s = String(data: data, encoding: .utf8) {
+                    env["RYBOX_ENTITLEMENTS"] = s
+                }
+                env["RYBOX_ENTITLEMENTS_KEYS"] = simulated.keys.sorted().joined(separator: ",")
+                RyLog.shared.log("微内核放行 \(app.bundleIdentifier) 的 entitlements：\(simulated.keys.sorted().joined(separator: ", "))",
+                                 .info, "kernel")
+            }
         }
         return env
     }
