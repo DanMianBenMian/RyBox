@@ -3,9 +3,12 @@
 #import <dlfcn.h>
 #import <string.h>
 #import <stdlib.h>
+#import <stdio.h>       // FILE / fopen (ry_fopen)
+#import <stdarg.h>      // va_list / va_start / va_arg (ry_open / ry_openat)
 #import <unistd.h>
 #import <limits.h>
 #import <sys/stat.h>
+#import <sys/mount.h>   // statfs / struct statfs live here on Darwin
 #import <fcntl.h>
 #import <spawn.h>
 #import "litehook.h"
