@@ -193,6 +193,96 @@ static void RyInstallUIKitSwizzles(void) {
     if (a && b) method_exchangeImplementations(a, b);
 }
 
+// ----------------------------------------------------------------------------
+// Entitlement simulation for in-process guests
+//
+// The guest runs INSIDE RyBox's process, so its code-signature entitlements are
+// RyBox's, not the app's. When the guest asks Security "do I hold entitlement
+// X?" (via SecTaskCopyValueForEntitlement / ...ValuesForEntitlements) it would
+// get RyBox's set and self-degrade ("环境不兼容"). These hooks route those
+// queries to the container's entitlement oracle (RyEntitlementAnswer), which
+// answers from the guest's ORIGINAL entitlement set captured at import time.
+//
+// This is the in-process half of "the microkernel takes over entitlements"
+// (the CLI half already exports RYBOX_ENTITLEMENTS). It is transparent when no
+// guest is active: the oracle returns NULL for every unknown key, so we fall
+// straight through to the real Security implementation.
+// ----------------------------------------------------------------------------
+static id (*orig_SecTaskCopyValueForEntitlement)(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error) = NULL;
+static CFDictionaryRef (*orig_SecTaskCopyValuesForEntitlements)(SecTaskRef task, CFArrayRef entitlements, CFErrorRef *error) = NULL;
+
+// EntitlementPolicy.plistString emits either a full XML plist fragment
+// (dict/array values) or a bare scalar ("true"/"false", a number-as-string,
+// or a raw string). Reconstruct the matching Obj-C object.
+static id ryDecodeEntitlementAnswer(const char *ans) {
+    if (!ans) return nil;
+    NSString *s = [NSString stringWithUTF8String:ans];
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    id parsed = [NSPropertyListSerialization propertyListWithData:d
+                                                          options:NSPropertyListImmutable
+                                                           format:NULL error:NULL];
+    if (parsed) return parsed;                        // dict / array
+    if ([s isEqualToString:@"true"])  return @YES;
+    if ([s isEqualToString:@"false"]) return @NO;
+    return s;                                         // number-as-string / raw string
+}
+
+NS_RETURNS_RETAINED
+static id ry_SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error) {
+    if (entitlement) {
+        const char *name = [(NSString *)entitlement UTF8String];
+        char *ans = RyEntitlementAnswer(name);
+        if (ans) {
+            id val = ryDecodeEntitlementAnswer(ans);
+            free(ans);
+            if (val) return (__bridge_transfer id)CFBridgingRetain(val);  // caller owns (+1)
+        }
+    }
+    if (orig_SecTaskCopyValueForEntitlement)
+        return orig_SecTaskCopyValueForEntitlement(task, entitlement, error);
+    return nil;
+}
+
+CF_RETURNS_RETAINED
+static CFDictionaryRef ry_SecTaskCopyValuesForEntitlements(SecTaskRef task, CFArrayRef entitlements, CFErrorRef *error) {
+    // Start from the real answer, then overlay the guest's simulated values so
+    // the app gets a complete dict (keys it does not simulate fall back to
+    // RyBox's own entitlements).
+    CFDictionaryRef orig = orig_SecTaskCopyValuesForEntitlements
+        ? orig_SecTaskCopyValuesForEntitlements(task, entitlements, error) : NULL;
+    NSMutableDictionary *out = orig
+        ? [(__bridge NSDictionary *)orig mutableCopy]
+        : [NSMutableDictionary dictionary];
+    if (orig) CFRelease(orig);
+
+    if (entitlements) {
+        CFIndex n = CFArrayGetCount(entitlements);
+        for (CFIndex i = 0; i < n; i++) {
+            CFStringRef key = (CFStringRef)CFArrayGetValueAtIndex(entitlements, i);
+            if (!key) continue;
+            const char *name = [(NSString *)key UTF8String];
+            char *ans = RyEntitlementAnswer(name);
+            if (ans) {
+                id val = ryDecodeEntitlementAnswer(ans);
+                free(ans);
+                if (val) out[(NSString *)key] = val;
+            }
+        }
+    }
+    return (CFDictionaryRef)CFBridgingRetain(out);  // caller owns (+1)
+}
+
+static void RyInstallEntitlementSwizzles(void) {
+    if (orig_SecTaskCopyValueForEntitlement && orig_SecTaskCopyValuesForEntitlements) return;  // idempotent
+    void *pv  = dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    void *pvs = dlsym(RTLD_DEFAULT, "SecTaskCopyValuesForEntitlements");
+    if (pv)  orig_SecTaskCopyValueForEntitlement = (id (*)(SecTaskRef, CFStringRef, CFErrorRef *))pv;
+    if (pvs) orig_SecTaskCopyValuesForEntitlements = (CFDictionaryRef (*)(SecTaskRef, CFArrayRef, CFErrorRef *))pvs;
+    if (pv)  litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pv,  ry_SecTaskCopyValueForEntitlement, NULL);
+    if (pvs) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pvs, ry_SecTaskCopyValuesForEntitlements, NULL);
+    RyLog("entitlement swizzle installed (SecTaskCopyValueForEntitlement / ...ValuesForEntitlements)");
+}
+
 /// The guest's SceneDelegate class name, read from its UISceneManifest.
 static NSString *RyGuestSceneDelegateClassName(void) {
     NSDictionary *info = NSBundle.mainBundle.infoDictionary;
@@ -519,6 +609,10 @@ void RyInstallGuestDyldHooks(void) {
         orig_UIApplicationMain = (int (*)(int, char **, NSString *, NSString *))uam;
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, uam, Ry_UIApplicationMain, NULL);
     }
+
+    // Route in-process guests' entitlement queries to the container oracle so a
+    // guest sees its OWN (simulated) entitlements instead of RyBox's host set.
+    RyInstallEntitlementSwizzles();
 }
 
 void *RyLaunchGuestExecutable(const char *execPath) {
