@@ -75,6 +75,12 @@ enum GuestRuntime {
                 //    dlopen-time symbol resolution).
                 RyInstallGuestDyldHooks()
 
+                // 4b) Turn ON filesystem redirection for the duration of the
+                //     guest: the guest's absolute path opens (and any tools it
+                //     spawns) now route into the jbroot. RyBox's own paths are
+                //     whitelisted, so the shell keeps working untouched.
+                ry_fs_set_enabled(1)
+
                 // 5) dlopen + jump to the guest entry. The guest UIApplicationMain is
                 //    intercepted and hosted; by the time this returns the guest UI is up.
                 RyLog.shared.log("ks  EXEC   \(exePath) (guest entry point)", level: .info, tag: "guest")
@@ -88,6 +94,9 @@ enum GuestRuntime {
 
     /// Tear down the in-process guest (the "弹出 App" action). Process survives.
     static func eject() {
+        // Turn filesystem redirection back off so RyBox's own file operations
+        // are no longer routed into the jbroot.
+        ry_fs_set_enabled(0)
         GuestWindowHost.shared.dismissGuest()
         EntitlementPolicy.shared.setActive(bundleID: nil)
     }
