@@ -159,7 +159,9 @@ final class JbRoot {
             }
             try FileManager.default.copyItem(at: url, to: dest)
         } catch {
-            return .failure("复制失败：\(error.localizedDescription)")
+            // Interpolated strings are NOT string literals — ExpressibleByStringLiteral
+            // does not kick in, so wrap explicitly (this exact mistake failed CI twice).
+            return .failure(RyMessageError("复制失败：\(error.localizedDescription)"))
         }
         let bytes = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size]) as? Int64 ?? 0
         let mb = Double(bytes) / 1024 / 1024
