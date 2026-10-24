@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import Compression
 
 /// Imports an .ipa: unzip -> parse Info.plist -> classify GUI vs CLI ->
@@ -67,7 +68,7 @@ public final class AppImporter: ObservableObject {
         } else {
             DispatchQueue.main.async { self.importedApps = merged }
         }
-        RyLog.shared.log("已导入 App 重新登记：\(merged.count) 个（磁盘扫描 \(found.count) 个）", .info, "import")
+        RyLog.shared.log("已导入 App 重新登记：\(merged.count) 个（磁盘扫描 \(found.count) 个）", level: .info, tag: "import")
     }
 
     private let fm = FileManager.default
@@ -149,15 +150,15 @@ public final class AppImporter: ObservableObject {
         if !originalEntitlements.isEmpty {
             EntitlementPolicy.shared.recordOriginal(bundleID: bid, entitlements: originalEntitlements)
             RyLog.shared.log("\(bid) 原始 entitlements：\(originalEntitlements.keys.sorted().joined(separator: ", "))",
-                             .info, "sign")
+                             level: .info, tag: "sign")
         }
 
         var signNote: String?
         if case .failure(let e) = CodeSigner.shared.sign(bundleAt: appURL.path) {
             signNote = e.localizedDescription
-            RyLog.shared.log("签名失败：\(e.localizedDescription)", .error, "sign")
+            RyLog.shared.log("签名失败：\(e.localizedDescription)", level: .error, tag: "sign")
         } else {
-            RyLog.shared.log("签名成功：\(bid)", .info, "sign")
+            RyLog.shared.log("签名成功：\(bid)", level: .info, tag: "sign")
         }
 
         // Ensure the main executable is marked executable (zip may drop the bit).
@@ -176,7 +177,7 @@ public final class AppImporter: ObservableObject {
             // The move MUST succeed — otherwise the app is registered in memory
             // but its bundle is not on disk, so it vanishes on the next launch
             // (the "imported but shows 0 apps" symptom).
-            RyLog.shared.log("导入失败：无法移动到 Apps 目录（\(error.localizedDescription)）", .error, "import")
+            RyLog.shared.log("导入失败：无法移动到 Apps 目录（\(error.localizedDescription)）", level: .error, tag: "import")
             return .failure(ImportError.moveFailed(error.localizedDescription))
         }
 
@@ -199,7 +200,7 @@ public final class AppImporter: ObservableObject {
         } else {
             DispatchQueue.main.sync { self.registerSynchronously(app) }
         }
-        RyLog.shared.log("导入完成：\(displayName)（\(bid)）· \(isGUI ? "GUI" : "CLI")", .info, "import")
+        RyLog.shared.log("导入完成：\(displayName)（\(bid)）· \(isGUI ? "GUI" : "CLI")", level: .info, tag: "import")
         return .success(app)
     }
 
