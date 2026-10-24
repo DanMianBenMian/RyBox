@@ -41,13 +41,22 @@ struct BootGateView: View {
             ScrollView {
                 VStack(spacing: 22) {
                     header
-                    certCard
                     firmwareCard
+                    certCard
                     enterButton
                     Spacer(minLength: 20)
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 30)
+            }
+
+            // Black-background white-text deploy log while the firmware is being
+            // unpacked (user asked for this exact look during deployment).
+            if fw.phase == .scanning || fw.phase == .extracting {
+                DeployLogView()
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.2), value: fw.phase)
             }
         }
     }
@@ -74,7 +83,7 @@ struct BootGateView: View {
 
     private var certCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            stepHeader(index: 1, title: "签名证书", done: certDone)
+            stepHeader(index: 2, title: "签名证书", done: certDone)
 
             row(title: "证书（p12 / pfx）", value: p12Name) { pickP12() }
             SecureField("p12 密码（可为空）", text: $p12Password)
@@ -124,7 +133,7 @@ struct BootGateView: View {
 
     private var firmwareCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            stepHeader(index: 2, title: "系统固件", done: fwDone)
+            stepHeader(index: 1, title: "系统固件", done: fwDone)
 
             Text("导入 .ryboxenv 系统环境包（推荐，电脑上预处理好的完整 /usr /System 目录树），或直接导入 .ipsw 原厂固件（RyBox 会就地读取其中未加密的 manifest / kernelcache / trustcache）。")
                 .font(.caption)
