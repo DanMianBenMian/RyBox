@@ -521,7 +521,22 @@ void RyInstallGuestDyldHooks(void) {
 }
 
 void *RyLaunchGuestExecutable(const char *execPath) {
-    void *handle = dlopen(execPath, RTLD_NOW | RTLD_GLOBAL);
+    // LiveContainer parity: `dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|
+    // RTLD_FIRST)`. RTLD_FIRST is the important one — it makes the guest's own
+    // symbols win over the host's when the guest resolves a name, so a RyBox
+    // symbol can never shadow a guest symbol (or the other way round).
+    //
+    // We try RTLD_NOW first: it binds everything up front, so a genuinely
+    // missing symbol fails HERE with a readable dlerror() instead of crashing
+    // later inside the guest. If that rejects a guest that would have loaded
+    // fine, retry with LiveContainer's exact RTLD_LAZY combination.
+    void *handle = dlopen(execPath, RTLD_NOW | RTLD_GLOBAL | RTLD_FIRST);
+    if (!handle) {
+        const char *nowErr = dlerror();
+        RyLog("dlopen(RTLD_NOW) refused the guest (%s) — retrying RTLD_LAZY",
+              nowErr ? nowErr : "no message");
+        handle = dlopen(execPath, RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST);
+    }
     if (!handle) {
         RyLogErr("dlopen guest failed: %s", dlerror());
         return NULL;
@@ -557,14 +572,23 @@ void *RyLaunchGuestExecutable(const char *execPath) {
     }
 
     uintptr_t base = (uintptr_t)hdr; // dylib __TEXT vmaddr is 0 -> entry ~ base + entryoff
-    int (*guestMain)(int, char **, char **, char **) =
-        (int (*)(int, char **, char **, char **))(base + entryoff);
+    // LiveContainer's signature: `static int (*appMain)(int, char**, char**);`
+    // — three parameters, matching the C `main` ALC, not libc's internal
+    // four-argument form. The entry point is called through this cast, so the
+    // cast has to describe the function that is actually there.
+    int (*guestMain)(int, char **, char **) =
+        (int (*)(int, char **, char **))(base + entryoff);
 
     // Gate the UIApplicationMain interception for THIS call.
     gGuestLaunching = true;
 
     char *argv[] = { (char *)execPath, NULL };
-    guestMain(1, argv, NULL, NULL);
+    // LiveContainer passes the real `environ` (`ret = appMain(argc, argv,
+    // environ)` in LCBootstrap.m). A NULL envp is not fatal for a C main, but
+    // Swift's runtime and anything that reads `*environ` during its
+    // initialisers will walk a NULL pointer.
+    extern char **environ;
+    guestMain(1, argv, environ);
 
     return handle;
 }
