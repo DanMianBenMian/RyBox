@@ -124,25 +124,44 @@ def flatten_single_top(dirpath):
 
 def build_zip(srcdir, out):
     srcdir = flatten_single_top(srcdir)
-    if not (os.path.isdir(os.path.join(srcdir, "usr")) or
-            os.path.isdir(os.path.join(srcdir, "bin"))):
-        log("[warn] 目录里没找到 usr/ 或 bin/，可能不是有效的 bootstrap")
+    # A modern Procursus bootstrap is a ROOTLESS tree — everything lives under
+    # var/jb/ (dpkg at var/jb/usr/bin/dpkg, DBs at var/jb/var/lib/dpkg). Accept
+    # that layout as well as a flat usr//bin/ one.
+    looks_valid = (os.path.isdir(os.path.join(srcdir, "var", "jb")) or
+                   os.path.isdir(os.path.join(srcdir, "usr")) or
+                   os.path.isdir(os.path.join(srcdir, "bin")))
+    if not looks_valid:
+        log("[warn] 目录里没找到 var/jb、usr/ 或 bin/，可能不是有效的 bootstrap")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     n = 0
+    skipped = 0
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for root, _dirs, files in os.walk(srcdir):
             for f in files:
                 full = os.path.join(root, f)
                 rel = os.path.relpath(full, srcdir).replace(os.sep, "/")
-                # Store unix mode so executables stay executable.
+                # RyUnzip writes EVERY entry as a regular file (it only chmods
+                # 0755/0644) and CANNOT recreate symlinks — a stored link would
+                # extract as a junk text file holding the target path. So we
+                # DEREFERENCE here: store the symlink TARGET's bytes + its
+                # executable bit as a plain file. os.path.isfile() follows links
+                # and is False for broken links / non-regular files, which we
+                # skip. Directory symlinks appear in `_dirs` (os.walk does not
+                # follow them) and are intentionally omitted — their real target
+                # directory is walked separately.
+                if not os.path.isfile(full):
+                    skipped += 1
+                    continue
                 st = os.stat(full)
+                execbit = bool(st.st_mode & 0o111)
                 info = zipfile.ZipInfo(rel)
-                info.external_attr = (st.st_mode & 0xFFFF) << 16
+                info.external_attr = (0o755 if execbit else 0o644) << 16
                 with open(full, "rb") as fh:
                     z.writestr(info, fh.read())
                 n += 1
     size = os.path.getsize(out)
-    log("[zip] 写入 %d 个条目 -> %s (%d bytes)" % (n, out, size))
+    log("[zip] 写入 %d 个条目（跳过 %d 个断链/非常规文件）-> %s (%d bytes)"
+        % (n, skipped, out, size))
 
 
 def main():
