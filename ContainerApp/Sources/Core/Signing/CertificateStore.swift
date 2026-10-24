@@ -223,18 +223,43 @@ public final class CertificateStore: ObservableObject {
     public func fallbackKeyDER() -> Data? { decodedKey }
     public func fallbackKeyIsEC() -> Bool { fallbackKeyType == "ec" }
 
-    /// Decode the provisioning profile (CMS-wrapped plist) into its outer dict.
+    /// Decode the provisioning profile into its outer dict.
+    ///
+    /// A real `.mobileprovision` is a CMS `SignedData` whose *content* is a
+    /// binary property list — there is no `<?xml`/`</plist>` text in the bytes,
+    /// so the old ASCII-slice approach returned `nil` for every genuine profile
+    /// (which also blocked the boot gate). We unwrap the CMS with `CMSDecoder`
+    /// (available on iOS) to get the inner plist, then let
+    /// `PropertyListSerialization` parse either XML or binary form.
     public func provisioningPlist() -> [String: Any]? {
         guard let data = provisioningData else { return nil }
-        // The profile is PEM-like: the plist bytes are readable as text inside it.
-        guard let str = String(data: data, encoding: .ascii) ??
-                        String(data: data, encoding: .isoLatin1) else { return nil }
-        guard let start = str.range(of: "<?xml"),
-              let end = str.range(of: "</plist>") else { return nil }
-        let xml = String(str[start.lowerBound...end.upperBound])
-        guard let xmlData = xml.data(using: .utf8) else { return nil }
-        return (try? PropertyListSerialization.propertyList(from: xmlData,
+        let plistData: Data
+        if data.first == 0x30 {
+            // Looks like DER (a CMS envelope). Try to unwrap it.
+            plistData = Self.unwrapCMS(data) ?? data
+        } else {
+            // Plain XML/binary plist (0x3C '<?' or 0x62 'bplist00').
+            plistData = data
+        }
+        return (try? PropertyListSerialization.propertyList(from: plistData,
                 options: [], format: nil)) as? [String: Any]
+    }
+
+    /// Unwrap a CMS `SignedData` and return its encapsulated content (the inner
+    /// plist). Returns `nil` if `data` is not a readable CMS message.
+    private static func unwrapCMS(_ data: Data) -> Data? {
+        var decoder: CMSDecoder? = nil
+        guard CMSDecoderCreate(&decoder) == errSecSuccess, let decoder = decoder else { return nil }
+        let status = data.withUnsafeBytes { raw -> OSStatus in
+            let bound = raw.bindMemory(to: UInt8.self)
+            guard let base = bound.baseAddress else { return errSecAllocate }
+            return CMSDecoderUpdateMessage(decoder, base, bound.count)
+        }
+        guard status == errSecSuccess else { return nil }
+        guard CMSDecoderFinalizeMessage(decoder) == errSecSuccess else { return nil }
+        var cf: CFData? = nil
+        guard CMSDecoderCopyContent(decoder, &cf) == errSecSuccess, let cf = cf else { return nil }
+        return cf as Data
     }
 
     /// Entitlements to apply to a guest: taken from the provisioning profile's
@@ -244,6 +269,15 @@ public final class CertificateStore: ObservableObject {
     public func guestEntitlements() -> [String: Any]? {
         guard let plist = provisioningPlist() else { return nil }
         return plist["Entitlements"] as? [String: Any]
+    }
+
+    /// The `DeveloperCertificates` array from the profile — DER-encoded X.509
+    /// certificates forming the trust chain (leaf, intermediate, root). Swift
+    /// decodes them so the signer can embed the FULL chain; AMFI needs it to
+    /// validate the guest signature (a leaf-only CMS fails trust evaluation).
+    public func provisioningCertificates() -> [Data]? {
+        guard let plist = provisioningPlist() else { return nil }
+        return plist["DeveloperCertificates"] as? [Data]
     }
 
     // MARK: - Persistence
