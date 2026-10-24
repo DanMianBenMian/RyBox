@@ -123,6 +123,10 @@ final class GuestWindowHost {
             }
             container.isHidden = false
             container.makeKeyAndVisible()
+            // The floating log ball lives in its own (non-key) windows, which
+            // the sweep above also hid. Bring it back — it is meant to float
+            // above the desktop as much as above a guest.
+            FloatingLogBall.shared.reshow()
         } else {
             for w in UIApplication.shared.windows { w.isHidden = true }
         }
