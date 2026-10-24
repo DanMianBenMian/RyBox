@@ -20,6 +20,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             signingSection
+            entitlementSection
             jbrootSection
             logSection
             desktopSection
@@ -43,7 +44,7 @@ struct SettingsView: View {
                     if ThemeEngine.shared.deleteTheme(t.id) {
                         message = "已删除主题：\(t.name)"
                     } else {
-                        message = "删除失败：\(t.name)"
+                        message = "主题删除失败：\(t.name)"
                     }
                 }
                 themeToDelete = nil
@@ -52,7 +53,20 @@ struct SettingsView: View {
         } message: {
             Text("将从 /Library/Themes 永久移除「\(themeToDelete?.name ?? "")」，此操作不可撤销。")
         }
+        .alert("重置并重新解压 jbroot？", isPresented: $showJbrootResetAlert) {
+            Button("重置并解压", role: .destructive) {
+                JbRoot.shared.reset()
+                JbRoot.shared.bootstrap()
+                message = "已重置虚拟根，正在后台重新解压 jbroot…"
+            }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("会清空整个虚拟根目录（已安装的 deb 包、Sileo 源列表都会丢失），然后用当前 bootstrap 包重新解压。RyBox 自身的数据不受影响。")
+        }
     }
+
+    /// Confirmation for the destructive jbroot re-extract.
+    @State private var showJbrootResetAlert = false
 
     // MARK: 签名身份（状态只读，证书在「初始设置」中配置）
 
@@ -92,6 +106,32 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: 特殊权限分配（签名剥离、RyBox 接管）
+
+    private var entitlementSection: some View {
+        Section {
+            NavigationLink {
+                EntitlementManagerView()
+            } label: {
+                HStack {
+                    Label("特殊权限分配", systemImage: "switch.2")
+                    Spacer()
+                    let total = EntitlementPolicy.shared.takenOver.values
+                        .reduce(0) { $0 + $1.count }
+                    if total > 0 {
+                        Text("\(total) 项接管中")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        } header: {
+            Text("特殊权限")
+        } footer: {
+            Text("RyBox 里的 App 不需要（也用不了）签名里的特殊权限：它们以 in-process 方式跑在 RyBox 进程里，权限查询由 RyBox 代为回答。导入 App 时，platform-application、com.apple.private.* 等特殊权限会从签名中剥掉并打上标记，改由这里按 App 分配——关掉开关，该 App 查询对应权限就会得到「未授权」。")
+        }
+    }
+
     // MARK: 虚拟根（jbroot，自动解压）
 
     private var jbrootSection: some View {
@@ -113,6 +153,16 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if JbRoot.shared.hasImportedBootstrap {
+                HStack {
+                    Text("当前源")
+                    Spacer()
+                    Text("导入的 jbroot 包")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             if !JbRoot.shared.isBootstrapped {
                 Button {
                     JbRoot.shared.bootstrap()
@@ -120,10 +170,33 @@ struct SettingsView: View {
                     Label("立即解压 jbroot", systemImage: "arrow.down.circle")
                 }
             }
+
+            Button {
+                pickJbroot()
+            } label: {
+                Label("导入 jbroot 包（zip）", systemImage: "square.and.arrow.down.on.square")
+            }
+
+            if JbRoot.shared.hasImportedBootstrap {
+                Button(role: .destructive) {
+                    JbRoot.shared.removeImportedBootstrap()
+                    message = "已删除导入的 jbroot 包，回到内置 bootstrap"
+                } label: {
+                    Label("删除导入的 jbroot 包", systemImage: "trash")
+                }
+            }
+
+            if JbRoot.shared.isBootstrapped {
+                Button(role: .destructive) {
+                    showJbrootResetAlert = true
+                } label: {
+                    Label("重置并重新解压", systemImage: "arrow.counterclockwise")
+                }
+            }
         } header: {
             Text("虚拟根（jbroot）")
         } footer: {
-            Text("RyBox 不再从 IPSW / .ryboxenv 还原真实系统文件，而是启动后自动从一个内置的最小 Procursus bootstrap 解压出标准 jbroot（dpkg / apt / 标准 /usr /var 布局与包管理数据库）。若内置 bootstrap 缺失，这里会提示，Sileo 仍会安装但包管理工具不可用。")
+            Text("RyBox 不再从 IPSW / .ryboxenv 还原真实系统文件，而是启动后自动从一个最小 Procursus bootstrap 解压出标准 jbroot（dpkg / apt / 标准 /usr /var 布局与包管理数据库）。如果内置 bootstrap 太小或太旧，可以在电脑上用 make_jbroot.py 生成新的 zip，在这里导入——导入后点「重置并重新解压」生效（会清空虚拟根里已安装的包）。")
         }
     }
 
@@ -339,6 +412,24 @@ struct SettingsView: View {
                 switch ThemeEngine.shared.importTheme(from: url) {
                 case .success(let t): message = "已导入并启用主题：\(t.name)"
                 case .failure(let e): message = "主题导入失败：\(e.localizedDescription)"
+                }
+            case .failure(let e):
+                message = "选择失败：\(e.localizedDescription)"
+            }
+        }
+    }
+
+    /// Import a jbroot zip the user made on a PC (make_jbroot.py). The file is
+    /// copied into the container; the destructive re-extract is a separate,
+    /// confirmed step.
+    private func pickJbroot() {
+        message = "正在打开文件选择器…"
+        DocPicker.present { result in
+            switch result {
+            case .success(let url):
+                switch JbRoot.shared.importBootstrap(from: url) {
+                case .success(let note): message = note
+                case .failure(let reason): message = "jbroot 导入失败：\(reason)"
                 }
             case .failure(let e):
                 message = "选择失败：\(e.localizedDescription)"
