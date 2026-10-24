@@ -368,13 +368,16 @@ static int build_cms(const unsigned char *cd, size_t cd_len,
     // used for the signature, and the [0] IMPLICIT form for embedding).
     Buf sa; buf_init(&sa);
     { Buf ct; buf_init(&ct); der_oid(&ct, OID_DATA, sizeof(OID_DATA));
-      Buf ctset; buf_init(&ctset); der_set(&ctset, &ct);
-      Buf a1; buf_init(&a1); der_oid(&a1, OID_CTYPE, sizeof(OID_CTYPE)); der_set(&a1, &ctset);
-      der_wrap(&sa, 0x30, &a1); buf_free(&ct); buf_free(&ctset); buf_free(&a1); }
-    { Buf mos; buf_init(&mos); der_octet(&mos, md, sizeof(md));
-      Buf mosset; buf_init(&mosset); der_set(&mosset, &mos);
-      Buf a2; buf_init(&a2); der_oid(&a2, OID_MSGDIGEST, sizeof(OID_MSGDIGEST)); der_set(&a2, &mosset);
-      der_wrap(&sa, 0x30, &a2); buf_free(&mos); buf_free(&mosset); buf_free(&a2); }
+      Buf vals; buf_init(&vals); der_set(&vals, &ct);   // SET OF AttributeValue
+      Buf a1; buf_init(&a1); der_oid(&a1, OID_CTYPE, sizeof(OID_CTYPE));
+      buf_put(&a1, vals.p, vals.len);                   // SEQUENCE{ OID, SET{value} }
+      der_wrap(&sa, 0x30, &a1); buf_free(&ct); buf_free(&vals); buf_free(&a1); }
+    { Buf mdval; buf_init(&mdval); buf_put(&mdval, md, sizeof(md));
+      Buf mos; buf_init(&mos); der_octet(&mos, &mdval);  // OCTET STRING(digest)
+      Buf vals; buf_init(&vals); der_set(&vals, &mos);   // SET OF AttributeValue
+      Buf a2; buf_init(&a2); der_oid(&a2, OID_MSGDIGEST, sizeof(OID_MSGDIGEST));
+      buf_put(&a2, vals.p, vals.len);
+      der_wrap(&sa, 0x30, &a2); buf_free(&mdval); buf_free(&mos); buf_free(&vals); buf_free(&a2); }
 
     // signature over the DER SET OF Attributes (PKCS#7 rule)
     Buf saSet; buf_init(&saSet); der_set(&saSet, &sa);
@@ -401,7 +404,8 @@ static int build_cms(const unsigned char *cd, size_t cd_len,
       Buf raSeq; buf_init(&raSeq); der_wrap(&raSeq, 0x30, &ra);
       der_wrap(&si, 0x30, &raSeq); buf_free(&ra); buf_free(&raSeq); }
     // signature
-    der_octet(&si, CFDataGetBytePtr(sigData), (size_t)CFDataGetLength(sigData));
+    { Buf sigOct; buf_init(&sigOct); buf_put(&sigOct, CFDataGetBytePtr(sigData), (size_t)CFDataGetLength(sigData));
+      der_octet(&si, &sigOct); buf_free(&sigOct); }
     Buf signerInfo; buf_init(&signerInfo); der_wrap(&signerInfo, 0x30, &si);
 
     // SignedData
@@ -623,7 +627,7 @@ static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyR
         for (uint32_t i=0;i<n;i++){
             struct fat_arch a = arch[i];
             if (swap){ a.cputype=OSSwapInt32(a.cputype); a.cpusubtype=OSSwapInt32(a.cpusubtype); a.offset=OSSwapInt32(a.offset); a.size=OSSwapInt32(a.size); }
-            slices[i].cputype=a.cputype; slices[i].cpusub=a.cpusubtype; slices[i].off=a.offset; slices[i].size=a.size;
+            slices[i].cputype=a.cputype; slices[i].cpusub=a.cpusubtype;
             if (a.cputype==CPU_TYPE_ARM64){
                 unsigned char *sb = malloc(a.size);
                 memcpy(sb, buf+a.offset, a.size);
@@ -664,7 +668,6 @@ static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyR
             na[i].offset = OSSwapHostToBigInt32((uint32_t)cur);
             na[i].size = OSSwapHostToBigInt32((uint32_t)slices[i].len);
             na[i].align = OSSwapHostToBigInt32(14);
-            na[i].reserved = 0;
             memcpy(nf+cur, slices[i].b, slices[i].len);
             cur = (cur + slices[i].len + align - 1) & ~(align-1);
         }
