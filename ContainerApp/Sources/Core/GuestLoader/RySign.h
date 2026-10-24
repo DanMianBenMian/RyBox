@@ -79,6 +79,18 @@ void rysign_set_code_identity(const char *ident);
 void rysign_set_info_plist(const char *exeName,
                            const unsigned char *plist, size_t len);
 
+/// The sub-code of the last failure inside the main-executable signing step
+/// (the outer exit code 6 covers many causes). Values are the internal
+/// `sign_slice` / `sign_macho_file_at` return codes:
+///   -1  file unreadable or truncated      -6  SuperBlob assembly failed
+///   -2  no LC_CODE_SIGNATURE (no room)    -7  buffer growth failed
+///   -3  Requirements build failed         -8  path is not a regular file
+///   -4  CodeDirectory build failed        -9  not a 64-bit Mach-O
+///   -5  CMS build failed (key refused)   -10  write-back failed
+/// 0 means the last run succeeded. Call it right after a non-zero return from
+/// any `rysign_sign_bundle*` to tell the user WHERE signing died.
+int rysign_last_subcode(void);
+
 #ifdef __cplusplus
 }
 #endif
