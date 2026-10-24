@@ -532,13 +532,13 @@ struct SpringBoardView: View {
                 }
             )
         }
-        // Long-press EMPTY SPACE → edit mode; child icons win with their own
-        // long-press (context menu) so tapping an icon still opens it.
+        // Tapping EMPTY SPACE exits edit mode (jiggle). Entering edit mode is
+        // done by long-pressing an icon and dragging it (iOS-like) — see
+        // `iconGesture` / `iconDragGesture`. The old "long-press empty space →
+        // edit" gesture fought the per-icon long-press menu (both fired on the
+        // same touch) and is removed.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
-        .onLongPressGesture(minimumDuration: 0.5) {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { store.editMode = true }
-        }
         .onTapGesture {
             if store.editMode {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { store.editMode = false }
@@ -614,7 +614,16 @@ struct SpringBoardView: View {
         //   * tap                            → open
         //   * long press, no drag            → icon menu (drawn by RyBox)
         //   * long press, then drag ≥ 16 pt  → edit mode + move the icon
-        .simultaneousGesture(iconGesture(item: item, slot: slot))
+        // When NOT in edit mode: long-press → menu, long-press + drag → enter
+        // edit mode and move the icon (iOS-like). When IN edit mode: drag starts
+        // immediately (no long-press needed) so rearranging feels right — the old
+        // code forced a 0.3 s long press before every drag, which is why
+        // "编辑模式图标拖动失效".
+        .simultaneousGesture(
+            store.editMode
+                ? AnyGesture(iconDragGesture(item: item, slot: slot))
+                : AnyGesture(iconGesture(item: item, slot: slot))
+        )
     }
 
     /// The single gesture attached to an icon cell.
@@ -670,6 +679,25 @@ struct SpringBoardView: View {
                 } else {
                     finishDrag(item: item, slot: slot)
                 }
+            }
+    }
+
+    /// The drag gesture used while already in edit mode.
+    ///
+    /// In edit mode the icon should follow the finger *immediately* (minimum
+    /// distance only 4 pt, so a deliberate touch-move starts the drag without
+    /// the 0.3 s long press the non-edit `iconGesture` requires). This is the
+    /// fix for "编辑模式图标拖动失效" — previously every rearrange needed a
+    /// long press first, so a normal quick drag did nothing.
+    private func iconDragGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { drag in
+                draggingID = item.id
+                dragTranslation = drag.translation
+                updateTarget(for: item, slot: slot, translation: drag.translation)
+            }
+            .onEnded { _ in
+                finishDrag(item: item, slot: slot)
             }
     }
 
