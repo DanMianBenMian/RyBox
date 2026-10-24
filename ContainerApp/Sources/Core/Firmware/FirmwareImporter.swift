@@ -59,6 +59,9 @@ final class FirmwareImporter: ObservableObject {
     @Published var progress: Double = 0
     @Published var message = "尚未导入固件"
     @Published var report: FirmwareReport?
+    /// Stream of human-readable deploy steps, shown on the black-background
+    /// deploy log screen while the firmware is being unpacked.
+    @Published var log: [String] = []
 
     private var working = false
 
@@ -94,9 +97,12 @@ final class FirmwareImporter: ObservableObject {
         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
 
         DispatchQueue.main.async {
+            self.log.removeAll()
+            self.appendLog("ryboxenv deploy — \(url.lastPathComponent)")
             self.phase = .scanning
             self.progress = 0.03
             self.message = "正在扫描固件索引…"
+            self.appendLog("› 扫描固件索引…")
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -148,6 +154,13 @@ final class FirmwareImporter: ObservableObject {
 
         let aea = entries.filter { $0.0.hasSuffix(".aea") }.map { ($0.0 as NSString).lastPathComponent }
 
+        let kind = isEnv ? "ryboxenv 系统环境包" : "IPSW 原厂固件"
+        appendLog("› 识别为 \(kind)（\(entries.count) 个条目）")
+        if isEnv {
+            appendLog("› 解包 rootfs → 虚拟根…")
+        } else {
+            appendLog("› 提取未加密条目（manifest / kernelcache / trustcache）…")
+        }
         post(phase: .extracting, progress: 0.12, message: "正在还原系统环境…")
 
         var outBytes: UInt64 = 0
@@ -203,6 +216,10 @@ final class FirmwareImporter: ObservableObject {
                                  notes: notes,
                                  completedAt: Date())
         Self.saveReport(rep)
+        let mb = Double(outBytes) / 1024 / 1024
+        appendLog("✓ 已还原 \(installed) 个文件 / \(String(format: "%.1f", mb)) MB")
+        if !aea.isEmpty { appendLog("⚠ \(aea.count) 个 AEA 加密卷需在电脑端预处理") }
+        appendLog(aea.isEmpty ? "✓ 系统环境完整还原" : "◦ 部分还原（其余卷需 .ryboxenv）")
         DispatchQueue.main.async {
             self.report = rep
             self.phase = aea.isEmpty ? .ready : .partial
@@ -307,10 +324,18 @@ final class FirmwareImporter: ObservableObject {
     }
 
     private func fail(_ msg: String) {
+        appendLog("✗ \(msg)")
         DispatchQueue.main.async {
             self.phase = .failed
             self.progress = 0
             self.message = msg
+        }
+    }
+
+    /// Append a line to the deploy log (main-thread safe).
+    func appendLog(_ line: String) {
+        DispatchQueue.main.async {
+            self.log.append(line)
         }
     }
 
