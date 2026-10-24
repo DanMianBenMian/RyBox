@@ -49,13 +49,8 @@ struct SpringBoardView: View {
     @State private var renameTarget: RyFolder?
     @State private var renameText = ""
     @State private var toast = ""
-    /// The icon whose long-press menu is open, plus that icon's frame in the
-    /// shared "root" space (so the menu can be anchored to it). Long-pressing
-    /// an icon WITHOUT dragging shows this; long-pressing and THEN dragging
-    /// enters edit mode instead. Both used to fight each other through
-    /// `contextMenu` + two drag gestures on the same cell.
-    @State private var menuItem: DesktopItem?
-    @State private var menuFrame: CGRect = .zero
+    // (The menu state that used to live here — `menuItem` / `menuFrame` — belongs
+    //  to the system context menu now; there is nothing for RyBox to anchor.)
     /// Drives the edit-mode jiggle (one shared flag; per-slot duration/parity
     /// keeps the icons from wobbling in lockstep).
     @State private var jiggle = false
@@ -230,9 +225,6 @@ struct SpringBoardView: View {
 
                 if store.editMode { editHint.zIndex(4) }
                 if !toast.isEmpty { toastView.zIndex(5) }
-                if menuItem != nil {
-                    iconMenuOverlay(geo.size).zIndex(6)
-                }
             }
             .coordinateSpace(name: "root")
         }
@@ -533,10 +525,9 @@ struct SpringBoardView: View {
             )
         }
         // Tapping EMPTY SPACE exits edit mode (jiggle). Entering edit mode is
-        // done from the icon's own long-press menu — see
-        // `iconLongPressGesture` / `iconDragGesture`. The old "long-press empty
-        // space → edit" gesture fought the per-icon long-press menu (both
-        // fired on the same touch) and is removed.
+        // done from the icon's long-press menu ("编辑模式") — see
+        // `nativeMenuActions`. The old "long-press empty space → edit" gesture
+        // fought the per-icon menu (both fired on the same touch) and is gone.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
         .onTapGesture {
@@ -592,78 +583,75 @@ struct SpringBoardView: View {
         }
         .frame(width: cellWidth, height: cellHeight)
         .offset(isDragging ? dragTranslation : .zero)
-        .rotationEffect(.degrees(store.editMode ? (jiggle ? jiggleAngle(seed: seed)
-                                                         : -jiggleAngle(seed: seed)) : 0),
+        // A DRAGGED icon neither wobbles nor animates its own offset.
+        //
+        // Two reasons, one cosmetic and one fatal:
+        //   * it must sit exactly under the finger, not glide behind it;
+        //   * combining a `repeatForever` rotation with an animated translation
+        //     on the SAME view is what made dragging an app in edit mode crash —
+        //     two animations end up driving one transform, and the render tree
+        //     aborts (the AttributeGraph feedback trap). Suspending both while a
+        //     drag is live removes the loop entirely, and matches the real
+        //     SpringBoard, where a picked-up icon stops wobbling too.
+        .rotationEffect(.degrees(store.editMode && !isDragging
+                                    ? (jiggle ? jiggleAngle(seed: seed)
+                                              : -jiggleAngle(seed: seed))
+                                    : 0),
                         anchor: .center)
-        .animation(store.editMode
-                   ? .easeInOut(duration: 0.13 + 0.02 * Double(seed % 5))
-                       .repeatForever(autoreverses: true)
-                   : .default,
+        .animation(store.editMode && !isDragging
+                       ? Animation.easeInOut(duration: 0.13 + 0.02 * Double(seed % 5))
+                           .repeatForever(autoreverses: true)
+                       : Animation.default,
                    value: jiggle)
-        .animation(.easeInOut(duration: 0.16), value: dragTranslation)
+        // `nil` here means "no animation": while dragging, the offset must track
+        // the finger 1:1. Written explicitly because a bare ternary mixing nil
+        // and a modifier chain can fail to infer `Animation?`.
+        .animation(isDragging ? nil : Animation.easeInOut(duration: 0.16),
+                   value: dragTranslation)
         .zIndex(isDragging ? 20 : 0)
         .contentShape(Rectangle())
         .onTapGesture { if !store.editMode { open(item) } }
-        // ONE gesture system per cell, split by MODE (not by ternary on the
-        // gesture value type — `AnyGesture(iconDragGesture(...))` vs
-        // `AnyGesture(iconGesture(...))` produced two different `Value` types
-        // and the ternary could not be resolved, which is why this file did not
-        // compile for iOS at all).
         //
-        // Behaviour, per the user's explicit request:
-        //   * NOT in edit mode:
-        //       - tap                     → open the app
-        //       - long press (no drag)   → icon menu
-        //       - drag                    → NOTHING (the old "long-press then
-        //         drag enters edit mode" gesture was removed on purpose: it
-        //         fought with the long-press menu and made both unreliable)
-        //   * IN edit mode:
-        //       - drag (≥ 4 pt)          → move the icon, immediately
-        //       - long press              → icon menu
+        // ONE gesture system per cell: the drag below is the only gesture that
+        // does anything with movement; everything else is either a tap or the
+        // system's own long-press menu.
         //
-        // Both branches are attached simultaneously; each one checks
-        // `store.editMode` itself before acting, so exactly one of them can
-        // ever do something.
+        //   * tap                    → open the app (not in edit mode)
+        //   * long press             → NATIVE context menu (see below)
+        //   * drag (≥ 4 pt)          → move the icon (edit mode)
+        //
+        // The custom long-press gesture that used to open RyBox's own drawn menu
+        // is GONE: having a recogniser fire at 0.35 s while the system's own
+        // context-menu recogniser waits ~0.5 s is exactly what made the two
+        // fight (the menu sometimes never appeared, sometimes appeared while a
+        // drag started). Now the long press has precisely one owner — UIKit.
         .simultaneousGesture(iconDragGesture(item: item, slot: slot))
-        .simultaneousGesture(iconLongPressGesture(item: item, slot: slot))
+        // NATIVE menu (UIKit UIContextMenuInteraction). A drag CANCELS it (any
+        // movement dismisses the press), and a tap opens the app, so there is no
+        // ambiguity left between the three interactions.
+        .contextMenu { nativeMenuActions(for: item) }
     }
 
-    /// The LONG-PRESS gesture attached to an icon cell.
+    /// The icon's long-press menu, rendered by the SYSTEM rather than by RyBox.
     ///
-    /// A plain `LongPressGesture` with **no drag phase at all**. The old
-    /// implementation sequenced it with a `DragGesture`, and that single
-    /// decision is what broke both features at once:
-    ///
-    ///   * the sequenced pair's `.second(true, drag?)` branch turned a long
-    ///     press + movement into "enter edit mode", so a plain long press
-    ///     often never reached the menu ("长按菜单依旧未生效"), and
-    ///   * the same pair was ALSO what carried the edit-mode drag, so removing
-    ///     the "drag into edit mode" behaviour left no drag path at all
-    ///     ("编辑模式图标拖动失效").
-    ///
-    /// Splitting them into two independent gestures removes the conflict:
-    /// this one only ever opens the menu, `iconDragGesture` only ever drags.
-    ///
-    /// `LongPressGesture.Value` is `Bool`, so `onEnded` fires exactly once
-    /// with `true` when the press was held long enough — that is the menu
-    /// trigger. A failed long press (finger lifted early) ends the gesture
-    /// with `false` and nothing happens.
-    private func iconLongPressGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.35)
-            .onChanged { value in
-                // While the finger is down on an icon the pager must not page,
-                // otherwise the page slides out from under the finger.
-                if value { isIconPressing = true }
+    /// Same actions as the old hand-drawn `IconContextMenu`; see `menuActions`.
+    @ViewBuilder
+    private func nativeMenuActions(for item: DesktopItem) -> some View {
+        ForEach(menuActions(for: item), id: \.self) { action in
+            Button(role: action == .delete ? .destructive : nil) {
+                handleMenuAction(action, for: item)
+            } label: {
+                Label(action.title, systemImage: action.symbol)
             }
-            .onEnded { value in
-                isIconPressing = false
-                guard value else { return }
-                // A drag that is already running owns the interaction — do not
-                // pop the menu on top of a live drag.
-                guard draggingID == nil else { return }
-                showMenu(for: item, slot: slot)
-            }
+        }
     }
+
+    // NOTE: the custom long-press gesture that opened RyBox's own drawn menu
+    // has been REMOVED (2026-10-25, user request: "把长按菜单改回原生的，自绘的
+    // 太难用了"). The system's context menu owns the long press now
+    // (`nativeMenuActions`), so nothing here may compete for it: a second
+    // recogniser firing at 0.35 s while UIKit waits ~0.5 s is precisely what
+    // made menus flaky and drags start by themselves.
 
     /// The drag gesture used to move an icon.
     ///
@@ -677,12 +665,18 @@ struct SpringBoardView: View {
     private func iconDragGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
         DragGesture(minimumDistance: 4)
             .onChanged { drag in
+                // A finger that is moving an icon is never swiping the page,
+                // whatever mode we are in. This flag is what stops the pager
+                // from sliding out from under a press (it used to be armed by
+                // the long-press gesture, which no longer exists).
+                isIconPressing = true
                 guard store.editMode else { return }
                 draggingID = item.id
                 dragTranslation = drag.translation
                 updateTarget(for: item, slot: slot, translation: drag.translation)
             }
             .onEnded { _ in
+                isIconPressing = false
                 guard store.editMode else { return }
                 finishDrag(item: item, slot: slot)
             }
@@ -691,51 +685,11 @@ struct SpringBoardView: View {
 
     // MARK: Icon menu
 
-    /// Open the long-press menu for an icon, anchored to that icon's cell.
-    private func showMenu(for item: DesktopItem, slot: IconSlot) {
-        menuFrame = cellFrame(slot)
-        menuItem = item
-        if store.editMode {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { store.editMode = false }
-        }
-    }
-
-    /// The icon's frame in the shared "root" space, derived from the very same
-    /// origin + pitch the layout used — so the menu points at the right icon.
-    private func cellFrame(_ slot: IconSlot) -> CGRect {
-        CGRect(x: gridOrigin.x + CGFloat(slot.col) * gridPitch.width,
-               y: gridOrigin.y + CGFloat(slot.row) * gridPitch.height,
-               width: gridCell.width, height: gridCell.height)
-    }
-
-    private func closeMenu() {
-        withAnimation(.easeOut(duration: 0.15)) { menuItem = nil }
-    }
-
-    /// The long-press menu, drawn by RyBox rather than SwiftUI's `contextMenu`.
-    ///
-    /// `contextMenu` ships its own long-press recogniser; stacking that on top
-    /// of the long-press-and-drag gesture on the same cell made the two fight,
-    /// so the menu sometimes never appeared and a plain long press sometimes
-    /// started a drag. The gesture now decides what a long press means and this
-    /// view is only the result — no recogniser ambiguity left.
-    @ViewBuilder
-    private func iconMenuOverlay(_ bounds: CGSize) -> some View {
-        if let item = menuItem {
-            IconContextMenu(
-                item: item,
-                anchor: menuFrame,
-                bounds: bounds,
-                actions: menuActions(for: item),
-                onDismiss: { closeMenu() },
-                onAction: { action in
-                    closeMenu()
-                    handleMenuAction(action, for: item)
-                }
-            )
-            .transition(.opacity)
-        }
-    }
+    // Everything that used to be here (showMenu / cellFrame / closeMenu /
+    // iconMenuOverlay and the hand-drawn `IconContextMenu` view) is gone:
+    // the menu is the SYSTEM's context menu now, so there is no anchor
+    // geometry to compute, no overlay to dismiss, and no second long-press
+    // recogniser to keep in sync. See `nativeMenuActions` above.
 
     private func handleMenuAction(_ action: MenuAction, for item: DesktopItem) {
         switch action {
@@ -783,13 +737,26 @@ struct SpringBoardView: View {
     /// the same space `dockFrame` uses — so the Dock hit test below is
     /// consistent with the grid hit test.
     private func updateTarget(for item: DesktopItem, slot: IconSlot, translation: CGSize) {
+        // GUARD: `gridPitch` starts at .zero and only becomes real once the grid
+        // publishes its metrics. Dividing by a zero pitch yields ±inf/NaN, and
+        // `Int(NaN)` TRAPS — an instant, silent crash the first time a drag is
+        // started while the layout has not been measured yet (which includes a
+        // drag right after entering edit mode). Bail out instead: there is no
+        // meaningful target before we know the grid geometry.
+        guard gridPitch.width > 1, gridPitch.height > 1, columns > 0, rows > 0 else {
+            target = nil
+            store.dockHighlighted = false
+            return
+        }
+
         // The dragged icon's centre in root coordinates.
         let cellCenterX = gridOrigin.x + CGFloat(slot.col) * gridPitch.width + gridPitch.width / 2
         let cellCenterY = gridOrigin.y + CGFloat(slot.row) * gridPitch.height + gridPitch.height / 2
         let point = CGPoint(x: cellCenterX + translation.width,
                             y: cellCenterY + translation.height)
 
-        // Which cell is under it?
+        // Which cell is under it? (clamped to the grid, so it can never index
+        // outside the renderable range)
         var col = Int(((point.x - gridOrigin.x) / gridPitch.width).rounded(.down))
         var row = Int(((point.y - gridOrigin.y) / gridPitch.height).rounded(.down))
         col = max(0, min(columns - 1, col))
@@ -1146,102 +1113,3 @@ enum MenuAction {
 /// The icon long-press menu: a frosted card anchored to the icon it belongs to.
 ///
 /// Anchored rather than centred (the old `.contextMenu` had no useful position
-/// at all on iPad), and clamped inside the screen so it can never be opened
-/// off the top edge.
-private struct IconContextMenu: View {
-    let item: DesktopItem
-    /// The icon's frame in the shared "root" space.
-    let anchor: CGRect
-    /// The host's size, used to clamp the card on screen.
-    let bounds: CGSize
-    let actions: [MenuAction]
-    var onDismiss: () -> Void
-    var onAction: (MenuAction) -> Void
-
-    private let rowHeight: CGFloat = 46
-    private let cardWidth: CGFloat = 216
-    private let cardPadding: CGFloat = 8
-
-    private var cardHeight: CGFloat {
-        CGFloat(actions.count) * rowHeight + cardPadding * 2 + 50   // + header
-    }
-
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            // Tap anywhere outside the card to dismiss.
-            Color.black.opacity(0.001)
-                .ignoresSafeArea()
-                .onTapGesture { onDismiss() }
-
-            VStack(spacing: 0) {
-                // Header: the app's own artwork + name, so the menu is
-                // unambiguous when two icons look alike.
-                HStack(spacing: 10) {
-                    IconArtwork(item: item, size: 34, cornerRadius: 8)
-                    Text(item.name)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.92))
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 8)
-
-                // `id: \.offset` on an enumerated array would need a key path
-                // into a tuple element, which Swift does not allow — index the
-                // array instead.
-                ForEach(actions.indices, id: \.self) { index in
-                    let action = actions[index]
-                    if index > 0 {
-                        Divider()
-                            .overlay(Color.white.opacity(0.14))
-                            .padding(.horizontal, 10)
-                    }
-                    Button {
-                        onAction(action)
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: action.symbol)
-                                .font(.system(size: 14, weight: .semibold))
-                                .frame(width: 20)
-                            Text(action.title)
-                                .font(.system(size: 15, weight: .medium))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .foregroundStyle(action.isDestructive
-                                         ? Color(red: 1.0, green: 0.45, blue: 0.47)
-                                         : Color.white)
-                        .padding(.horizontal, 14)
-                        .frame(height: rowHeight)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.vertical, cardPadding)
-            .frame(width: cardWidth)
-            .background(.regularMaterial,
-                        in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6)
-            )
-            .shadow(color: .black.opacity(0.34), radius: 18, y: 8)
-            .position(x: cardX, y: cardY)
-        }
-    }
-
-    /// Horizontal centre of the icon, clamped so the whole card stays on screen.
-    private var cardX: CGFloat {
-        let raw = anchor.midX
-        let half = cardWidth / 2
-        return min(max(raw, half + 10), bounds.width - half - 10)
-    }
-
-    /// Prefer ABOVE the icon (that is where a thumb is not), fall back below.
-    private var cardY: CGFloat {
-        let above = anchor.minY - cardHeight - 12
-        if above > 60 { return above + cardHeight / 2 }
-        return anchor.maxY + 12 + cardHeight / 2
-    }
-}
