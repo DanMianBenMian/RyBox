@@ -816,20 +816,5 @@ int rysign_sign_bundle(const char *bundlePath,
     return 0;
 }
 
-// ---- main() --------------------------------------------------------------
-int main(int argc, char **argv){
-    const char *p12=NULL, *pw="", *prov=NULL, *ent=NULL, *bundle=NULL;
-    for (int i=1;i<argc;i++){
-        if (!strcmp(argv[i],"--p12") && i+1<argc) p12=argv[++i];
-        else if (!strcmp(argv[i],"--password") && i+1<argc) pw=argv[++i];
-        else if (!strcmp(argv[i],"--prov") && i+1<argc) prov=argv[++i];
-        else if (!strcmp(argv[i],"--entitlements") && i+1<argc) ent=argv[++i];
-        else if (!strcmp(argv[i],"--bundle") && i+1<argc) bundle=argv[++i];
-        else if (argv[i][0]!='-') bundle=argv[i];
-    }
-    if (!p12 || !prov || !bundle){
-        fprintf(stderr, "usage: rysign --p12 <p12> --password <pw> --prov <mobileprovision> [--entitlements <plist>] --bundle <app>\n");
-        return 1;
-    }
-    return rysign_sign_bundle(bundle, p12, pw, prov, ent);
-}
+// NOTE: rysign_sign_bundle() is invoked in-process from CodeSigner.swift
+// (the RyBox app target has its own entry point, so no main() here).
