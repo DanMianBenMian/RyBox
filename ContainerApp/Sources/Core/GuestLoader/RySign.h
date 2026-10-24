@@ -39,6 +39,16 @@ int rysign_sign_bundle_with_der(const char *bundlePath,
                                 const char *provPath,
                                 const char *entitlementsPath);
 
+/// Override the CodeDirectory identifier used for every Mach-O signed by this
+/// module.
+///
+/// LiveContainer parity: ZSign is driven with `bundleId: NSBundle.mainBundle
+/// .bundleIdentifier` — the HOST app's id, because the guest is signed with the
+/// host's certificate AND the host's provisioning profile. Passing NULL (or an
+/// empty string) restores the default, which is the guest's own
+/// `CFBundleIdentifier` read from its Info.plist.
+void rysign_set_code_identity(const char *ident);
+
 #ifdef __cplusplus
 }
 #endif
