@@ -361,6 +361,7 @@ static int build_cms(const unsigned char *cd, size_t cd_len,
                      const unsigned char *issuer, size_t issuer_len,
                      const unsigned char *serial, size_t serial_len,
                      Buf *out_cms){
+    if (!privKey){ return -1; }          // caller must never pass NULL
     unsigned char md[CC_SHA256_DIGEST_LENGTH];
     sha256(cd, cd_len, md);
 
@@ -581,7 +582,10 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
 }
 
 // ---- Sign a whole file (fat or single) -----------------------------------
-static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyRef privKey,
+// Takes the leaf CERTIFICATE (not a SecIdentity) so the caller may have built
+// it either from SecPKCS12Import or from RyBox's own PKCS#12 decoder — the
+// signing path does not care where the cert came from.
+static int sign_macho_file_at(const char *path, SecCertificateRef leaf, SecKeyRef privKey,
                               const char *team, const char *ident,
                               const unsigned char *ent, size_t ent_len){
     size_t len; unsigned char *buf = read_file(path, &len);
@@ -590,7 +594,6 @@ static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyR
     uint32_t magic = *(uint32_t*)buf;
 
     if (magic == MH_MAGIC_64){
-        SecCertificateRef leaf = NULL; SecIdentityCopyCertificate(identity, &leaf);
         Buf issuer; Buf serial; buf_init(&issuer); buf_init(&serial);
         unsigned char **certs=NULL; size_t *clens=NULL; int nc=0;
         if (leaf){
@@ -614,7 +617,6 @@ static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyR
             free(buf);
             return -2;
         }
-        if (leaf) CFRelease(leaf);
         // buf now points to the signed (final) data; intentionally not freed (one-shot)
         return 0;
     } else if (magic == FAT_MAGIC || magic == FAT_CIGAM){
@@ -632,7 +634,6 @@ static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyR
                 unsigned char *sb = malloc(a.size);
                 memcpy(sb, buf+a.offset, a.size);
                 size_t sl = a.size;
-                SecCertificateRef leaf=NULL; SecIdentityCopyCertificate(identity,&leaf);
                 Buf issuer; Buf serial; buf_init(&issuer); buf_init(&serial);
                 unsigned char **certs=NULL; size_t *clens=NULL; int nc=0;
                 if (leaf){
@@ -644,7 +645,6 @@ static int sign_macho_file_at(const char *path, SecIdentityRef identity, SecKeyR
                     sign_slice(&sb, &sl, ident, team, NULL, 0, ent, ent_len, privKey, certs, clens, nc, issuer.p, issuer.len, serial.p, serial.len);
                     if (ld) CFRelease(ld);
                 }
-                if (leaf) CFRelease(leaf);
                 slices[i].b=sb; slices[i].len=sl; slices[i].signedd=1;
             } else {
                 slices[i].b = malloc(a.size); memcpy(slices[i].b, buf+a.offset, a.size); slices[i].len=a.size;
@@ -692,7 +692,7 @@ static int is_macho_at(const char *path){
     free(b);
     return r;
 }
-static void sign_walk(const char *dir, SecIdentityRef identity, SecKeyRef privKey,
+static void sign_walk(const char *dir, SecCertificateRef leaf, SecKeyRef privKey,
                       const char *team, const char *ident,
                       const unsigned char *ent, size_t ent_len){
     DIR *d = opendir(dir);
@@ -705,50 +705,27 @@ static void sign_walk(const char *dir, SecIdentityRef identity, SecKeyRef privKe
         struct stat st;
         if (stat(path, &st)!=0) continue;
         if (S_ISDIR(st.st_mode)){
-            sign_walk(path, identity, privKey, team, ident, ent, ent_len);
+            sign_walk(path, leaf, privKey, team, ident, ent, ent_len);
         } else if (S_ISREG(st.st_mode)){
             if (is_macho_at(path)){
-                sign_macho_file_at(path, identity, privKey, team, ident, ent, ent_len);
+                sign_macho_file_at(path, leaf, privKey, team, ident, ent, ent_len);
             }
         }
     }
     closedir(d);
 }
 
-// ---- Bundle signing entry ------------------------------------------------
-int rysign_sign_bundle(const char *bundlePath,
-                       const char *p12Path,
-                       const char *password,
-                       const char *provPath,
-                       const char *entitlementsPath){
-    // 1. Read p12 -> identity + private key
-    size_t plen; unsigned char *p12 = read_file(p12Path, &plen);
-    if (!p12) { fprintf(stderr, "rysign: cannot read p12\n"); return 2; }
-    CFDataRef p12Data = CFDataCreate(NULL, p12, (CFIndex)plen);
-    SecIdentityRef identity = NULL; SecKeyRef privKey = NULL;
-    {
-        CFStringRef pw = CFStringCreateWithCString(NULL, password, kCFStringEncodingUTF8);
-        const void *keys[] = { kSecImportExportPassphrase };
-        const void *vals[] = { pw };
-        CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1, NULL, NULL);
-        CFArrayRef items = NULL;
-        OSStatus st = SecPKCS12Import(p12Data, opts, &items);
-        if (st != errSecSuccess){
-            fprintf(stderr, "rysign: SecPKCS12Import failed (%d)\n", (int)st);
-            CFRelease(p12Data); free(p12); if(pw)CFRelease(pw); if(opts)CFRelease(opts);
-            return 3;
-        }
-        CFDictionaryRef dict = CFArrayGetValueAtIndex(items, 0);
-        identity = (SecIdentityRef)CFDictionaryGetValue(dict, kSecImportItemIdentity);
-        CFRetain(identity);
-        if (pw) CFRelease(pw); if (opts) CFRelease(opts); if (items) CFRelease(items);
-    }
-    CFRelease(p12Data);
-    SecIdentityCopyPrivateKey(identity, &privKey);
-
+// ---- Shared bundle-signing body (identity already in hand) ----------------
+// Returns 0 on success. Exit-code convention:
+//   5  main executable not found
+//   6  signing the main executable failed
+static int sign_bundle_with_leaf_key(const char *bundlePath,
+                                     SecCertificateRef leaf, SecKeyRef privKey,
+                                     const char *provPath,
+                                     const char *entitlementsPath){
     // 2. Provisioning profile
     size_t provlen; unsigned char *prov = read_file(provPath, &provlen);
-    if (!prov){ fprintf(stderr, "rysign: cannot read provisioning\n"); if(identity)CFRelease(identity); if(privKey)CFRelease(privKey); free(p12); return 4; }
+    if (!prov){ fprintf(stderr, "rysign: cannot read provisioning\n"); return 4; }
     g_prov = prov; g_prov_len = provlen;
 
     // team id
@@ -793,27 +770,157 @@ int rysign_sign_bundle(const char *bundlePath,
     }
     if (access(exe_path, F_OK)!=0){
         fprintf(stderr, "rysign: cannot locate main executable in bundle\n");
-        if(identity)CFRelease(identity); if(privKey)CFRelease(privKey); free(p12); free(prov); if(ent)free(ent);
+        free(prov); if(ent)free(ent);
         return 5;
     }
-    int rc = sign_macho_file_at(exe_path, identity, privKey, team, bid, ent, ent_len);
-    if (rc != 0){ fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc); if(identity)CFRelease(identity); if(privKey)CFRelease(privKey); free(p12); free(prov); if(ent)free(ent); return 6; }
+    int rc = sign_macho_file_at(exe_path, leaf, privKey, team, bid, ent, ent_len);
+    if (rc != 0){
+        fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc);
+        free(prov); if(ent)free(ent);
+        // -3 from sign_slice means the RSA signature over the CodeDirectory
+        // could not be produced — i.e. SecKeyCreateSignature refused the key.
+        return (rc == -3) ? 9 : 6;
+    }
 
     // 5. sign frameworks / plugins dylibs
     const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };
     for (int s=0;s<3;s++){
         char d[2048]; snprintf(d,sizeof(d),"%s/%s",bundlePath,subdirs[s]);
-        sign_walk(d, identity, privKey, team, bid, ent, ent_len);
+        sign_walk(d, leaf, privKey, team, bid, ent, ent_len);
     }
 
     // 6. embed provisioning profile (AMFI requires profile to match signature)
     char emb[2048]; snprintf(emb,sizeof(emb),"%s/embedded.mobileprovision",bundlePath);
     write_file(emb, prov, provlen);
 
-    if (identity) CFRelease(identity);
-    if (privKey) CFRelease(privKey);
-    free(p12); free(prov); if (ent) free(ent);
+    free(prov); if(ent)free(ent);
     return 0;
+}
+
+// ---- Bundle signing entry: PKCS#12 file ----------------------------------
+// Kept for completeness, but the app no longer uses it: the overwhelmingly
+// common p12 today is written by OpenSSL 3 (PBES2 / AES-256-CBC / PBKDF2),
+// which `SecPKCS12Import` cannot read at all — it fails with an opaque status
+// and this function returns 3. Use `rysign_sign_bundle_with_der` instead.
+int rysign_sign_bundle(const char *bundlePath,
+                       const char *p12Path,
+                       const char *password,
+                       const char *provPath,
+                       const char *entitlementsPath){
+    // 1. Read p12 -> identity + private key
+    size_t plen; unsigned char *p12 = read_file(p12Path, &plen);
+    if (!p12) { fprintf(stderr, "rysign: cannot read p12\n"); return 2; }
+    CFDataRef p12Data = CFDataCreate(NULL, p12, (CFIndex)plen);
+    SecIdentityRef identity = NULL; SecKeyRef privKey = NULL; SecCertificateRef leaf = NULL;
+    {
+        CFStringRef pw = CFStringCreateWithCString(NULL, password, kCFStringEncodingUTF8);
+        const void *keys[] = { kSecImportExportPassphrase };
+        const void *vals[] = { pw };
+        CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1, NULL, NULL);
+        CFArrayRef items = NULL;
+        OSStatus st = SecPKCS12Import(p12Data, opts, &items);
+        if (st != errSecSuccess){
+            fprintf(stderr, "rysign: SecPKCS12Import failed (%d)\n", (int)st);
+            CFRelease(p12Data); free(p12); if(pw)CFRelease(pw); if(opts)CFRelease(opts);
+            return 3;
+        }
+        CFDictionaryRef dict = CFArrayGetValueAtIndex(items, 0);
+        identity = (SecIdentityRef)CFDictionaryGetValue(dict, kSecImportItemIdentity);
+        CFRetain(identity);
+        if (pw) CFRelease(pw); if (opts) CFRelease(opts); if (items) CFRelease(items);
+    }
+    CFRelease(p12Data);
+    SecIdentityCopyCertificate(identity, &leaf);
+    SecIdentityCopyPrivateKey(identity, &privKey);
+
+    int rc = sign_bundle_with_leaf_key(bundlePath, leaf, privKey, provPath, entitlementsPath);
+
+    if (leaf) CFRelease(leaf);
+    if (privKey) CFRelease(privKey);
+    if (identity) CFRelease(identity);
+    free(p12);
+    return rc;
+}
+
+// Bit length of the modulus inside a PKCS#1 `RSAPrivateKey` DER, or 0 if the
+// blob is not shaped like one. Handed to `SecKeyCreateWithData` as
+// `kSecAttrKeySizeInBits`: Security accepts RSA keys without it, but stating it
+// removes any doubt about which representation the data is in.
+static int pkcs1_modulus_bits(const unsigned char *der, size_t len){
+    Cur c; c.p=der; c.len=len; c.pos=0;
+    unsigned char tag; const unsigned char *content; size_t clen;
+    if (cur_read_tlv(&c,&tag,&content,&clen)!=0 || tag!=0x30) return 0;  // RSAPrivateKey
+    if (cur_read_tlv(&c,&tag,&content,&clen)!=0 || tag!=0x02) return 0;  // version
+    if (cur_read_tlv(&c,&tag,&content,&clen)!=0 || tag!=0x02) return 0;  // modulus
+    const unsigned char *m = content; size_t n = clen;
+    while (n > 1 && m[0]==0){ m++; n--; }
+    return (int)(n * 8);
+}
+
+// ---- Bundle signing entry: DER certificate + DER private key -------------
+// This is the path RyBox actually uses. The p12 was already decoded by
+// `RyP12` (Swift), which handles the OpenSSL 3 schemes Apple's importer
+// refuses; here we only have to turn the two DER blobs back into Security
+// objects and sign. No `SecIdentity` is ever created, so nothing depends on
+// `SecPKCS12Import` succeeding.
+//
+// `keyIsEC` selects the key type. Apple's iOS development / distribution
+// certificates are RSA, so the CMS builder below assumes RSA.
+int rysign_sign_bundle_with_der(const char *bundlePath,
+                                const char *certDerPath,
+                                const char *keyDerPath,
+                                int keyIsEC,
+                                const char *provPath,
+                                const char *entitlementsPath){
+    size_t clen = 0, klen = 0;
+    unsigned char *cd = read_file(certDerPath, &clen);
+    unsigned char *kd = read_file(keyDerPath, &klen);
+    if (!cd || !kd || clen == 0 || klen == 0){
+        fprintf(stderr, "rysign: cannot read cert/key DER\n");
+        if (cd) free(cd); if (kd) free(kd);
+        return 7;
+    }
+
+    CFDataRef certData = CFDataCreate(NULL, cd, (CFIndex)clen);
+    SecCertificateRef leaf = SecCertificateCreateWithData(NULL, certData);
+    if (!leaf){
+        fprintf(stderr, "rysign: SecCertificateCreateWithData failed\n");
+        CFRelease(certData); free(cd); free(kd);
+        return 7;
+    }
+
+    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
+    CFDictionarySetValue(attrs, kSecAttrKeyType,
+                         keyIsEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA);
+    if (!keyIsEC){
+        // RSA only: EC keys get their size from the curve OID in the DER.
+        int bits = pkcs1_modulus_bits(kd, klen);
+        if (bits > 0){
+            int bitsRef = bits;
+            CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
+            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, n);
+            if (n) CFRelease(n);
+        }
+    }
+    CFErrorRef keyErr = NULL;
+    CFDataRef keyData = CFDataCreate(NULL, kd, (CFIndex)klen);
+    SecKeyRef privKey = SecKeyCreateWithData(keyData, attrs, &keyErr);
+    CFRelease(keyData); CFRelease(attrs);
+    if (!privKey){
+        fprintf(stderr, "rysign: SecKeyCreateWithData failed\n");
+        if (keyErr) CFRelease(keyErr);
+        CFRelease(certData); CFRelease(leaf); free(cd); free(kd);
+        return 8;
+    }
+
+    int rc = sign_bundle_with_leaf_key(bundlePath, leaf, privKey, provPath, entitlementsPath);
+
+    CFRelease(privKey);
+    CFRelease(leaf);
+    CFRelease(certData);
+    free(cd); free(kd);
+    return rc;
 }
 
 // NOTE: rysign_sign_bundle() is invoked in-process from CodeSigner.swift
