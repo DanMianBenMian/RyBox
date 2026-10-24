@@ -385,7 +385,7 @@ final class DesktopStore: ObservableObject {
             slots.removeValue(forKey: m)
         }
         reflow()
-        RyLog.shared.log("建立文件夹「\(folder.name)」· 成员 \(members.count) 个", .info, "ui")
+        RyLog.shared.log("建立文件夹「\(folder.name)」· 成员 \(members.count) 个", level: .info, tag: "ui")
         return folder
     }
 
