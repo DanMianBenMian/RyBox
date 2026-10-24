@@ -49,7 +49,7 @@ final class FloatingLogBall: NSObject {
     func show() {
         guard window == nil else { return }
         guard let scene = Self.currentScene() else {
-            RyLog.shared.log("浮窗日志球无法开启：没有可用的 windowScene", .error, "ui")
+            RyLog.shared.log("浮窗日志球无法开启：没有可用的 windowScene", level: .error, tag: "ui")
             return
         }
 
@@ -167,7 +167,7 @@ final class FloatingLogBall: NSObject {
             }
             .store(in: &cancellables)
 
-        RyLog.shared.log("浮窗日志球已开启", .info, "ui")
+        RyLog.shared.log("浮窗日志球已开启", level: .info, tag: "ui")
     }
 
     func hide() {
@@ -181,7 +181,7 @@ final class FloatingLogBall: NSObject {
         panel = nil
         logText = nil
         panelVisible = false
-        RyLog.shared.log("浮窗日志球已关闭", .info, "ui")
+        RyLog.shared.log("浮窗日志球已关闭", level: .info, tag: "ui")
     }
 
     func toggle() {
