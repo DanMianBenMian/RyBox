@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 /// chain depends on, plus desktop/Dock customization and about info.
 struct SettingsView: View {
     @State private var message: String = ""
+    @State private var themeToDelete: RyTheme?
 
     @ObservedObject private var store = CertificateStore.shared
     @ObservedObject private var desktop = DesktopStore.shared
@@ -22,6 +23,24 @@ struct SettingsView: View {
             aboutSection
         }
         .navigationTitle("设置")
+        .alert("删除主题？", isPresented: Binding(
+            get: { themeToDelete != nil },
+            set: { if !$0 { themeToDelete = nil } }
+        )) {
+            Button("删除", role: .destructive) {
+                if let t = themeToDelete {
+                    if ThemeEngine.shared.deleteTheme(t.id) {
+                        message = "已删除主题：\(t.name)"
+                    } else {
+                        message = "删除失败：\(t.name)"
+                    }
+                }
+                themeToDelete = nil
+            }
+            Button("取消", role: .cancel) { themeToDelete = nil }
+        } message: {
+            Text("将从 /Library/Themes 永久移除「\(themeToDelete?.name ?? "")」，此操作不可撤销。")
+        }
     }
 
     // MARK: 签名身份（状态只读，证书在「初始设置」中配置）
@@ -208,6 +227,11 @@ struct SettingsView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { theme.setEnabled(t.id, enabled: !theme.isEnabled(t.id)) }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) { themeToDelete = t } label: {
+                            Label("删除", systemImage: "trash")
+                        }
+                    }
                 }
             }
 
