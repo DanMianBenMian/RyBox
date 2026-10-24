@@ -67,6 +67,18 @@ void rysign_set_code_identity(const char *ident) {
     }
 }
 
+// ---- Explicit trust-chain certificates (set by Swift) --------------------
+// A `.mobileprovision` is a CMS-wrapped *binary* plist; the in-C profile
+// parser (which greps for `<dict>`/`<array>` byte strings) cannot read it, so
+// the CMS used to ship with only the leaf certificate and AMFI could not build
+// a trust chain. Swift decodes the profile and passes the full chain here.
+unsigned char **g_extra_certs = NULL;
+size_t *g_extra_certs_lens = NULL;
+int g_extra_certs_n = 0;
+
+// Forward declaration — defined later, used by `rysign_sign_bundle_robust`.
+static int pkcs1_modulus_bits(const unsigned char *der, size_t len);
+
 // ---- DER builders --------------------------------------------------------
 typedef struct { unsigned char *p; size_t len; size_t cap; } Buf;
 static void buf_init(Buf *b){ b->p = malloc(64); b->len = 0; b->cap = 64; }
@@ -407,7 +419,7 @@ static int build_cms(const unsigned char *cd, size_t cd_len,
     if (st != errSecSuccess){ buf_free(&sa); buf_free(&saSet); return -1; }
 
     Buf si; buf_init(&si);
-    { unsigned char one[1] = {1}; der_int(&si, one, 1); } // version
+    { unsigned char one[1] = {3}; der_int(&si, one, 1); } // version — 3 because signedAttrs are present
     // issuerAndSerialNumber
     { Buf iasn; buf_init(&iasn); buf_put(&iasn, issuer, issuer_len);
       der_int(&iasn, serial, serial_len);
@@ -429,7 +441,9 @@ static int build_cms(const unsigned char *cd, size_t cd_len,
 
     // SignedData
     Buf sd; buf_init(&sd);
-    { unsigned char one[1]={1}; der_int(&sd, one, 1); }
+    // Version 3: required because SignerInfo carries signedAttrs. AMFI/trust
+    // evaluation rejects a v1 SignedData that actually contains signedAttrs.
+    { unsigned char one[1]={3}; der_int(&sd, one, 1); }
     // digestAlgorithms SET OF AlgorithmIdentifier
     { Buf da; buf_init(&da); der_oid(&da, OID_SHA256, sizeof(OID_SHA256));
       Buf daSeq; buf_init(&daSeq); der_wrap(&daSeq, 0x30, &da);
@@ -630,12 +644,24 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         else if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64){
             // FairPlay-encrypted binaries cannot be re-signed meaningfully; the
             // import path is expected to reject them. Say so rather than
-            // silently producing a broken signature.
+            // silently producing a broken signature. The cryptoff field is a
+            // file offset too, so shift it with the body.
             struct encryption_info_command *ei = (struct encryption_info_command*)lc;
+            if (ei->cryptoff >= cmds_end) ei->cryptoff += (uint32_t)LC_SIZE;
             if (ei->cryptid != 0){
                 fprintf(stderr, "rysign: WARNING binary is FairPlay-encrypted "
                                 "(cryptid=%u); its signature will not validate\n", ei->cryptid);
             }
+        }
+        else if (lc->cmd == LC_LINKER_OPTIMIZATION_HINT || lc->cmd == LC_DYLIB_CODE_SIGN_DRS
+                 || lc->cmd == LC_SEGMENT_SPLIT_INFO){
+            // These modern load commands carry a `dataoff` file offset that must
+            // move with the body when the LC_CODE_SIGNATURE command is inserted.
+            // Missing them (Sileo, any binary linked by Xcode 14+) produced a
+            // corrupt binary whose chained-fixups / split-info blob was read 16
+            // bytes out of place — dyld rejected it and the guest never launched.
+            struct linkedit_data_command *ld = (struct linkedit_data_command*)lc;
+            if (ld->dataoff >= cmds_end) ld->dataoff += LC_SIZE;
         }
         lc = (struct load_command*)((unsigned char*)lc + lc->cmdsize);
     }
@@ -687,16 +713,27 @@ static int sign_macho_file_at(const char *path, SecCertificateRef leaf, SecKeyRe
                 for (int i=0;i<pn;i++){ certs[1+i]=pc[i]; clens[1+i]=pl[i]; }
                 nc = 1+pn;
             }
+            if (g_extra_certs_n > 0){
+                certs = realloc(certs, sizeof(void*)*(nc + g_extra_certs_n));
+                clens = realloc(clens, sizeof(size_t)*(nc + g_extra_certs_n));
+                for (int i=0;i<g_extra_certs_n;i++){ certs[nc+i]=g_extra_certs[i]; clens[nc+i]=g_extra_certs_lens[i]; }
+                nc += g_extra_certs_n;
+            }
             int rc = sign_slice(&buf, &len, ident, team, NULL, 0, ent, ent_len,
                                 privKey, certs, clens, nc, issuer.p, issuer.len, serial.p, serial.len);
-            if (rc==0) write_file(path, buf, len);
-            if (ld) CFRelease(ld);
+        fprintf(stderr, "rysign: sign_slice(main) rc=%d magic=%08x leaf=%d\n", rc, magic, (leaf!=NULL));
+        if (rc==0){
+            write_file(path, buf, len);
+            // buf now points to the signed (final) data; intentionally not freed (one-shot)
+        } else {
+            free(buf);   // on failure sign_slice leaves the original buffer intact
+        }
+        if (ld) CFRelease(ld);
+        return rc;
         } else {
             free(buf);
             return -2;
         }
-        // buf now points to the signed (final) data; intentionally not freed (one-shot)
-        return 0;
     } else if (magic == FAT_MAGIC || magic == FAT_CIGAM){
         int swap = (magic == FAT_CIGAM);
         struct fat_header *fh = (struct fat_header*)buf;
@@ -719,7 +756,7 @@ static int sign_macho_file_at(const char *path, SecCertificateRef leaf, SecKeyRe
                     parse_cert_ids(ldp,ldl,&issuer,&serial);
                     certs=malloc(sizeof(void*)); clens=malloc(sizeof(size_t)); certs[0]=(unsigned char*)ldp; clens[0]=ldl; nc=1;
                     unsigned char **pc=NULL; size_t *pl=NULL; int pn=0;
-                    if (extract_profile_certs(g_prov,g_prov_len,&pc,&pl,&pn)==0){ certs=realloc(certs,sizeof(void*)*(1+pn)); clens=realloc(clens,sizeof(size_t)*(1+pn)); for(int j=0;j<pn;j++){certs[1+j]=pc[j];clens[1+j]=pl[j];} nc=1+pn; }
+                    if (extract_profile_certs(g_prov,g_prov_len,&pc,&pl,&pn)==0){ certs=realloc(certs,sizeof(void*)*(1+pn)); clens=realloc(clens,sizeof(size_t)*(1+pn)); for(int j=0;j<pn;j++){certs[1+j]=pc[j];clens[1+j]=pl[j];} nc=1+pn; } if (g_extra_certs_n>0){ certs=realloc(certs,sizeof(void*)*(nc+g_extra_certs_n)); clens=realloc(clens,sizeof(size_t)*(nc+g_extra_certs_n)); for(int j=0;j<g_extra_certs_n;j++){certs[nc+j]=g_extra_certs[j];clens[nc+j]=g_extra_certs_lens[j];} nc+=g_extra_certs_n; }
                     sign_slice(&sb, &sl, ident, team, NULL, 0, ent, ent_len, privKey, certs, clens, nc, issuer.p, issuer.len, serial.p, serial.len);
                     if (ld) CFRelease(ld);
                 }
@@ -877,6 +914,182 @@ static int sign_bundle_with_leaf_key(const char *bundlePath,
 
     free(prov); if(ent)free(ent);
     return 0;
+}
+
+// ---- Explicit trust-chain certificates (set by Swift) --------------------
+// A `.mobileprovision` is a CMS-wrapped *binary* plist — the in-C profile
+// parser (which greps for `<dict>`/`<array>` byte strings) can never read it,
+// so `extract_profile_certs` returns nothing and the CMS used to ship with only
+// the leaf certificate. AMFI then cannot build a chain to a trusted root and
+// rejects the guest. Swift now decodes the profile properly and hands the whole
+// chain here; `sign_macho_file_at` appends it after the leaf.
+// (The globals are declared near the top of this file.)
+
+void rysign_set_extra_certs(unsigned char **c, size_t *l, int n) {
+    if (g_extra_certs) { for (int i=0;i<g_extra_certs_n;i++) free(g_extra_certs[i]); free(g_extra_certs); }
+    if (g_extra_certs_lens) free(g_extra_certs_lens);
+    g_extra_certs = c; g_extra_certs_lens = l; g_extra_certs_n = n;
+}
+
+/// Read every `*.der` in `dir` (sorted by name) into a malloc'd cert array.
+static int read_certs_dir(const char *dir, unsigned char ***out, size_t **outl, int *outn) {
+    DIR *d = opendir(dir); if (!d) return -1;
+    char **names = NULL; int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        size_t len = strlen(de->d_name);
+        if (len < 4 || strcmp(de->d_name + len - 4, ".der") != 0) continue;
+        names = realloc(names, sizeof(char*) * (n + 1));
+        names[n++] = strdup(de->d_name);
+    }
+    closedir(d);
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && strcmp(names[j-1], names[j]) > 0; j--) {
+            char *t = names[j-1]; names[j-1] = names[j]; names[j] = t;
+        }
+    unsigned char **certs = n ? malloc(sizeof(void*) * n) : NULL;
+    size_t *lens = n ? malloc(sizeof(size_t) * n) : NULL;
+    for (int i = 0; i < n; i++) {
+        char path[2048]; snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        size_t l = 0; unsigned char *b = read_file(path, &l);
+        certs[i] = b; lens[i] = l;
+        free(names[i]);
+    }
+    free(names);
+    *out = certs; *outl = lens; *outn = n;
+    return 0;
+}
+
+// ---- Robust bundle signing: all material pre-decoded by Swift -------------
+// Swift decodes the provisioning profile with `CMSDecoder` + `PropertyList-
+// Serialization` (which handles the binary plist), then passes the team id,
+// the entitlements plist, and the full certificate chain. This module no
+// longer parses the profile at all — it only embeds it.
+//
+// Exit codes mirror `sign_bundle_with_leaf_key`:
+//   5  main executable not found
+//   6  signing the main executable failed
+//   7  cert/key DER unusable
+//   8  private key could not be created
+static int sign_bundle_core(const char *bundlePath,
+                            SecCertificateRef leaf, SecKeyRef privKey,
+                            const char *team,
+                            const unsigned char *ent, size_t ent_len,
+                            const char *provPath) {
+    // Provisioning profile — embedded only (AMFI requires it to match).
+    size_t provlen; unsigned char *prov = read_file(provPath, &provlen);
+    if (!prov) { fprintf(stderr, "rysign: cannot read provisioning\n"); return 4; }
+    g_prov = prov; g_prov_len = provlen;
+
+    // main executable + bundle id from Info.plist (host id comes from the
+    // CodeDirectory-identifier override set by Swift).
+    char exe_path[2048];
+    snprintf(exe_path, sizeof(exe_path), "%s/Info.plist", bundlePath);
+    unsigned char *info = NULL; size_t info_len = 0;
+    info = read_file(exe_path, &info_len);
+    char bid[256] = {0};
+    if (info) {
+        char *t = malloc(info_len + 1); for (size_t i=0;i<info_len;i++) t[i]=(char)info[i]; t[info_len]=0;
+        char *fe = strstr(t, "CFBundleExecutable");
+        if (fe) { char *s=strstr(fe,"<string"); if(s){ char *e=strstr(s+7,"</string>"); if(e){ size_t l=(size_t)(e-(s+7)); char exen[1024]={0}; if(l<1024){memcpy(exen,s+7,l);} snprintf(exe_path,sizeof(exe_path),"%s/%s",bundlePath,exen); } } }
+        char *bi = strstr(t, "CFBundleIdentifier");
+        if (bi) { char *s=strstr(bi,"<string"); if(s){ char *e=strstr(s+7,"</string>"); if(e){ size_t l=(size_t)(e-(s+7)); if(l<256){memcpy(bid,s+7,l);} } } }
+        free(t); free(info);
+    }
+    if (access(exe_path, F_OK) != 0) {
+        fprintf(stderr, "rysign: cannot locate main executable in bundle\n");
+        free(prov); if(ent)free(ent);
+        return 5;
+    }
+    const char *ident = (g_ident_override && g_ident_override[0]) ? g_ident_override : bid;
+    fprintf(stderr, "rysign: signing '%s' team='%s' ident='%s' hasEnt=%d\n",
+            exe_path, team ? team : "", ident, (ent && ent_len>0)?1:0);
+    int rc = sign_macho_file_at(exe_path, leaf, privKey, team, ident, ent, ent_len);
+    if (rc != 0) {
+        fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc);
+        free(prov); if(ent)free(ent);
+        return (rc == -3) ? 9 : 6;
+    }
+
+    // sign frameworks / plugins dylibs
+    const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };
+    for (int s=0;s<3;s++) {
+        char d[2048]; snprintf(d,sizeof(d),"%s/%s",bundlePath,subdirs[s]);
+        sign_walk(d, leaf, privKey, team, ident, ent, ent_len);
+    }
+
+    // embed provisioning profile
+    char emb[2048]; snprintf(emb,sizeof(emb),"%s/embedded.mobileprovision",bundlePath);
+    write_file(emb, prov, provlen);
+
+    free(prov); if(ent)free(ent);
+    return 0;
+}
+
+int rysign_sign_bundle_robust(const char *bundlePath,
+                              const char *leafCertDerPath,
+                              const char *keyDerPath,
+                              int keyIsEC,
+                              const char *provPath,
+                              const char *entitlementsPath,
+                              const char *team,
+                              const char *certsDir) {
+    size_t clen = 0, klen = 0;
+    unsigned char *cd = read_file(leafCertDerPath, &clen);
+    unsigned char *kd = read_file(keyDerPath, &klen);
+    if (!cd || !kd || clen == 0 || klen == 0) {
+        fprintf(stderr, "rysign: cannot read cert/key DER\n");
+        if (cd) free(cd); if (kd) free(kd);
+        return 7;
+    }
+    CFDataRef certData = CFDataCreate(NULL, cd, (CFIndex)clen);
+    SecCertificateRef leaf = SecCertificateCreateWithData(NULL, certData);
+    if (!leaf) {
+        fprintf(stderr, "rysign: SecCertificateCreateWithData failed\n");
+        CFRelease(certData); free(cd); free(kd);
+        return 7;
+    }
+    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
+    CFDictionarySetValue(attrs, kSecAttrKeyType,
+                         keyIsEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA);
+    if (!keyIsEC) {
+        int bits = pkcs1_modulus_bits(kd, klen);
+        if (bits > 0) {
+            int bitsRef = bits;
+            CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
+            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, n);
+            if (n) CFRelease(n);
+        }
+    }
+    CFErrorRef keyErr = NULL;
+    CFDataRef keyData = CFDataCreate(NULL, kd, (CFIndex)klen);
+    SecKeyRef privKey = SecKeyCreateWithData(keyData, attrs, &keyErr);
+    CFRelease(keyData); CFRelease(attrs);
+    if (!privKey) {
+        fprintf(stderr, "rysign: SecKeyCreateWithData failed\n");
+        if (keyErr) CFRelease(keyErr);
+        CFRelease(certData); CFRelease(leaf); free(cd); free(kd);
+        return 8;
+    }
+
+    // Trust chain (intermediate + root) handed in by Swift.
+    unsigned char **extra = NULL; size_t *extra_lens = NULL; int extra_n = 0;
+    if (certsDir) read_certs_dir(certsDir, &extra, &extra_lens, &extra_n);
+    rysign_set_extra_certs(extra, extra_lens, extra_n);
+
+    // Entitlements — explicit plist file preferred; the caller always supplies it.
+    unsigned char *ent = NULL; size_t ent_len = 0;
+    if (entitlementsPath && access(entitlementsPath, F_OK) == 0)
+        ent = read_file(entitlementsPath, &ent_len);
+
+    int rc = sign_bundle_core(bundlePath, leaf, privKey, team, ent, ent_len, provPath);
+
+    if (leaf) CFRelease(leaf);
+    if (privKey) CFRelease(privKey);
+    CFRelease(certData); free(cd); free(kd);
+    return rc;
 }
 
 // ---- Bundle signing entry: PKCS#12 file ----------------------------------
