@@ -184,11 +184,15 @@ struct IconArtwork: View {
         .shadow(color: .black.opacity(0.24), radius: 5, y: 3)
     }
 
-    private var themedOrOwnImage: UIImage? {
+    /// The real artwork for an item: theme icon first, then the app's own PNG.
+    /// Exposed so the FOLDER THUMBNAIL can show the members' real icons — the
+    /// folder preview used to fall back to flat colour squares with an SF Symbol
+    /// even when the member app had a perfectly good icon.
+    static func artworkImage(for item: DesktopItem,
+                             theme: ThemeEngine = .shared) -> UIImage? {
         if let bid = item.bundleIdentifier, let themed = theme.icon(forBundleID: bid) {
             return themed
         }
-        // Folders can be themed by their own id in IconBundles.
         if case .folder(let f) = item.kind, let themed = theme.icon(forBundleID: f.id) {
             return themed
         }
@@ -198,10 +202,20 @@ struct IconArtwork: View {
         return nil
     }
 
+    private var themedOrOwnImage: UIImage? {
+        IconArtwork.artworkImage(for: item, theme: theme)
+    }
+
     private var folderArtwork: some View {
         let previews = Array(folderMembers.prefix(4))
         return RoundedRectangle(cornerRadius: radius, style: .continuous)
+            // A dark frosted plate: the folder name is drawn in white on top of
+            // it, so the plate must stay dark or the text is unreadable.
             .fill(.ultraThinMaterial)
+            .overlay(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(Color.black.opacity(0.34))
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .strokeBorder(.white.opacity(0.25), lineWidth: 0.5)
@@ -212,23 +226,38 @@ struct IconArtwork: View {
                         HStack(spacing: size * 0.045) {
                             ForEach(0..<2, id: \.self) { col in
                                 let idx = row * 2 + col
-                                ZStack {
-                                    RoundedRectangle(cornerRadius: size * 0.08, style: .continuous)
-                                        .fill(previews.indices.contains(idx)
-                                              ? previews[idx].tint
-                                              : Color.white.opacity(0.18))
-                                        .frame(width: size * 0.32, height: size * 0.32)
-                                    if previews.indices.contains(idx) {
-                                        Image(systemName: previews[idx].symbol)
-                                            .font(.system(size: size * 0.13))
-                                            .foregroundStyle(.white)
-                                    }
-                                }
+                                memberThumb(idx, previews: previews)
                             }
                         }
                     }
                 }
             )
+    }
+
+    /// One member thumbnail inside the folder: the member's REAL icon when it
+    /// has one (theme icon or the app's own PNG), otherwise the tinted
+    /// placeholder square.
+    @ViewBuilder
+    private func memberThumb(_ idx: Int, previews: [DesktopItem]) -> some View {
+        let member = previews.indices.contains(idx) ? previews[idx] : nil
+        let real = member.flatMap { IconArtwork.artworkImage(for: $0, theme: theme) }
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.08, style: .continuous)
+                .fill(member?.tint ?? Color.white.opacity(0.18))
+                .frame(width: size * 0.32, height: size * 0.32)
+            if let real = real {
+                // The member's own icon, clipped to the squircle shape.
+                Image(uiImage: real)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size * 0.32, height: size * 0.32)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.08, style: .continuous))
+            } else if let member = member {
+                Image(systemName: member.symbol)
+                    .font(.system(size: size * 0.13))
+                    .foregroundStyle(.white)
+            }
+        }
     }
 
     private var generatedArtwork: some View {
