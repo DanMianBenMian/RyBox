@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 /// Built-in RyBox apps. Sileo is PREINSTALLED (shows on the desktop + dock by
 /// default), matching a jailbroken-device home screen.
@@ -229,7 +230,28 @@ final class DesktopStore: ObservableObject {
         slots = Self.loadSlots()
         folders = Self.loadFolders()
         badges = (defaults.dictionary(forKey: Key.badges) as? [String: Int]) ?? [:]
+
+        // Imported guests change AFTER this store is built: a fresh import
+        // (ImportView) and the bootstrap re-scan on relaunch (AppImporter.bootstrap)
+        // both repopulate `importedApps` asynchronously. When that happens we must
+        // (a) give every guest a desktop slot so it actually shows on the grid,
+        // (b) drop stale slots for uninstalled guests, and (c) re-publish so the
+        // SpringBoard re-renders. Without this, a restored guest has no slot —
+        // `items(onPage:)` filters by slot — and silently vanishes on relaunch,
+        // which is exactly the "重新进入软件后已经导入的ipa丢失" bug.
+        AppImporter.shared.$importedApps
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                self.ensurePlaced(isIPad: UIDevice.current.userInterfaceIdiom == .pad)
+                self.pruneSlots()
+                self.objectWillChange.send()
+            }
+            .store(in: &cancellables)
     }
+
+    /// Combine bag for the `importedApps` subscription above.
+    private var cancellables = Set<AnyCancellable>()
 
     // MARK: Item lists
 
