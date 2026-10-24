@@ -59,6 +59,12 @@
 // profile. Swift sets this; NULL keeps the guest's own CFBundleIdentifier.
 static char *g_ident_override = NULL;
 
+/// The sub-code of the LAST failure inside `sign_macho_file_at`, exposed so the
+/// Swift layer can tell the user WHERE signing died (the outer exit code 6
+/// covers a dozen different causes). Read via `rysign_last_subcode()`.
+static int g_sign_subcode = 0;
+int rysign_last_subcode(void) { return g_sign_subcode; }
+
 /// The guest's Info.plist FILE BYTES (special slot -1). Swift can hand them
 /// over via `rysign_set_info_plist`; if it does not, the signer reads them from
 /// disk. (The in-C parser that used to `strstr` for `<string` failed on every
@@ -391,6 +397,14 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
     OSStatus st = SecKeyCreateSignature(privKey, signAlgo,
         CFDataCreate(NULL, saSet.p, (CFIndex)saSet.len), &sigData);
     if (st != errSecSuccess) {
+        // The OSStatus is the ONLY clue the device gives us here: -25338
+        // (errSecUnsupportedAlgorithm?) style codes point at a key/algorithm
+        // mismatch, which is exactly the failure that used to surface as a
+        // bare "exit code 6".
+        fprintf(stderr, "rysign: SecKeyCreateSignature failed osstatus=%d algo=%s\n",
+                (int)st,
+                CFEqual(signAlgo, kSecKeyAlgorithmECDSASignatureMessageX962SHA256)
+                    ? "ecdsa-x9.62-sha256" : "rsa-pkcs1v15-sha256");
         buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
         return -1;
     }
@@ -448,6 +462,55 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
 // Sign a single 64-bit Mach-O — zsign-style in-place overwrite
 // ---------------------------------------------------------------------------
 
+/// Offset of the first byte that is NOT load commands (the lowest section
+/// fileoff), or 0 when it cannot be determined. Used to decide whether a new
+/// load command can be appended into the header's slack.
+static uint32_t loadCommandsBoundary(const struct mach_header_64 *hdr) {
+    const struct load_command *lc =
+        (const struct load_command *)((const uint8_t *)hdr + sizeof(*hdr));
+    uint32_t best = 0;
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sects = (const struct section_64 *)(seg + 1);
+            for (uint32_t s = 0; s < seg->nsects; s++) {
+                if (sects[s].offset > 0 && (best == 0 || sects[s].offset < best))
+                    best = sects[s].offset;
+            }
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return best;
+}
+
+/// zsign parity (`ZArchO::Sign` inserts one when the binary carries none): a
+/// decrypted / tool-stripped IPA may have had its LC_CODE_SIGNATURE removed.
+/// Without the command the whole signing model (write at `dataoff`) has no
+/// anchor, so synthesise it at the end of the load commands, pointing at the
+/// current file tail — the SuperBlob then grows the file exactly like zsign.
+/// On success stores the new command in `*out_lc` and returns its dataoff;
+/// returns 0 when there is no room (caller fails).
+static uint32_t synthesizeCodeSignature(struct mach_header_64 *hdr, size_t file_len,
+                                        struct linkedit_data_command **out_lc) {
+    uint32_t boundary = loadCommandsBoundary(hdr);
+    if (boundary == 0) return 0;
+    uint8_t *cmdEnd = (uint8_t *)hdr + sizeof(*hdr) + hdr->sizeofcmds;
+    if ((uintptr_t)cmdEnd + sizeof(struct linkedit_data_command) >
+        (uintptr_t)hdr + boundary) return 0;         // no slack — cannot insert
+
+    struct linkedit_data_command *nc = (struct linkedit_data_command *)cmdEnd;
+    memset(nc, 0, sizeof(*nc));
+    nc->cmd = LC_CODE_SIGNATURE;
+    nc->cmdsize = (uint32_t)sizeof(*nc);             // 16
+    nc->dataoff = (uint32_t)file_len;                // blob starts at file tail
+    nc->datasize = 0;
+    hdr->ncmds++;
+    hdr->sizeofcmds += nc->cmdsize;
+    if (out_lc) *out_lc = nc;
+    fprintf(stderr, "rysign: synthesised LC_CODE_SIGNATURE dataoff=%u\n", nc->dataoff);
+    return nc->dataoff;
+}
+
 static int sign_slice(unsigned char **pbuf, size_t *len,
                       const char *ident, const char *team,
                       const unsigned char *infoplist, size_t info_len,
@@ -479,7 +542,17 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         }
         lc = (struct load_command *)((unsigned char *)lc + lc->cmdsize);
     }
-    if (!sig_lc) { fprintf(stderr, "rysign: missing LC_CODE_SIGNATURE\n"); return -2; }
+    if (!sig_lc) {
+        // No signature command at all (stripped/decrypted IPA). Synthesise one
+        // instead of dying — zsign does exactly this.
+        uint32_t new_off = synthesizeCodeSignature(hdr, *len, &sig_lc);
+        if (new_off == 0) {
+            fprintf(stderr, "rysign: missing LC_CODE_SIGNATURE and no room to add one\n");
+            return -2;
+        }
+        sig_dataoff = new_off;
+        sig_datasize = 0;
+    }
 
     // CodeDirectory hashes everything before the signature — zsign's m_uCodeLength.
     uint64_t code_limit = (uint64_t)sig_dataoff;
@@ -552,6 +625,8 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
             linkedit->filesize = (uint64_t)new_len - linkedit->fileoff;
             uint64_t new_vmsize = (linkedit->filesize + 0xFFFULL) & ~(uint64_t)0xFFFULL;
             if (new_vmsize > linkedit->vmsize) linkedit->vmsize = new_vmsize;
+        } else {
+            fprintf(stderr, "rysign: no __LINKEDIT segment; growing file without it\n");
         }
         sig_lc->datasize = (uint32_t)sb.len;
         unsigned char *nb = (unsigned char *)realloc(buf, new_len);
@@ -577,31 +652,72 @@ static int sign_macho_file_at(const char *path, const char *bundlePath,
                               SecCertificateRef leaf, SecKeyRef privKey,
                               const char *team, const char *ident,
                               const unsigned char *ent, size_t ent_len) {
+    g_sign_subcode = 0;
+
+    // A directory (e.g. a mangled exe path ending in "/") would otherwise sail
+    // through read_file's fseek/ftell and hand sign_slice uninitialised bytes.
+    struct stat pst;
+    if (stat(path, &pst) != 0 || S_ISDIR(pst.st_mode)) {
+        fprintf(stderr, "rysign: '%s' is not a regular file\n", path);
+        g_sign_subcode = -8;
+        return -8;
+    }
+
     size_t len; unsigned char *buf = read_file(path, &len);
-    if (!buf) return -1;
+    if (!buf) { g_sign_subcode = -1; return -1; }
+    if (len < sizeof(struct mach_header_64)) {
+        fprintf(stderr, "rysign: '%s' too small (%zu bytes)\n", path, len);
+        free(buf); g_sign_subcode = -1; return -1;
+    }
 
     uint32_t magic = *(uint32_t *)buf;
-    if (magic != MH_MAGIC_64) { free(buf); return -9; }
+    if (magic != MH_MAGIC_64) {
+        fprintf(stderr, "rysign: '%s' is not a 64-bit Mach-O (magic %08x)\n", path, magic);
+        free(buf); g_sign_subcode = -9; return -9;
+    }
 
+    // The leaf DER must outlive the CFDataRef it was borrowed from: certs[0]
+    // pointed straight into that buffer, which used to be CFRelease'd before
+    // build_cms read it (a use-after-free that only survived by luck).
     Buf issuer; Buf serial; buf_init(&issuer); buf_init(&serial);
+    unsigned char *leaf_copy = NULL; size_t leaf_copy_len = 0;
     unsigned char **certs = NULL; size_t *cert_lens = NULL; int nc = 0;
     if (leaf) {
         CFDataRef ld = SecCertificateCopyData(leaf);
-        const unsigned char *ldp = CFDataGetBytePtr(ld);
-        size_t ldl = (size_t)CFDataGetLength(ld);
-        parse_cert_ids(ldp, ldl, &issuer, &serial);
+        if (ld) {
+            const unsigned char *ldp = CFDataGetBytePtr(ld);
+            size_t ldl = (size_t)CFDataGetLength(ld);
+            leaf_copy = (unsigned char *)malloc(ldl ? ldl : 1);
+            if (leaf_copy) {
+                memcpy(leaf_copy, ldp, ldl);
+                leaf_copy_len = ldl;
+            }
+            parse_cert_ids(ldp, ldl, &issuer, &serial);
+            CFRelease(ld);
+        }
         certs = malloc(sizeof(void *));
         cert_lens = malloc(sizeof(size_t));
-        certs[0] = (unsigned char *)ldp; cert_lens[0] = ldl; nc = 1;
-        if (g_extra_certs_n > 0) {
-            certs = realloc(certs, sizeof(void *) * (nc + g_extra_certs_n));
-            cert_lens = realloc(cert_lens, sizeof(size_t) * (nc + g_extra_certs_n));
-            for (int i = 0; i < g_extra_certs_n; i++) {
-                certs[nc + i] = g_extra_certs[i]; cert_lens[nc + i] = g_extra_certs_lens[i];
-            }
-            nc += g_extra_certs_n;
+        if (certs && cert_lens) {
+            certs[0] = leaf_copy; cert_lens[0] = leaf_copy_len; nc = 1;
         }
-        if (ld) CFRelease(ld);
+        if (g_extra_certs_n > 0 && certs && cert_lens) {
+            certs = realloc(certs, sizeof(void *) * (size_t)(nc + g_extra_certs_n));
+            cert_lens = realloc(cert_lens, sizeof(size_t) * (size_t)(nc + g_extra_certs_n));
+            for (int i = 0; i < g_extra_certs_n; i++) {
+                // The provisioning profile's DeveloperCertificates array
+                // repeats the leaf; a duplicated leaf in the CMS cert set can
+                // confuse AMFI's trust evaluation, so skip identical DERs.
+                bool dup = false;
+                for (int j = 0; j < nc; j++) {
+                    if (cert_lens[j] == g_extra_certs_lens[i] &&
+                        memcmp(certs[j], g_extra_certs[i], g_extra_certs_lens[i]) == 0) {
+                        dup = true; break;
+                    }
+                }
+                if (dup) continue;
+                certs[nc] = g_extra_certs[i]; cert_lens[nc] = g_extra_certs_lens[i]; nc++;
+            }
+        }
     }
 
     unsigned char *info = NULL; size_t info_len = 0;
@@ -617,14 +733,24 @@ static int sign_macho_file_at(const char *path, const char *bundlePath,
         cr = read_file(crp, &cr_len);
     }
 
+    fprintf(stderr, "rysign: signing '%s' (info=%zu cr=%zu ent=%zu certs=%d)\n",
+            path, info_len, cr_len, ent_len, nc);
+
     int rc = sign_slice(&buf, &len, ident, team, info, info_len, ent, ent_len,
                         cr, cr_len, privKey, certs, cert_lens, nc,
                         issuer.p, issuer.len, serial.p, serial.len);
+    if (rc == 0) {
+        if (write_file(path, buf, len) != 0) {
+            fprintf(stderr, "rysign: write-back failed for '%s'\n", path);
+            rc = -10;
+        }
+    } else {
+        fprintf(stderr, "rysign: sign_slice '%s' rc=%d\n", path, rc);
+    }
 
-    if (rc == 0) write_file(path, buf, len);
-    else fprintf(stderr, "rysign: sign_slice '%s' rc=%d\n", path, rc);
-
+    g_sign_subcode = rc;
     free(buf);
+    if (leaf_copy) free(leaf_copy);
     if (certs) free(certs);
     if (cert_lens) free(cert_lens);
     if (info != g_info_plist && info) free(info);
