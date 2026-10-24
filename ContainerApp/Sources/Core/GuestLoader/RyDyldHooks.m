@@ -7,6 +7,7 @@
 #import <string.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <crt_externs.h>
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
@@ -586,9 +587,10 @@ void *RyLaunchGuestExecutable(const char *execPath) {
     // LiveContainer passes the real `environ` (`ret = appMain(argc, argv,
     // environ)` in LCBootstrap.m). A NULL envp is not fatal for a C main, but
     // Swift's runtime and anything that reads `*environ` during its
-    // initialisers will walk a NULL pointer.
-    extern char **environ;
-    guestMain(1, argv, environ);
+    // initialisers will walk a NULL pointer. `environ` is not declared in any
+    // public iOS header, so pull it through `_NSGetEnviron()` (crt_externs.h).
+    char **envp = *_NSGetEnviron();
+    guestMain(1, argv, envp);
 
     return handle;
 }
