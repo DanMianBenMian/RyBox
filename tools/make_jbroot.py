@@ -75,9 +75,11 @@ def decompress_zstd(data: bytes) -> bytes:
         import zstandard  # type: ignore
         dctx = zstandard.ZstdDecompressor()
         log("[zstd] using python zstandard")
-        return dctx.decompress(data)
-    except Exception:
-        pass
+        # stream_reader().read() works even when the frame has NO embedded
+        # content size (ZstdDecompressor.decompress() raises in that case).
+        return dctx.stream_reader(io.BytesIO(data)).read()
+    except Exception as e:
+        log("[zstd] python zstandard unavailable/failed: %s" % e)
     import shutil
     import subprocess
     exe = shutil.which("zstd") or shutil.which("unzstd")
