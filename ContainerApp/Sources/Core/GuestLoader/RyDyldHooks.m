@@ -11,8 +11,17 @@
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
-#import <Security/SecTask.h>
 #import <objc/runtime.h>
+
+// SecTaskRef is NOT exposed by the iOS SDK headers we import (SecTask.h is
+// macOS-only, and Security.h does not forward-declare it for iOS). We only ever
+// pass a SecTaskRef pointer THROUGH to the real SecTask APIs, which we resolve
+// via dlsym() at runtime — so an opaque forward declaration is all the compiler
+// needs. Declaring it here avoids the "unknown type name 'SecTaskRef'" error
+// that a bare <Security/SecTask.h> import hits on iOS.
+#ifndef __SecTask_h
+typedef struct __SecTask *SecTaskRef;
+#endif
 
 // ---- shims needed to flip the guest Mach-O header filetype ----
 // TPRO write-enable shims are implemented in litehook.c (same target); declared
