@@ -20,7 +20,37 @@ final class SpringBoardController: ObservableObject {
     /// "注销资源库" — rescan /Library/Themes and drop the image caches.
     static let reloadLibraryNotification = Notification.Name("rybox.reloadLibrary")
 
-    private init() {}
+    /// Gesture-driven shell panels (Control Center / App Switcher / Notification
+    /// Center). Driven by local @State in SpringBoardView, but the names are
+    /// declared here so any subsystem (e.g. a hardware-button shim) can trigger
+    /// them too.
+    static let appSwitcherNotification = Notification.Name("rybox.appSwitcher")
+    static let controlCenterNotification = Notification.Name("rybox.controlCenter")
+    static let notificationCenterNotification = Notification.Name("rybox.notificationCenter")
+
+    /// Most-recently-opened desktop item ids (front = newest). Backs the App
+    /// Switcher and survives relaunch so the recents deck is stable.
+    @Published private(set) var recents: [String] = []
+    private let recentsKey = "rybox.recents"
+
+    private init() {
+        recents = UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
+    }
+
+    /// Record an app open at the front of the recents deck (dedup + cap).
+    func recordOpen(_ id: String) {
+        var next = recents.filter { $0 != id }
+        next.insert(id, at: 0)
+        if next.count > 16 { next = Array(next.prefix(16)) }
+        recents = next
+        UserDefaults.standard.set(recents, forKey: recentsKey)
+    }
+
+    /// Drop an item from the recents deck (App Switcher "swipe up to quit").
+    func removeRecent(_ id: String) {
+        recents.removeAll { $0 == id }
+        UserDefaults.standard.set(recents, forKey: recentsKey)
+    }
 
     /// Return to the SpringBoard. Container process is never terminated.
     func goHome() {
