@@ -24,7 +24,7 @@ struct AppSwitcherView: View {
     }
 
     private let cardW: CGFloat = min(UIScreen.main.bounds.width, 720) * 0.62
-    private let cardH: CGFloat = cardW * 1.32
+    private var cardH: CGFloat { cardW * 1.32 }
 
     var body: some View {
         ZStack {
