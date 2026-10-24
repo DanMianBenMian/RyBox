@@ -64,10 +64,18 @@ jobs:
         run: |
           set -eo pipefail
           APP="${{ steps.locate.outputs.app_path }}"
-          # Preinstalled IPAs (real Sileo) ride inside the app bundle. Must be
-          # staged BEFORE codesign, or the added files invalidate the seal.
+          # Preinstalled assets ride inside the app bundle. Must be staged BEFORE
+          # codesign, or the added files invalidate the seal.
           mkdir -p "$APP/Preinstalled"
           cp preinstalled/Sileo.ipa "$APP/Preinstalled/Sileo.ipa"
+          # The minimal jbroot (dpkg/apt + /usr /var) is OPTIONAL and large, so
+          # only stage it when present — a missing file must NOT fail the build.
+          if [ -f preinstalled/ProcursusBootstrap.zip ]; then
+            cp preinstalled/ProcursusBootstrap.zip "$APP/Preinstalled/ProcursusBootstrap.zip"
+            echo "staged ProcursusBootstrap.zip"
+          else
+            echo "ProcursusBootstrap.zip not found — skipping (Sileo still installs)"
+          fi
           echo "staged preinstalled:"
           ls -la "$APP/Preinstalled"
 
