@@ -13,11 +13,31 @@ extern "C" {
 /// CommonCrypto (no OpenSSL / third-party deps) so it compiles cleanly for iOS.
 ///
 /// Returns 0 on success, non-zero on failure.
+///
+/// ⚠️ This entry goes through `SecPKCS12Import`, which cannot read a p12 written
+/// by OpenSSL 3.x (PBES2 / AES-256-CBC / PBKDF2) — it returns 3 for those.
+/// Prefer `rysign_sign_bundle_with_der` below.
 int rysign_sign_bundle(const char *bundlePath,
                        const char *p12Path,
                        const char *password,
                        const char *provPath,
                        const char *entitlementsPath);
+
+/// Re-sign a bundle from ALREADY-DECODED identity material: a DER certificate
+/// and a DER private key (PKCS#1 `RSAPrivateKey` for RSA, SEC1 `ECPrivateKey`
+/// for EC — the inner key, not the PKCS#8 wrapper).
+///
+/// RyBox decodes the p12 itself (`RyP12`) precisely because Apple's importer
+/// rejects modern p12 files, so this is the normal path. `keyIsEC` selects the
+/// key type; the CMS builder assumes RSA.
+///
+/// Returns 0 on success, non-zero on failure.
+int rysign_sign_bundle_with_der(const char *bundlePath,
+                                const char *certDerPath,
+                                const char *keyDerPath,
+                                int keyIsEC,
+                                const char *provPath,
+                                const char *entitlementsPath);
 
 #ifdef __cplusplus
 }
