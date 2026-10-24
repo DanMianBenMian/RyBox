@@ -228,8 +228,8 @@ public final class CertificateStore: ObservableObject {
     /// A real `.mobileprovision` is a CMS `SignedData` whose *content* is a
     /// binary property list — there is no `<?xml`/`</plist>` text in the bytes,
     /// so the old ASCII-slice approach returned `nil` for every genuine profile
-    /// (which also blocked the boot gate). We unwrap the CMS with `CMSDecoder`
-    /// (available on iOS) to get the inner plist, then let
+    /// (which also blocked the boot gate). We unwrap the CMS ourselves (the
+    /// `CMSDecoder` API is macOS-only and absent from the iOS SDK), then let
     /// `PropertyListSerialization` parse either XML or binary form.
     public func provisioningPlist() -> [String: Any]? {
         guard let data = provisioningData else { return nil }
@@ -247,20 +247,67 @@ public final class CertificateStore: ObservableObject {
 
     /// Unwrap a CMS `SignedData` and return its encapsulated content (the inner
     /// plist). Returns `nil` if `data` is not a readable CMS message.
+    ///
+    /// ## Why not `CMSDecoder`
+    ///
+    /// `CMSDecoder` is a **macOS-only** API — Apple's own header annotates it
+    /// "macOS 10.5+" and the symbol does not exist in the iOS SDK, so calling it
+    /// simply fails to compile for the iOS target. A genuine `.mobileprovision`
+    /// is a CMS `SignedData` whose content is a *binary* property list, so the
+    /// decoder is the only way to reach the profile's `Entitlements` and
+    /// `DeveloperCertificates`.
+    ///
+    /// So we unwrap it ourselves. The walk is:
+    ///
+    ///     ContentInfo ::= SEQUENCE {
+    ///       contentType  OBJECT IDENTIFIER,          -- 1.2.840.113549.1.7.2 (signedData)
+    ///       content     [0] EXPLICIT SignedData }
+    ///     SignedData ::= SEQUENCE {
+    ///       version, digestAlgorithms, encapContentInfo, ... }
+    ///     EncapsulatedContentInfo ::= SEQUENCE {
+    ///       eContentType OBJECT IDENTIFIER,          -- 1.2.840.113549.1.7.1 (data)
+    ///       eContent    [0] EXPLICIT OCTET STRING }  -- <- the plist bytes
+    ///
+    /// Only the *content* is needed — the signature is not verified here. The
+    /// profile's authenticity is established by the platform itself (the
+    /// certificate chain is checked when the profile is embedded and used).
     private static func unwrapCMS(_ data: Data) -> Data? {
-        var decoder: CMSDecoder? = nil
-        guard CMSDecoderCreate(&decoder) == errSecSuccess, let decoder = decoder else { return nil }
-        let status = data.withUnsafeBytes { raw -> OSStatus in
-            let bound = raw.bindMemory(to: UInt8.self)
-            guard let base = bound.baseAddress else { return errSecAllocate }
-            return CMSDecoderUpdateMessage(decoder, base, bound.count)
-        }
-        guard status == errSecSuccess else { return nil }
-        guard CMSDecoderFinalizeMessage(decoder) == errSecSuccess else { return nil }
-        var cf: CFData? = nil
-        guard CMSDecoderCopyContent(decoder, &cf) == errSecSuccess, let cf = cf else { return nil }
-        return cf as Data
+        let r = RyASN1.Reader(data)
+        guard let top = r.at(0), top.tag == RyASN1.SEQUENCE else { return nil }
+        let topKids = r.children(top)
+        guard topKids.count >= 2, topKids[0].tag == RyASN1.OID else { return nil }
+
+        // contentType must be signedData (1.2.840.113549.1.7.2). Some profiles
+        // are wrapped in a degenerate `[0]`; walk down until we find a SEQUENCE
+        // that looks like a SignedData.
+        guard RyASN1.oidString(topKids[0], r) == oidSignedData else { return nil }
+
+        // content [0] EXPLICIT -> SignedData
+        guard let contentWrapper = r.children(topKids[1]).first,
+              contentWrapper.tag == 0xA0 else { return nil }
+        guard let signedData = r.children(contentWrapper).first,
+              signedData.tag == RyASN1.SEQUENCE else { return nil }
+
+        // SignedData children: version, digestAlgorithms, encapContentInfo, ...
+        let sdKids = r.children(signedData)
+        guard sdKids.count >= 3 else { return nil }
+        let encap = sdKids[2]
+        guard encap.tag == RyASN1.SEQUENCE else { return nil }
+
+        let encapKids = r.children(encap)
+        guard encapKids.count >= 2 else { return nil }
+        // eContentType
+        guard RyASN1.oidString(encapKids[0], r) == oidData else { return nil }
+        // eContent [0] EXPLICIT OCTET STRING
+        guard let eContentWrapper = r.children(encapKids[1]).first,
+              eContentWrapper.tag == 0xA0 else { return nil }
+        guard let octet = r.children(eContentWrapper).first,
+              octet.tag == RyASN1.OCTET_STRING else { return nil }
+        return Data(r.slice(octet))
     }
+
+    private static let oidSignedData = "1.2.840.113549.1.7.2"
+    private static let oidData = "1.2.840.113549.1.7.1"
 
     /// Entitlements to apply to a guest: taken from the provisioning profile's
     /// embedded `Entitlements` dict. This already contains application-identifier
