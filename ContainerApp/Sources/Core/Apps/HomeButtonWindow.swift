@@ -74,7 +74,7 @@ final class GuestChromeWindow {
         // else falls through to the guest window beneath.
         win.makeKeyAndVisible()
         self.window = win
-        RyLog.shared.log("guest chrome (主屏 button) installed", .info, "ui")
+        RyLog.shared.log("guest chrome (主屏 button) installed", level: .info, tag: "ui")
     }
 
     func teardown() {
