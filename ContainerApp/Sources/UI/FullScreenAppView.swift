@@ -38,6 +38,7 @@ struct FullScreenAppView: View {
             case .files: FilesystemView()
             case .terminal: TerminalView()
             case .import: ImportView()
+            case .logs: LogConsoleView()
             }
         case .guest(let app):
             GuestLaunchView(app: app)
