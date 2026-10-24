@@ -40,7 +40,7 @@ enum GuestEnvironment {
                 }
                 env["RYBOX_ENTITLEMENTS_KEYS"] = simulated.keys.sorted().joined(separator: ",")
                 RyLog.shared.log("微内核放行 \(app.bundleIdentifier) 的 entitlements：\(simulated.keys.sorted().joined(separator: ", "))",
-                                 .info, "kernel")
+                                 level: .info, tag: "kernel")
             }
         }
         return env
