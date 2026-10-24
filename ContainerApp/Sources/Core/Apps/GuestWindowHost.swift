@@ -32,7 +32,7 @@ final class GuestWindowHost {
     /// Called from the dyld hook: the guest UIWindow is already key+visible.
     /// Hide the container window and show the floating Home-key chrome.
     @objc private func onGuestDidLaunch() {
-        RyLog.shared.log("guest launched — handing the screen over", .info, "ui")
+        RyLog.shared.log("guest launched — handing the screen over", level: .info, tag: "ui")
         RyBoxAppDelegate.containerWindow?.isHidden = true
         installGuestChrome()
     }
@@ -40,7 +40,7 @@ final class GuestWindowHost {
     /// The guest never produced a window. Restore the container so the user is
     /// NOT stranded on a black screen, and say what happened.
     @objc private func onGuestDidFail() {
-        RyLog.shared.log("guest failed to show any UI — restoring SpringBoard", .error, "ui")
+        RyLog.shared.log("guest failed to show any UI — restoring SpringBoard", level: .error, tag: "ui")
         restoreContainer()
         GuestChromeWindow.shared.teardown()
     }
@@ -80,7 +80,7 @@ final class GuestWindowHost {
         self.scaffoldWindow = win
         RyBoxAppDelegate.containerWindow?.isHidden = true
         installGuestChrome()
-        RyLog.shared.log("scaffold window shown for \(bundleURL.lastPathComponent)", .warn, "ui")
+        RyLog.shared.log("scaffold window shown for \(bundleURL.lastPathComponent)", level: .warn, tag: "ui")
     }
 
     /// Floating Home-key chrome shown while a guest owns the screen. The virtual
@@ -128,6 +128,6 @@ final class GuestWindowHost {
         }
         // Drop the hook's strong references so the guest's UI objects die.
         RyReleaseGuestReferences()
-        RyLog.shared.log("guest ejected, SpringBoard restored", .info, "ui")
+        RyLog.shared.log("guest ejected, SpringBoard restored", level: .info, tag: "ui")
     }
 }
