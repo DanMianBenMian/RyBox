@@ -68,6 +68,13 @@ public final class CodeSigner {
     public func sign(bundleAt path: String) -> Result<Void, SignError> {
         guard CertificateStore.shared.isConfigured else { return .failure(.notConfigured) }
 
+        // LiveContainer parity: the CodeDirectory identifier of every guest
+        // binary is the HOST app's bundle id, because that is the identity the
+        // provisioning profile authorises. (ZSign is called with
+        // `bundleId: NSBundle.mainBundle.bundleIdentifier` in LCUtils.m.)
+        let hostBundleID = Bundle.main.bundleIdentifier ?? ""
+        rysign_set_code_identity(hostBundleID)
+
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory
             .appendingPathComponent("rybox-sign-\(UUID().uuidString)")
@@ -136,7 +143,48 @@ public final class CodeSigner {
         if rc != 0 {
             return .failure(.signFailed(rc, signFailureReason(rc)))
         }
+        verifySignature(bundleAt: path, hostBundleID: hostBundleID)
         return .success(())
+    }
+
+    /// LiveContainer calls `checkCodeSignature()` after signing and refuses to
+    /// hand the app to dlopen when it fails. RyBox logs the same check: the
+    /// result is the only way to tell "the signer ran" from "the signer
+    /// produced something AMFI will accept", and a silent failure here is
+    /// indistinguishable from a black screen later.
+    private func verifySignature(bundleAt path: String, hostBundleID: String) {
+        let exe = URL(fileURLWithPath: path).appendingPathComponent(mainExecutableName(in: path))
+        var code: SecStaticCode?
+        // `SecCSFlags` is imported either as a UInt32 typealias or as an
+        // OptionSet depending on the SDK, so both values below are built from
+        // constants the SDK itself declares. `SecStaticCodeCreateWithPath` only
+        // honours kSecCSInternalInformation (which we do NOT want), so the
+        // check flag is harmless there and equivalent to "default".
+        let createFlags = kSecCSCheckAllArchitectures
+        guard SecStaticCodeCreateWithPath(exe as CFURL, createFlags, &code) == errSecSuccess,
+              let code = code else {
+            RyLog.shared.log("sign  签名后校验：无法读取已签名的主可执行文件", level: .warn, tag: "sign")
+            return
+        }
+        let status = SecStaticCodeCheckValidity(code, kSecCSCheckAllArchitectures, nil)
+        if status == errSecSuccess {
+            RyLog.shared.log("sign  签名后校验通过（标识符 \(hostBundleID)）", level: .info, tag: "sign")
+        } else {
+            RyLog.shared.log("sign  签名后校验未通过（OSStatus \(status)）——dlopen 时可能被 AMFI 拒绝",
+                             level: .warn, tag: "sign")
+        }
+    }
+
+    /// The guest's `CFBundleExecutable`, read straight out of its Info.plist.
+    private func mainExecutableName(in bundlePath: String) -> String {
+        let plist = URL(fileURLWithPath: bundlePath).appendingPathComponent("Info.plist")
+        guard let data = try? Data(contentsOf: plist),
+              let dict = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                    as? [String: Any],
+              let name = dict["CFBundleExecutable"] as? String, !name.isEmpty else {
+            return ""
+        }
+        return name
     }
 
     /// Turn a rysign exit code into something a human can act on. The old code
