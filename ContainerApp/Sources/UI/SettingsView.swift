@@ -13,7 +13,6 @@ struct SettingsView: View {
 
     @ObservedObject private var store = CertificateStore.shared
     @ObservedObject private var desktop = DesktopStore.shared
-    @ObservedObject private var firm = FirmwareImporter.shared
     @ObservedObject private var theme = ThemeEngine.shared
     @ObservedObject private var log = RyLog.shared
     @EnvironmentObject private var env: RuntimeEnvironment
@@ -21,7 +20,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             signingSection
-            firmwareSection
+            jbrootSection
             logSection
             desktopSection
             themeSection
@@ -93,83 +92,43 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: 系统固件（系统环境来源）
+    // MARK: 虚拟根（jbroot，自动解压）
 
-    private var firmwareSection: some View {
+    private var jbrootSection: some View {
         Section {
             HStack {
                 Text("状态")
                 Spacer()
-                Label(firm.phase.label,
-                      systemImage: firm.isSatisfied ? "checkmark.circle.fill"
-                                                    : "exclamationmark.circle")
-                    .foregroundStyle(firm.isSatisfied ? Color.green : Color.orange)
+                let done = JbRoot.shared.isBootstrapped
+                Label(done ? "已就绪" : "未解压",
+                      systemImage: done ? "checkmark.circle.fill" : "exclamationmark.circle")
+                    .foregroundStyle(done ? Color.green : Color.orange)
                     .font(.footnote)
             }
 
-            if let r = firm.report {
-                HStack {
-                    Text("来源")
-                    Spacer()
-                    Text(r.source).foregroundColor(.secondary).lineLimit(1)
-                }
-                if let v = r.version {
-                    HStack {
-                        Text("系统版本")
-                        Spacer()
-                        Text("\(v)\(r.build.map { " (\($0))" } ?? "")")
-                            .foregroundColor(.secondary)
-                    }
-                }
-                HStack {
-                    Text("已还原")
-                    Spacer()
-                    Text("\(r.installedFiles) 个文件 / \(Self.mb(r.installedBytes)) MB")
-                        .foregroundColor(.secondary)
-                }
-                ForEach(r.notes, id: \.self) { note in
-                    Text(note).font(.caption).foregroundColor(.secondary)
-                }
+            if let info = JbRoot.shared.statusLine {
+                Text(info)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            if firm.phase == .scanning || firm.phase == .extracting {
-                ProgressView(value: max(firm.progress, 0.05))
-                Text(firm.message).font(.caption).foregroundColor(.secondary)
-            } else if case .failed = firm.phase {
-                Text(firm.message).font(.caption).foregroundColor(.red)
-            }
-
-            Button {
-                pickFirmware()
-            } label: {
-                Label(firm.isSatisfied ? "重新导入固件" : "导入固件（.ryboxenv / .ipsw）",
-                      systemImage: "square.and.arrow.down.on.square")
+            if !JbRoot.shared.isBootstrapped {
+                Button {
+                    JbRoot.shared.bootstrap()
+                } label: {
+                    Label("立即解压 jbroot", systemImage: "arrow.down.circle")
+                }
             }
         } header: {
-            Text("系统固件")
+            Text("虚拟根（jbroot）")
         } footer: {
-            Text("固件不打包进 IPA（否则会变成数 GB）。.ryboxenv 是电脑上预处理好的系统环境包（已解密 AEA / DMG / APFS），导入即完整还原 /usr /System；直接导入 .ipsw 时 RyBox 就地读取其中未加密的 manifest、kernelcache 与 trustcache。")
+            Text("RyBox 不再从 IPSW / .ryboxenv 还原真实系统文件，而是启动后自动从一个内置的最小 Procursus bootstrap 解压出标准 jbroot（dpkg / apt / 标准 /usr /var 布局与包管理数据库）。若内置 bootstrap 缺失，这里会提示，Sileo 仍会安装但包管理工具不可用。")
         }
     }
 
     private static func mb(_ bytes: Int64) -> String {
         String(format: "%.1f", Double(bytes) / 1024 / 1024)
-    }
-
-    private func pickFirmware() {
-        // asCopy: TRUE — open-in-place (asCopy:false) never delivers the
-        // selection on iPadOS 27 beta, which is why firmware picking stalled.
-        DocPicker.present(asCopy: true) { result in
-            switch result {
-            case .success(let url):
-                // No extension gate — FirmwareImporter decides by content.
-                firm.message = "已选择：\(url.lastPathComponent)"
-                firm.ingest(url)
-            case .failure(let e):
-                firm.message = "选择失败：\(e.localizedDescription)"
-                firm.phase = .failed
-            }
-        }
     }
 
     // MARK: 日志与浮窗（实时诊断）
