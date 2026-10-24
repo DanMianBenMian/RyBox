@@ -37,6 +37,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <dirent.h>
 
 #include <CommonCrypto/CommonDigest.h>
@@ -65,6 +66,23 @@ static char *g_ident_override = NULL;
 /// covers a dozen different causes). Read via `rysign_last_subcode()`.
 static int g_sign_subcode = 0;
 int rysign_last_subcode(void) { return g_sign_subcode; }
+
+/// The exact Security-framework status of the last failed Sec* call. A device
+/// prints nothing but its own log line, so without this every key/algorithm
+/// problem collapsed into a bare "exit code 6" and took three build cycles to
+/// diagnose. Callers read it right after a failed sign and surface it.
+static int g_sign_osstatus = 0;
+int rysign_last_osstatus(void) { return g_sign_osstatus; }
+
+/// One-line human-readable version of the last failure (for the app log).
+static char g_sign_diag[512] = "";
+const char *rysign_last_diag(void) { return g_sign_diag; }
+
+static void rysign_set_diag(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(g_sign_diag, sizeof(g_sign_diag), fmt, ap);
+    va_end(ap);
+}
 
 /// The guest's Info.plist FILE BYTES (special slot -1). Swift can hand them
 /// over via `rysign_set_info_plist`; if it does not, the signer reads them from
@@ -375,40 +393,103 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         buf_free(&vals); buf_free(&attr);
     }
 
-    // Choose the signature algorithm by key type (LiveContainer parity):
-    // RSA identities sign with PKCS#1 v1.5 SHA-256; EC identities sign with
-    // ECDSA X9.62 SHA-256. Hard-coding RSA here makes build_cms() return -1
-    // for EC certs — a silent second source of the "main exe sign failed"
-    // rc=6 the user hit. Defaulting to RSA when attributes are unavailable
-    // keeps the common (Apple RSA dev/dist cert) path exactly as before.
-    SecKeyAlgorithm signAlgo = kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256;
+    // Choose the signature algorithm by key type: RSA identities sign with
+    // PKCS#1 v1.5 SHA-256, EC identities with ECDSA X9.62 SHA-256. Hard-coding
+    // either one fails loudly for the other.
+    //
+    // IMPORTANT (2026-10-25 device finding): the key's own attributes are not
+    // always authoritative on iOS 27+ — a SecKey round-tripped through
+    // SecKeyCopyExternalRepresentation can report a type that does not match
+    // the algorithm it can actually perform, and `SecKeyCreateSignature` then
+    // refuses with the SAME error for a development AND a distribution
+    // certificate (which is exactly what the user saw: both rejected). So we
+    // try the preferred algorithm first and then the ALTERNATE one before
+    // declaring failure. Signing with the wrong one fails harmlessly; signing
+    // with the right one is what makes the guest loadable.
+    // Try-list: for each key type there is a MESSAGE variant (framework hashes
+    // the payload for us) and a DIGEST variant (we hand it a raw SHA-256). The
+    // key's self-reported type is only a hint — on iOS 27 a key can end up
+    // mismatched, so all four are attempted and the one that works is recorded
+    // for the log. This is what turned "both certs are rejected, no idea why"
+    // into "here is the exact call that succeeded".
+    SecKeyAlgorithm msgA[2], digA[2];
+    const char *msgName[2], *digName[2];
+    bool preferEC = false;
     {
         CFDictionaryRef kattrs = SecKeyCopyAttributes(privKey);
         if (kattrs) {
             CFStringRef kt = (CFStringRef)CFDictionaryGetValue(kattrs, kSecAttrKeyType);
-            if (kt && CFEqual(kt, kSecAttrKeyTypeECSECPrimeRandom))
-                signAlgo = kSecKeyAlgorithmECDSASignatureMessageX962SHA256;
+            if (kt && CFEqual(kt, kSecAttrKeyTypeECSECPrimeRandom)) preferEC = true;
             CFRelease(kattrs);
         }
+    }
+    if (preferEC) {
+        msgA[0] = kSecKeyAlgorithmECDSASignatureMessageX962SHA256;
+        msgName[0] = "ecdsa-x9.62-sha256(message)";
+        digA[0] = kSecKeyAlgorithmECDSASignatureDigestX962SHA256;
+        digName[0] = "ecdsa-x9.62-sha256(digest)";
+        msgA[1] = kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256;
+        msgName[1] = "rsa-pkcs1v15-sha256(message)";
+        digA[1] = kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256;
+        digName[1] = "rsa-pkcs1v15-sha256(digest)";
+    } else {
+        msgA[0] = kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256;
+        msgName[0] = "rsa-pkcs1v15-sha256(message)";
+        digA[0] = kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256;
+        digName[0] = "rsa-pkcs1v15-sha256(digest)";
+        msgA[1] = kSecKeyAlgorithmECDSASignatureMessageX962SHA256;
+        msgName[1] = "ecdsa-x9.62-sha256(message)";
+        digA[1] = kSecKeyAlgorithmECDSASignatureDigestX962SHA256;
+        digName[1] = "ecdsa-x9.62-sha256(digest)";
     }
 
     // The signature is over the DER SET OF the attributes (CMS rule).
     Buf saSet; buf_init(&saSet); der_set(&saSet, &sa);
-    CFDataRef sigData = NULL;
-    OSStatus st = SecKeyCreateSignature(privKey, signAlgo,
-        CFDataCreate(NULL, saSet.p, (CFIndex)saSet.len), &sigData);
-    if (st != errSecSuccess) {
-        // The OSStatus is the ONLY clue the device gives us here: -25338
-        // (errSecUnsupportedAlgorithm?) style codes point at a key/algorithm
-        // mismatch, which is exactly the failure that used to surface as a
-        // bare "exit code 6".
-        fprintf(stderr, "rysign: SecKeyCreateSignature failed osstatus=%d algo=%s\n",
-                (int)st,
-                CFEqual(signAlgo, kSecKeyAlgorithmECDSASignatureMessageX962SHA256)
-                    ? "ecdsa-x9.62-sha256" : "rsa-pkcs1v15-sha256");
+    if (!saSet.p || saSet.len == 0) {
+        rysign_set_diag("CMS 待签数据为空（SET OF 未能构建）");
         buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
         return -1;
     }
+
+    CFDataRef sigData = NULL;
+    OSStatus st = errSecSuccess;
+    const char *usedName = NULL;
+    for (int attempt = 0; attempt < 4 && !sigData; attempt++) {
+        bool useDigest = (attempt % 2) == 1;
+        int idx = attempt / 2;
+        SecKeyAlgorithm algo = useDigest ? digA[idx] : msgA[idx];
+        CFDataRef payload;
+        if (useDigest) {
+            unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+            CC_SHA256(saSet.p, (CC_LONG)saSet.len, hash);
+            payload = CFDataCreate(NULL, hash, (CFIndex)sizeof(hash));
+        } else {
+            payload = CFDataCreate(NULL, saSet.p, (CFIndex)saSet.len);
+        }
+        OSStatus s = SecKeyCreateSignature(privKey, algo, payload, &sigData);
+        CFRelease(payload);
+        g_sign_osstatus = (int)s;
+        if (s == errSecSuccess && sigData) {
+            usedName = useDigest ? digName[idx] : msgName[idx];
+            break;
+        }
+        if (sigData) { CFRelease(sigData); sigData = NULL; }
+        st = s;
+    }
+    if (st != errSecSuccess && !sigData) st = (OSStatus)g_sign_osstatus;
+    if (!sigData) {
+        // The OSStatus is the ONLY clue the device gives us here: -25338
+        // (errSecUnsupportedAlgorithm?) style codes point at a key/algorithm
+        // mismatch, which is exactly the failure that used to surface as a
+        // bare "exit code 6". It now reaches the user through RyLog.
+        fprintf(stderr, "rysign: SecKeyCreateSignature failed osstatus=%d "
+                "(tried 4 algorithm variants)\n", (int)st);
+        rysign_set_diag("SecKeyCreateSignature 失败 osstatus=%d（已试 %s / %s / %s / %s）",
+                        (int)st, msgName[0], digName[0], msgName[1], digName[1]);
+        buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
+        return -1;
+    }
+    rysign_set_diag("CMS 签名方式：%s", usedName ? usedName : "?");
 
     // ---- SignerInfo (version 3) -------------------------------------------
     Buf si; buf_init(&si);
@@ -866,6 +947,192 @@ static int sign_bundle_core(const char *bundlePath,
 }
 
 // ---------------------------------------------------------------------------
+// Building a USABLE private key from raw DER bytes
+// ---------------------------------------------------------------------------
+// Everything that can disagree here, does:
+//   * the key type Swift inferred vs. what the bytes actually are,
+//   * raw PKCS#1/SEC1 vs. a PKCS#8 wrapper around the inner key,
+//   * "SecKeyCreateWithData succeeded" vs. "this key can actually sign".
+//
+// That last one is the trap that cost three build cycles on device: a key CAN
+// be created successfully and still refuse every signature, which surfaces as
+// CMS failure (sub-code -5) — identically for a development AND a distribution
+// certificate, which is exactly what the user saw. So every plausible
+// combination is tried against a signing CANARY, and only a key that really
+// signs its first payload is handed back.
+
+/// Parse the TLV header at `pos` expecting `tag`. Stores the content range and
+/// returns the offset just past this value, or 0 when it does not fit.
+static size_t tlv_read(const unsigned char *b, size_t len, size_t pos,
+                       unsigned char tag, size_t *cpos, size_t *clen) {
+    if (pos + 2 > len || b[pos] != tag) return 0;
+    size_t p = pos + 1;
+    size_t l = b[p];
+    if (l & 0x80) {
+        size_t nb = l & 0x7f;
+        if (nb == 0 || nb > 4 || p + 1 + nb > len) return 0;
+        l = 0; p += 1;
+        for (size_t i = 0; i < nb; i++) l = (l << 8) | b[p++];
+    } else {
+        p += 1;
+    }
+    if (p + l > len) return 0;
+    *cpos = p; *clen = l;
+    return p + l;
+}
+
+/// If `b` is a PKCS#8 PrivateKeyInfo, locate the inner key inside its OCTET
+/// STRING. Returns true and fills the inner range on success.
+static bool pkcs8_inner(const unsigned char *b, size_t len,
+                        size_t *cpos, size_t *clen) {
+    if (len < 8 || b[0] != 0x30) return false;
+    size_t cp = 0, cl = 0;
+    if (!tlv_read(b, len, 0, 0x30, &cp, &cl)) return false;   // PrivateKeyInfo
+    size_t q = cp, ep = 0, el = 0;
+    q = tlv_read(b, len, q, 0x02, &ep, &el);                  // version INTEGER
+    if (q == 0) return false;
+    q = tlv_read(b, len, q, 0x30, &ep, &el);                  // privateKeyAlgorithm
+    if (q == 0) return false;
+    q = tlv_read(b, len, q, 0x04, &ep, &el);                  // privateKey OCTET STRING
+    if (q == 0 || el == 0) return false;
+    *cpos = ep; *clen = el;
+    return true;
+}
+
+/// RSA modulus size straight out of the PKCS#1 INTEGER (n leads after version).
+static int rsa_modulus_bits(const unsigned char *d, size_t l) {
+    int bits = 0;
+    size_t cp = 0, cl = 0, q;
+    if (!tlv_read(d, l, 0, 0x30, &cp, &cl)) return 0;          // RSAPrivateKey
+    q = tlv_read(d, l, cp, 0x02, &cp, &cl);                    // version
+    if (!q) return 0;
+    q = tlv_read(d, l, q, 0x02, &cp, &cl);                     // modulus n
+    if (!q || cl == 0) return 0;
+    const unsigned char *m = d + cp; size_t n = cl;
+    while (n > 1 && m[0] == 0) { m++; n--; }                   // leading pad
+    bits = (int)(n * 8);
+    return bits;
+}
+
+static SecKeyRef try_create_key(const unsigned char *d, size_t l,
+                                CFStringRef type, int *out_os) {
+    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
+    CFDictionarySetValue(attrs, kSecAttrKeyType, type);
+    if (CFEqual(type, kSecAttrKeyTypeRSA)) {
+        int bits = rsa_modulus_bits(d, l);
+        if (bits > 0) {
+            CFNumberRef num = CFNumberCreate(NULL, kCFNumberIntType, &bits);
+            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, num);
+            if (num) CFRelease(num);
+        }
+    }
+    CFDataRef kd = CFDataCreate(NULL, d, (CFIndex)l);
+    CFErrorRef err = NULL;
+    SecKeyRef k = SecKeyCreateWithData(kd, attrs, &err);
+    CFRelease(kd); CFRelease(attrs);
+    if (err) CFRelease(err);
+    if (!k && out_os) *out_os = (int)-1;
+    return k;
+}
+
+/// Canary: a SecKey that cannot sign a four-byte payload will not sign a CMS
+/// structure either. Cheap (one SHA-256), so it runs for every candidate.
+static bool key_can_sign(SecKeyRef k, int *out_os) {
+    static const unsigned char msg[4] = { 0x01, 0x02, 0x03, 0x04 };
+    SecKeyAlgorithm algo = kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256;
+    CFDictionaryRef kat = SecKeyCopyAttributes(k);
+    if (kat) {
+        CFStringRef kt = (CFStringRef)CFDictionaryGetValue(kat, kSecAttrKeyType);
+        if (kt && CFEqual(kt, kSecAttrKeyTypeECSECPrimeRandom))
+            algo = kSecKeyAlgorithmECDSASignatureMessageX962SHA256;
+        CFRelease(kat);
+    }
+    CFDataRef d = CFDataCreate(NULL, msg, (CFIndex)sizeof(msg));
+    CFDataRef sig = NULL;
+    OSStatus s = SecKeyCreateSignature(k, algo, d, &sig);
+    CFRelease(d);
+    if (s == errSecSuccess && sig) { CFRelease(sig); return true; }
+    if (sig) CFRelease(sig);
+    if (out_os) *out_os = (int)s;
+    return false;
+}
+
+/// Try every plausible reading of the key bytes and return one that WORKS.
+static SecKeyRef create_signing_key(const unsigned char *kd, size_t klen,
+                                    bool preferEC, int *out_os) {
+    const unsigned char *cands[2]; size_t clens[2]; int nc = 1;
+    cands[0] = kd; clens[0] = klen;
+    size_t ip = 0, il = 0;
+    if (pkcs8_inner(kd, klen, &ip, &il) && il > 0 && il < klen) {
+        cands[1] = kd + ip; clens[1] = il; nc = 2;
+    }
+    CFStringRef pref = preferEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA;
+    CFStringRef alt  = preferEC ? kSecAttrKeyTypeRSA : kSecAttrKeyTypeECSECPrimeRandom;
+    CFStringRef types[2] = { pref, alt };
+
+    SecKeyRef result = NULL;
+    for (int c = 0; c < nc && !result; c++) {
+        for (int t = 0; t < 2 && !result; t++) {
+            SecKeyRef k = try_create_key(cands[c], clens[c], types[t], out_os);
+            if (!k) continue;
+            if (key_can_sign(k, out_os)) {
+                result = k;
+                if (c > 0 || t > 0)
+                    fprintf(stderr, "rysign: usable key found via candidate %d type %d\n", c, t);
+            } else {
+                CFRelease(k);
+            }
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Shared tail of the two material entries (DER key, live SecKey):
+// install the trust chain, load the entitlements plist, run the core signer.
+// ---------------------------------------------------------------------------
+static int sign_bundle_tail(const char *bundlePath,
+                            SecCertificateRef leaf, SecKeyRef privKey,
+                            const char *team, const char *entitlementsPath,
+                            const char *certsDir, const char *provPath) {
+    unsigned char **extra = NULL; size_t *extra_lens = NULL; int extra_n = 0;
+    if (certsDir) {
+        DIR *d = opendir(certsDir);
+        if (d) {
+            char **names = NULL; int nn = 0; struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                size_t l = strlen(de->d_name);
+                if (l < 4 || strcmp(de->d_name + l - 4, ".der") != 0) continue;
+                names = realloc(names, sizeof(char *) * (nn + 1));
+                names[nn++] = strdup(de->d_name);
+            }
+            closedir(d);
+            for (int i = 1; i < nn; i++)
+                for (int j = i; j > 0 && strcmp(names[j-1], names[j]) > 0; j--) {
+                    char *t = names[j-1]; names[j-1] = names[j]; names[j] = t;
+                }
+            if (nn) { extra = malloc(sizeof(void *) * nn); extra_lens = malloc(sizeof(size_t) * nn); }
+            for (int i = 0; i < nn; i++) {
+                char p[2048]; snprintf(p, sizeof(p), "%s/%s", certsDir, names[i]);
+                size_t l = 0; unsigned char *b = read_file(p, &l);
+                extra[i] = b; extra_lens[i] = l; free(names[i]);
+                extra_n++;
+            }
+            if (names) free(names);
+        }
+    }
+    rysign_set_extra_certs(extra, extra_lens, extra_n);
+
+    unsigned char *ent = NULL; size_t ent_len = 0;
+    if (entitlementsPath && access(entitlementsPath, F_OK) == 0)
+        ent = read_file(entitlementsPath, &ent_len);
+
+    return sign_bundle_core(bundlePath, leaf, privKey, team, ent, ent_len, provPath);
+}
+
+// ---------------------------------------------------------------------------
 // Robust bundle signing: all material pre-decoded by Swift
 // ---------------------------------------------------------------------------
 // Exit codes mirror sign_bundle_core: 4 prov · 5 no exe · 6 sign failed
@@ -893,77 +1160,78 @@ int rysign_sign_bundle_robust(const char *bundlePath,
         CFRelease(certData); free(cd); free(kd);
         return 7;
     }
-    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-    CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
-    CFDictionarySetValue(attrs, kSecAttrKeyType,
-                         keyIsEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA);
-    if (!keyIsEC) {
-        int bits = 0;
-        Cur c; c.p = kd; c.len = klen; c.pos = 0;
-        unsigned char tag; const unsigned char *content; size_t clen2;
-        if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x30) { }
-        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
-        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
-        else {
-            const unsigned char *m = content; size_t n = clen2;
-            while (n > 1 && m[0] == 0) { m++; n--; }
-            bits = (int)(n * 8);
-        }
-        if (bits > 0) {
-            int bitsRef = bits;
-            CFNumberRef num = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
-            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, num);
-            if (num) CFRelease(num);
-        }
-    }
-    CFErrorRef keyErr = NULL;
-    CFDataRef keyData = CFDataCreate(NULL, kd, (CFIndex)klen);
-    SecKeyRef privKey = SecKeyCreateWithData(keyData, attrs, &keyErr);
-    CFRelease(keyData); CFRelease(attrs);
+    // Recover a key that actually works: raw/PKCS#8 × RSA/EC, each validated by
+    // a signing canary (see create_signing_key). Previously this built ONE key
+    // from ONE guess and trusted it, which is how a well-formed identity still
+    // ended up unable to sign anything.
+    g_sign_osstatus = 0;
+    SecKeyRef privKey = create_signing_key(kd, klen, keyIsEC ? true : false,
+                                           &g_sign_osstatus);
     if (!privKey) {
-        fprintf(stderr, "rysign: SecKeyCreateWithData failed\n");
-        if (keyErr) CFRelease(keyErr);
+        fprintf(stderr, "rysign: no usable private key from key DER\n");
+        if (!g_sign_diag[0])
+            rysign_set_diag("没有任何一把可用私钥（raw/PKCS#8 × RSA/EC 四种组合都试过，最后 osstatus=%d）",
+                            g_sign_osstatus);
         CFRelease(certData); CFRelease(leaf); free(cd); free(kd);
         return 8;
     }
 
-    unsigned char **extra = NULL; size_t *extra_lens = NULL; int extra_n = 0;
-    if (certsDir) {
-        DIR *d = opendir(certsDir);
-        if (d) {
-            char **names = NULL; int nn = 0; struct dirent *de;
-            while ((de = readdir(d)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                size_t l = strlen(de->d_name);
-                if (l < 4 || strcmp(de->d_name + l - 4, ".der") != 0) continue;
-                names = realloc(names, sizeof(char *) * (nn + 1));
-                names[nn++] = strdup(de->d_name);
-            }
-            closedir(d);
-            for (int i = 1; i < nn; i++)
-                for (int j = i; j > 0 && strcmp(names[j-1], names[j]) > 0; j--) {
-                    char *t = names[j-1]; names[j-1] = names[j]; names[j] = t;
-                }
-            if (nn) { extra = malloc(sizeof(void *) * nn); extra_lens = malloc(sizeof(size_t) * nn); }
-            for (int i = 0; i < nn; i++) {
-                char p[2048]; snprintf(p, sizeof(p), "%s/%s", certsDir, names[i]);
-                size_t l = 0; unsigned char *b = read_file(p, &l);
-                extra[i] = b; extra_lens[i] = l; free(names[i]);
-            }
-            if (names) free(names);
-        }
-    }
-    rysign_set_extra_certs(extra, extra_lens, extra_n);
-
-    unsigned char *ent = NULL; size_t ent_len = 0;
-    if (entitlementsPath && access(entitlementsPath, F_OK) == 0)
-        ent = read_file(entitlementsPath, &ent_len);
-
-    int rc = sign_bundle_core(bundlePath, leaf, privKey, team, ent, ent_len, provPath);
+    int rc = sign_bundle_tail(bundlePath, leaf, privKey, team,
+                              entitlementsPath, certsDir, provPath);
 
     if (leaf) CFRelease(leaf);
     if (privKey) CFRelease(privKey);
     CFRelease(certData); free(cd); free(kd);
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Sign with a SecKey ALREADY held by the caller (the preferred path)
+// ---------------------------------------------------------------------------
+// Everything above rebuilds the private key from raw DER bytes with
+// `SecKeyCreateWithData`. That round-trip is the weakest link in the chain: the
+// reconstructed SecKey can come back with attributes that do not match what the
+// original key can perform, and `SecKeyCreateSignature` then refuses — with the
+// SAME error for a development AND a distribution certificate, which is exactly
+// the symptom the user reported from the device.
+//
+// When RyBox already holds a real SecIdentity it therefore hands the SecKey
+// itself down here and skips the reconstruction entirely.
+int rysign_sign_bundle_with_key(const char *bundlePath,
+                                SecKeyRef privKey,
+                                const char *leafCertDerPath,
+                                const char *provPath,
+                                const char *entitlementsPath,
+                                const char *team,
+                                const char *certsDir) {
+    g_sign_subcode = 0;
+    g_sign_osstatus = 0;
+    g_sign_diag[0] = '\0';
+    if (!privKey) {
+        rysign_set_diag("私钥为空（SecIdentityCopyPrivateKey 没给出密钥）");
+        return 8;
+    }
+    size_t clen = 0;
+    unsigned char *cd = read_file(leafCertDerPath, &clen);
+    if (!cd || clen == 0) {
+        if (cd) free(cd);
+        rysign_set_diag("读不到叶子证书 DER（%s）", leafCertDerPath);
+        return 7;
+    }
+    CFDataRef certData = CFDataCreate(NULL, cd, (CFIndex)clen);
+    SecCertificateRef leaf = SecCertificateCreateWithData(NULL, certData);
+    if (!leaf) {
+        CFRelease(certData); free(cd);
+        rysign_set_diag("SecCertificateCreateWithData 失败（叶子证书 DER 无法解析）");
+        return 7;
+    }
+
+    CFRetain(privKey);
+    int rc = sign_bundle_tail(bundlePath, leaf, privKey, team,
+                              entitlementsPath, certsDir, provPath);
+    CFRelease(privKey);
+
+    CFRelease(leaf); CFRelease(certData); free(cd);
     return rc;
 }
 
@@ -1033,36 +1301,18 @@ int rysign_sign_bundle_with_der(const char *bundlePath,
         CFRelease(certData); free(cd); free(kd);
         return 7;
     }
-    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-    CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
-    CFDictionarySetValue(attrs, kSecAttrKeyType,
-                         keyIsEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA);
-    if (!keyIsEC) {
-        int bits = 0;
-        Cur c; c.p = kd; c.len = klen; c.pos = 0;
-        unsigned char tag; const unsigned char *content; size_t clen2;
-        if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x30) { }
-        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
-        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
-        else {
-            const unsigned char *m = content; size_t n = clen2;
-            while (n > 1 && m[0] == 0) { m++; n--; }
-            bits = (int)(n * 8);
-        }
-        if (bits > 0) {
-            int bitsRef = bits;
-            CFNumberRef num = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
-            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, num);
-            if (num) CFRelease(num);
-        }
-    }
-    CFErrorRef keyErr = NULL;
-    CFDataRef keyData = CFDataCreate(NULL, kd, (CFIndex)klen);
-    SecKeyRef privKey = SecKeyCreateWithData(keyData, attrs, &keyErr);
-    CFRelease(keyData); CFRelease(attrs);
+    // Recover a key that actually works: raw/PKCS#8 × RSA/EC, each validated by
+    // a signing canary (see create_signing_key). Previously this built ONE key
+    // from ONE guess and trusted it, which is how a well-formed identity still
+    // ended up unable to sign anything.
+    g_sign_osstatus = 0;
+    SecKeyRef privKey = create_signing_key(kd, klen, keyIsEC ? true : false,
+                                           &g_sign_osstatus);
     if (!privKey) {
-        fprintf(stderr, "rysign: SecKeyCreateWithData failed\n");
-        if (keyErr) CFRelease(keyErr);
+        fprintf(stderr, "rysign: no usable private key from key DER\n");
+        if (!g_sign_diag[0])
+            rysign_set_diag("没有任何一把可用私钥（raw/PKCS#8 × RSA/EC 四种组合都试过，最后 osstatus=%d）",
+                            g_sign_osstatus);
         CFRelease(certData); CFRelease(leaf); free(cd); free(kd);
         return 8;
     }
