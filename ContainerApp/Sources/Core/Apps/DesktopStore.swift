@@ -380,6 +380,7 @@ final class DesktopStore: ObservableObject {
             removeFromDock(m)
             slots.removeValue(forKey: m)
         }
+        reflow()
         return folder
     }
 
@@ -391,6 +392,7 @@ final class DesktopStore: ObservableObject {
         folders = folders.map { $0.id == folderID ? f : $0 }
         removeFromDock(itemID)
         slots.removeValue(forKey: itemID)
+        reflow()
     }
 
     /// Remove an item from its folder (it flows back to the desktop).
@@ -402,6 +404,7 @@ final class DesktopStore: ObservableObject {
             return nf
         }
         slots.removeValue(forKey: itemID)
+        reflow()
     }
 
     func renameFolder(_ folderID: String, to name: String) {
@@ -415,6 +418,19 @@ final class DesktopStore: ObservableObject {
         guard let f = folders.first(where: { $0.id == folderID }) else { return }
         for m in f.memberIDs { slots.removeValue(forKey: m) }
         folders.removeAll { $0.id == folderID }
+        reflow()
+    }
+
+    /// Re-assign slots to any unplaced item, drop stale slots, and force a
+    /// re-render. `items(onPage:)` only renders items that HAVE a slot, so any
+    /// mutation that introduces a new desktop item (a folder) or frees one back
+    /// to the grid (leaving/dissolving a folder) must re-place — otherwise the
+    /// change stays invisible until the next respring. This is the fix for
+    /// "建立文件夹 / 从文件夹移除 App 必须注销 SpringBoard 才显示".
+    private func reflow() {
+        ensurePlaced(isIPad: UIDevice.current.userInterfaceIdiom == .pad)
+        pruneSlots()
+        objectWillChange.send()
     }
 
     // MARK: Grid layout
@@ -492,6 +508,7 @@ final class DesktopStore: ObservableObject {
         dockIDs = BuiltinApp.allCases.map(\.id)
         iconScale = 1.0
         badges = [:]
+        reflow()
     }
 
     // MARK: App Library
