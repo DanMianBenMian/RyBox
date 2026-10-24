@@ -533,10 +533,10 @@ struct SpringBoardView: View {
             )
         }
         // Tapping EMPTY SPACE exits edit mode (jiggle). Entering edit mode is
-        // done by long-pressing an icon and dragging it (iOS-like) — see
-        // `iconGesture` / `iconDragGesture`. The old "long-press empty space →
-        // edit" gesture fought the per-icon long-press menu (both fired on the
-        // same touch) and is removed.
+        // done from the icon's own long-press menu — see
+        // `iconLongPressGesture` / `iconDragGesture`. The old "long-press empty
+        // space → edit" gesture fought the per-icon long-press menu (both
+        // fired on the same touch) and is removed.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
         .onTapGesture {
@@ -604,102 +604,90 @@ struct SpringBoardView: View {
         .zIndex(isDragging ? 20 : 0)
         .contentShape(Rectangle())
         .onTapGesture { if !store.editMode { open(item) } }
-        // ONE gesture on the cell. The old stack was four competing systems —
-        // `.onTapGesture` + `.contextMenu` + a sequenced long-press/drag + a
-        // second, independent drag gesture — which is exactly why taps were
-        // unreliable ("应用概率点不动") and why a plain long press sometimes
-        // entered edit mode instead of opening the menu.
+        // ONE gesture system per cell, split by MODE (not by ternary on the
+        // gesture value type — `AnyGesture(iconDragGesture(...))` vs
+        // `AnyGesture(iconGesture(...))` produced two different `Value` types
+        // and the ternary could not be resolved, which is why this file did not
+        // compile for iOS at all).
         //
-        // Behaviour now, mirroring iOS:
-        //   * tap                            → open
-        //   * long press, no drag            → icon menu (drawn by RyBox)
-        //   * long press, then drag ≥ 16 pt  → edit mode + move the icon
-        // When NOT in edit mode: long-press → menu, long-press + drag → enter
-        // edit mode and move the icon (iOS-like). When IN edit mode: drag starts
-        // immediately (no long-press needed) so rearranging feels right — the old
-        // code forced a 0.3 s long press before every drag, which is why
-        // "编辑模式图标拖动失效".
-        .simultaneousGesture(
-            store.editMode
-                ? AnyGesture(iconDragGesture(item: item, slot: slot))
-                : AnyGesture(iconGesture(item: item, slot: slot))
-        )
+        // Behaviour, per the user's explicit request:
+        //   * NOT in edit mode:
+        //       - tap                     → open the app
+        //       - long press (no drag)   → icon menu
+        //       - drag                    → NOTHING (the old "long-press then
+        //         drag enters edit mode" gesture was removed on purpose: it
+        //         fought with the long-press menu and made both unreliable)
+        //   * IN edit mode:
+        //       - drag (≥ 4 pt)          → move the icon, immediately
+        //       - long press              → icon menu
+        //
+        // Both branches are attached simultaneously; each one checks
+        // `store.editMode` itself before acting, so exactly one of them can
+        // ever do something.
+        .simultaneousGesture(iconDragGesture(item: item, slot: slot))
+        .simultaneousGesture(iconLongPressGesture(item: item, slot: slot))
     }
 
-    /// The single gesture attached to an icon cell.
+    /// The LONG-PRESS gesture attached to an icon cell.
     ///
-    /// A `LongPressGesture` sequenced with a `DragGesture`:
-    ///   * the long press must hold 0.3 s before anything else happens,
-    ///   * lifting the finger at that point opens the icon menu,
-    ///   * only a subsequent movement of ≥ 16 pt starts a drag (and turns edit
-    ///     mode on).
+    /// A plain `LongPressGesture` with **no drag phase at all**. The old
+    /// implementation sequenced it with a `DragGesture`, and that single
+    /// decision is what broke both features at once:
     ///
-    /// The 16 pt threshold matters. `DragGesture` inside a sequenced pair
-    /// measures its translation from the START of the touch, so by the time the
-    /// long press fires the accumulated movement is whatever the finger drifted
-    /// while holding. At 6 pt that drift alone was enough to start a drag —
-    /// a resting hand moves 2–5 pt — which is why long-pressing an icon went
-    /// straight to edit mode. 16 pt is beyond resting drift but still a
-    /// comfortable deliberate drag.
-    private func iconGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.3)
-            .sequenced(before: DragGesture(minimumDistance: 16))
+    ///   * the sequenced pair's `.second(true, drag?)` branch turned a long
+    ///     press + movement into "enter edit mode", so a plain long press
+    ///     often never reached the menu ("长按菜单依旧未生效"), and
+    ///   * the same pair was ALSO what carried the edit-mode drag, so removing
+    ///     the "drag into edit mode" behaviour left no drag path at all
+    ///     ("编辑模式图标拖动失效").
+    ///
+    /// Splitting them into two independent gestures removes the conflict:
+    /// this one only ever opens the menu, `iconDragGesture` only ever drags.
+    ///
+    /// `LongPressGesture.Value` is `Bool`, so `onEnded` fires exactly once
+    /// with `true` when the press was held long enough — that is the menu
+    /// trigger. A failed long press (finger lifted early) ends the gesture
+    /// with `false` and nothing happens.
+    private func iconLongPressGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.35)
             .onChanged { value in
-                switch value {
-                case .first(true):
-                    // The long press has fired — the finger is on an icon, so the
-                    // pager must not page.
-                    isIconPressing = true
-                    longPressFired = true
-                case .second(true, let drag?):
-                    // The long press already happened and a real drag started.
-                    // NOTE the `drag?` — a sequenced gesture's `.second` case
-                    // carries an OPTIONAL drag value (`Value2?`), so it must be
-                    // unwrapped before `.translation` can be read.
-                    longPressFired = false
-                    if !store.editMode {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                            store.editMode = true
-                        }
-                    }
-                    guard store.editMode else { return }
-                    draggingID = item.id
-                    dragTranslation = drag.translation
-                    updateTarget(for: item, slot: slot, translation: drag.translation)
-                default:
-                    break
-                }
+                // While the finger is down on an icon the pager must not page,
+                // otherwise the page slides out from under the finger.
+                if value { isIconPressing = true }
             }
-            .onEnded { _ in
+            .onEnded { value in
                 isIconPressing = false
-                if longPressFired {
-                    // Long press held, no drag followed → the menu.
-                    longPressFired = false
-                    showMenu(for: item, slot: slot)
-                } else {
-                    finishDrag(item: item, slot: slot)
-                }
+                guard value else { return }
+                // A drag that is already running owns the interaction — do not
+                // pop the menu on top of a live drag.
+                guard draggingID == nil else { return }
+                showMenu(for: item, slot: slot)
             }
     }
 
-    /// The drag gesture used while already in edit mode.
+    /// The drag gesture used to move an icon.
     ///
-    /// In edit mode the icon should follow the finger *immediately* (minimum
-    /// distance only 4 pt, so a deliberate touch-move starts the drag without
-    /// the 0.3 s long press the non-edit `iconGesture` requires). This is the
-    /// fix for "编辑模式图标拖动失效" — previously every rearrange needed a
-    /// long press first, so a normal quick drag did nothing.
+    /// Only active in edit mode — outside edit mode a drag does nothing, so
+    /// the pager and the App Library's own scrolling keep working and the
+    /// long-press menu is never stolen by an accidental swipe.
+    ///
+    /// In edit mode the icon follows the finger *immediately* (minimum
+    /// distance 4 pt), so a rearrange does not need a long press first — that
+    /// was the second half of the "编辑模式图标拖动失效" bug.
     private func iconDragGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
         DragGesture(minimumDistance: 4)
             .onChanged { drag in
+                guard store.editMode else { return }
                 draggingID = item.id
                 dragTranslation = drag.translation
                 updateTarget(for: item, slot: slot, translation: drag.translation)
             }
             .onEnded { _ in
+                guard store.editMode else { return }
                 finishDrag(item: item, slot: slot)
             }
     }
+
 
     // MARK: Icon menu
 
@@ -753,6 +741,13 @@ struct SpringBoardView: View {
         switch action {
         case .open:
             open(item)
+        case .edit:
+            // The long-press menu is the only way into edit mode now (the old
+            // "long-press and drag into edit mode" gesture was removed), so
+            // this entry has to turn the jiggle on.
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                store.editMode = true
+            }
         case .addToDock:
             store.addToDock(item.id)
         case .removeFromDock:
@@ -768,12 +763,6 @@ struct SpringBoardView: View {
             delete(item)
         }
     }
-
-    /// True once the icon long press has fired but before any drag began.
-    /// Used in `onEnded` to tell "long press then lift" (→ menu) from "long
-    /// press then drag" (→ move), without depending on which enum case the
-    /// sequenced gesture happens to deliver on cancellation.
-    @State private var longPressFired = false
 
     /// Per-icon jiggle: different phase and direction per slot so the page
     /// wobbles organically instead of in lockstep.
@@ -849,6 +838,11 @@ struct SpringBoardView: View {
     /// The actions offered in the long-press menu, in display order.
     private func menuActions(for item: DesktopItem) -> [MenuAction] {
         var out: [MenuAction] = [.open]
+        // Entering edit mode used to be "long-press an icon and drag it". That
+        // gesture was removed (it fought the long-press menu and broke both),
+        // so the menu is now the only way in — without this entry the user
+        // could not reach the jiggle/rearrange mode at all.
+        out.append(.edit)
         out.append(store.isInDock(item.id) ? .removeFromDock : .addToDock)
         if case .folder = item.kind {
             out.append(.rename)
@@ -1107,6 +1101,7 @@ struct PagerFramePreferenceKey: PreferenceKey {
 /// One row of the icon long-press menu.
 enum MenuAction {
     case open
+    case edit
     case addToDock
     case removeFromDock
     case rename
@@ -1116,6 +1111,7 @@ enum MenuAction {
     var title: String {
         switch self {
         case .open:          return "打开"
+        case .edit:          return "编辑模式"
         case .addToDock:     return "添加到 Dock"
         case .removeFromDock:return "从 Dock 移除"
         case .rename:        return "重命名"
@@ -1127,6 +1123,7 @@ enum MenuAction {
     var symbol: String {
         switch self {
         case .open:          return "arrow.up.right.square"
+        case .edit:          return "square.grid.2x2"
         case .addToDock:     return "plus.square.on.square"
         case .removeFromDock:return "minus.square"
         case .rename:        return "pencil"
