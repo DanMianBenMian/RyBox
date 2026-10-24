@@ -124,35 +124,80 @@ public final class CodeSigner {
         var certDER: Data? = nil
         var keyDER: Data? = nil
         var keyIsEC = false
-        if CertificateStore.shared.usesFallbackIdentity,
-           let c = CertificateStore.shared.fallbackCertDER(),
-           let k = CertificateStore.shared.fallbackKeyDER() {
-            RyLog.shared.log("sign  使用内置 PKCS#12 解码器（OpenSSL 3 p12）",
-                             level: .info, tag: "sign")
-            certDER = c; keyDER = k; keyIsEC = CertificateStore.shared.fallbackKeyIsEC()
-        } else if let identity = CertificateStore.shared.identityRef() {
-            var cert: SecCertificate? = nil
-            SecIdentityCopyCertificate(identity, &cert)
-            if let cert = cert { certDER = SecCertificateCopyData(cert) as Data }
+        /// When a real SecIdentity exists we hand its SecKey STRAIGHT to the
+        /// signer. Rebuilding it inside the signer from raw DER
+        /// (`SecKeyCopyExternalRepresentation` → `SecKeyCreateWithData`) is the
+        /// step that actually broke on device: the reconstructed SecKey comes
+        /// back unable to perform the signature algorithm the certificate needs,
+        /// so `SecKeyCreateSignature` refuses — identically for a development
+        /// AND a distribution certificate (which is exactly what the user's
+        /// log showed: both rejected, sub-code -5).
+        var liveKey: SecKey? = nil
+        if let identity = CertificateStore.shared.identityRef() {
             var key: SecKey? = nil
-            SecIdentityCopyPrivateKey(identity, &key)
-            if let key = key {
-                keyDER = SecKeyCopyExternalRepresentation(key, nil) as Data?
-                if let attrs = SecKeyCopyAttributes(key) as? [String: Any],
-                   let t = attrs[kSecAttrKeyType as String] as? String {
-                    keyIsEC = (t == (kSecAttrKeyTypeECSECPrimeRandom as String))
+            let st = SecIdentityCopyPrivateKey(identity, &key)
+            if st == errSecSuccess, let key = key {
+                liveKey = key
+                var cert: SecCertificate? = nil
+                SecIdentityCopyCertificate(identity, &cert)
+                if let cert = cert {
+                    certDER = SecCertificateCopyData(cert) as Data
+                    if let attrs = SecKeyCopyAttributes(key) as? [String: Any],
+                       let t = attrs[kSecAttrKeyType as String] as? String {
+                        keyIsEC = (t == (kSecAttrKeyTypeECSECPrimeRandom as String))
+                    }
+                }
+                RyLog.shared.log("sign  使用系统 SecIdentity 私钥（不经 DER 重建）",
+                                 level: .info, tag: "sign")
+            } else {
+                RyLog.shared.log("sign  ⚠ SecIdentityCopyPrivateKey 失败 osstatus=\(st)，回退到 DER 重建路径",
+                                 level: .warn, tag: "sign")
+            }
+        }
+        if liveKey == nil {
+            if CertificateStore.shared.usesFallbackIdentity,
+               let c = CertificateStore.shared.fallbackCertDER(),
+               let k = CertificateStore.shared.fallbackKeyDER() {
+                RyLog.shared.log("sign  使用内置 PKCS#12 解码器（OpenSSL 3 p12）",
+                                 level: .info, tag: "sign")
+                certDER = c; keyDER = k; keyIsEC = CertificateStore.shared.fallbackKeyIsEC()
+            } else if let identity = CertificateStore.shared.identityRef() {
+                // Second chance: no live SecKey could be extracted, so fall back
+                // to the historical external-representation round-trip. Less
+                // reliable, but better than refusing to sign at all.
+                RyLog.shared.log("sign  ⚠ 回退到 DER 私钥重建路径（可靠性较低）",
+                                 level: .warn, tag: "sign")
+                var cert: SecCertificate? = nil
+                SecIdentityCopyCertificate(identity, &cert)
+                if let cert = cert { certDER = SecCertificateCopyData(cert) as Data }
+                var key: SecKey? = nil
+                SecIdentityCopyPrivateKey(identity, &key)
+                if let key = key {
+                    keyDER = SecKeyCopyExternalRepresentation(key, nil) as Data?
+                    if let attrs = SecKeyCopyAttributes(key) as? [String: Any],
+                       let t = attrs[kSecAttrKeyType as String] as? String {
+                        keyIsEC = (t == (kSecAttrKeyTypeECSECPrimeRandom as String))
+                    }
                 }
             }
         }
-        guard let certDER = certDER, let keyDER = keyDER else {
+        guard let certDER = certDER else {
+            RyLog.shared.log("sign  拿不到叶子证书（\(liveKey == nil ? "DER 路径" : "SecIdentity 路径")）",
+                             level: .error, tag: "sign")
+            return .failure(.stageFailed)
+        }
+        if liveKey == nil && keyDER == nil {
+            RyLog.shared.log("sign  拿不到私钥", level: .error, tag: "sign")
             return .failure(.stageFailed)
         }
 
-        // 4a) stage leaf cert + key DER (entsURL / profileEnts already staged above)
+        // 4a) stage leaf cert (+ key DER when we actually need to rebuild it)
         let certURL = tmp.appendingPathComponent("cert.der")
+        guard (try? certDER.write(to: certURL)) != nil else { return .failure(.stageFailed) }
         let keyURL = tmp.appendingPathComponent("key.der")
-        guard (try? certDER.write(to: certURL)) != nil,
-              (try? keyDER.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
+        if let k = keyDER {
+            guard (try? k.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
+        }
 
         // 4b) team + full cert chain (intermediate + root) from the profile
         let team = CertificateStore.shared.teamIdentifier ?? ""
@@ -166,13 +211,35 @@ public final class CodeSigner {
 
         // 4c) delegate Mach-O signing to the robust in-process signer. All profile
         //     material is pre-decoded by Swift; the signer only embeds the profile.
-        let rc: Int32 = rysign_sign_bundle_robust(path, certURL.path, keyURL.path,
-                                                 keyIsEC ? 1 : 0, provURL.path, entsURL.path,
-                                                 team, certsDir.path)
+        //
+        //     Two entries, in order of preference:
+        //       * `rysign_sign_bundle_with_key` — hands over the LIVE SecKey we
+        //         got from the SecIdentity. No key reconstruction inside the
+        //         signer, which is the path the device proved works... and the
+        //         one it never got to use before.
+        //       * `rysign_sign_bundle_robust` — rebuilds the private key from
+        //         raw DER (only when no SecKey could be extracted).
+        let rc: Int32
+        if let key = liveKey {
+            rc = rysign_sign_bundle_with_key(path, key, certURL.path, provURL.path,
+                                             entsURL.path, team, certsDir.path)
+        } else {
+            rc = rysign_sign_bundle_robust(path, certURL.path, keyURL.path,
+                                           keyIsEC ? 1 : 0, provURL.path, entsURL.path,
+                                           team, certsDir.path)
+        }
         if rc != 0 {
             // rc=6 ("sign the main executable failed") covers a dozen internal
             // causes; the signer keeps the precise one in rysign_last_subcode().
             let detail = signFailureReason(rc)
+            // The raw OSStatus and the signer's own one-liner are what turn a
+            // three-build-cycle mystery into one log line.
+            let os = rysign_last_osstatus()
+            let diag = diagString()
+            if os != 0 || !diag.isEmpty {
+                RyLog.shared.log("rysign osstatus=\(os) diag=\(diag)",
+                                 level: .error, tag: "sign")
+            }
             if rc == 6 {
                 let sub = rysign_last_subcode()
                 RyLog.shared.log("rysign 子码 \(sub)：\(subcodeReason(sub))",
@@ -181,7 +248,20 @@ public final class CodeSigner {
             }
             return .failure(.signFailed(rc, detail))
         }
+        // On success the signer records WHICH of the four algorithm variants
+        // actually worked — the fastest way to stop guessing next time.
+        let win = diagString()
+        if !win.isEmpty {
+            RyLog.shared.log("sign  签名成功：\(win)", level: .info, tag: "sign")
+        }
         return .success(())
+    }
+
+    /// The signer's one-line diagnosis of the last failure (UTF-8 static buffer).
+    private func diagString() -> String {
+        guard let p = rysign_last_diag() else { return "" }
+        let s = String(cString: p)
+        return s.isEmpty ? "" : s
     }
 
     /// Turn a rysign internal sub-code into something a human can act on.
