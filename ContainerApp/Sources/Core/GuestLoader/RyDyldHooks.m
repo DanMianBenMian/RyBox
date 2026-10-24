@@ -39,6 +39,144 @@ static volatile bool gGuestLaunching = false;
 static NSString *const kRyGuestDidLaunch = @"rybox.guestDidLaunch";
 
 // ----------------------------------------------------------------------------
+// Window-scene association (LiveContainer "updateWindowScene" fix)
+//
+// On iOS 13+ a UIWindow only renders reliably once it is bound to a
+// UIWindowScene. RyBox itself is now scene-capable (see UIApplicationSceneManifest
+// in Info.plist), so a real scene exists to attach guest windows to. A guest
+// window created with plain -initWithFrame: + -makeKeyAndVisible — or one the
+// guest builds itself in its (scene) delegate — is otherwise invisible on modern
+// iOS, which is exactly the "only a launch image shows" symptom. We mirror
+// LiveContainer's fix: bind the window to the host scene before it is shown.
+// ----------------------------------------------------------------------------
+static UIWindowScene *RyFirstWindowScene(void) {
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        if (ws.screen == UIScreen.mainScreen) return ws;
+    }
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)s;
+    }
+    return nil;
+}
+
+/// Bind `w` to the host's window scene if it has none (no-op otherwise).
+static void RyAttachWindowScene(UIWindow *w) {
+    if (!w || w.windowScene) return;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        if (w.screen == ws.screen) { w.windowScene = ws; break; }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// UIKit swizzles installed once per guest launch. They route every window the
+// guest shows through RyAttachWindowScene, and fix the status-bar frame for apps
+// that never adopted UISceneDelegate (LiveContainer parity).
+// ----------------------------------------------------------------------------
+static BOOL ryUIKitSwizzlesInstalled = NO;
+
+@interface UIWindow (RyGuestScene)
+- (void)ry_makeKeyAndVisible;
+- (void)ry_makeKeyWindow;
+- (void)ry_setHidden:(BOOL)hidden;
+@end
+
+@implementation UIWindow (RyGuestScene)
+- (void)ry_makeKeyAndVisible { RyAttachWindowScene(self); [self ry_makeKeyAndVisible]; }
+- (void)ry_makeKeyWindow    { RyAttachWindowScene(self); [self ry_makeKeyWindow]; }
+- (void)ry_setHidden:(BOOL)hidden { RyAttachWindowScene(self); [self ry_setHidden:hidden]; }
+@end
+
+@interface UIApplication (RyGuestScene)
+- (CGRect)ry_statusBarFrame;
+@end
+
+@implementation UIApplication (RyGuestScene)
+- (CGRect)ry_statusBarFrame {
+    for (UIScene *s in self.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIStatusBarManager *m = [(UIWindowScene *)s statusBarManager];
+        if (m) return m.statusBarFrame;
+    }
+    return [self ry_statusBarFrame];
+}
+@end
+
+static void RyInstallUIKitSwizzles(void) {
+    if (ryUIKitSwizzlesInstalled) return;
+    ryUIKitSwizzlesInstalled = YES;
+    Class win = objc_getClass("UIWindow");
+    Method a = class_getInstanceMethod(win, @selector(makeKeyAndVisible));
+    Method b = class_getInstanceMethod(win, @selector(ry_makeKeyAndVisible));
+    if (a && b) method_exchangeImplementations(a, b);
+    a = class_getInstanceMethod(win, @selector(makeKeyWindow));
+    b = class_getInstanceMethod(win, @selector(ry_makeKeyWindow));
+    if (a && b) method_exchangeImplementations(a, b);
+    a = class_getInstanceMethod(win, @selector(setHidden:));
+    b = class_getInstanceMethod(win, @selector(ry_setHidden:));
+    if (a && b) method_exchangeImplementations(a, b);
+    Class app = objc_getClass("UIApplication");
+    a = class_getInstanceMethod(app, @selector(statusBarFrame));
+    b = class_getInstanceMethod(app, @selector(ry_statusBarFrame));
+    if (a && b) method_exchangeImplementations(a, b);
+}
+
+/// The guest's SceneDelegate class name, read from its UISceneManifest.
+static NSString *RyGuestSceneDelegateClassName(void) {
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSDictionary *manifest = info[@"UIApplicationSceneManifest"];
+    NSDictionary *configs = manifest[@"UISceneConfigurations"];
+    NSArray *appConfigs = configs[@"UIWindowSceneSessionRoleApplication"];
+    NSDictionary *cfg = appConfigs.firstObject;
+    NSString *name = cfg[@"UISceneDelegateClassName"];
+    return [name isKindOfClass:[NSString class]] ? name : nil;
+}
+
+/// Best-effort: run the guest's SceneDelegate so a scene-based app builds its
+/// REAL window inside RyBox's scene. This is the iOS 13+ scene lifecycle the
+/// early-return UIApplicationMain hook otherwise skips. Returns YES when the
+/// guest produced its own on-screen window (so the caller must not add a
+/// fallback window on top of it).
+static BOOL RyDriveGuestSceneDelegate(void) {
+    @try {
+        NSString *name = RyGuestSceneDelegateClassName();
+        if (!name.length) return NO;
+        Class cls = NSClassFromString(name);
+        if (!cls) return NO;
+        UIWindowScene *scene = RyFirstWindowScene();
+        if (!scene) return NO;
+        id sceneDel = [[cls alloc] init];
+        SEL sel = @selector(scene:willConnectToSession:options:);
+        if (![sceneDel respondsToSelector:sel]) return NO;
+
+        NSUInteger before = UIApplication.sharedApplication.windows.count;
+        // Preserve + restore the host scene's delegate: a guest scene delegate
+        // often assigns itself as scene.delegate, which must not permanently
+        // steal RyBox's scene for the next guest launch.
+        id savedDelegate = scene.delegate;
+        NSMethodSignature *sig = [sceneDel methodSignatureForSelector:sel];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.target = sceneDel;
+        inv.selector = sel;
+        id s = scene;
+        id sess = scene.session;
+        id opts = nil;
+        [inv setArgument:&s atIndex:2];
+        [inv setArgument:&sess atIndex:3];
+        [inv setArgument:&opts atIndex:4];
+        [inv invoke];
+        scene.delegate = savedDelegate;
+        return UIApplication.sharedApplication.windows.count > before;
+    } @catch (NSException *e) {
+        NSLog(@"[RyBox] guest scene delegate drive failed: %@", e.reason);
+        return NO;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Original function pointers (captured at load, like LiveContainer)
 // ----------------------------------------------------------------------------
 void *(*orig_dlopen)(const char *, int) = dlopen;
@@ -141,12 +279,13 @@ static int Ry_UIApplicationMain(int argc, char *argv[],
 
     @autoreleasepool {
         UIApplication *app = UIApplication.sharedApplication;
+        NSDictionary *info = NSBundle.mainBundle.infoDictionary;
 
         Class delCls = NSClassFromString(delegateClassName);
         if (!delCls && principalClassName) delCls = NSClassFromString(principalClassName);
         id<UIApplicationDelegate> delegate = delCls ? [[delCls alloc] init] : nil;
 
-        // Tell the Swift side to hide the SpringBoard window + install eject button.
+        // Tell the Swift side to hide the SpringBoard window + install the Home chrome.
         [[NSNotificationCenter defaultCenter] postNotificationName:kRyGuestDidLaunch object:nil];
 
         if (delegate) {
@@ -156,29 +295,40 @@ static int Ry_UIApplicationMain(int argc, char *argv[],
             }
         }
 
-        UIWindow *w = delegate.window;
-        if (!w) {
+        // Scene-based guest (UISceneManifest): run its SceneDelegate so the REAL
+        // UI is built inside RyBox's scene. This is the iOS 13+ scene lifecycle the
+        // early-return hook otherwise skips — the fix for "只有一张启动图".
+        BOOL guestOwnsWindow = NO;
+        if (info[@"UIApplicationSceneManifest"] != nil) {
+            guestOwnsWindow = RyDriveGuestSceneDelegate();
+        }
+
+        UIWindow *w = [delegate respondsToSelector:@selector(window)] ? delegate.window : nil;
+        if (w && !guestOwnsWindow) {
+            // The guest's app delegate built its own window — just bind + show it.
+            RyAttachWindowScene(w);
+            w.windowLevel = UIWindowLevelAlert; // above the container
+            [w makeKeyAndVisible];
+        } else if (!w && !guestOwnsWindow) {
+            // Legacy delegate path (or the scene drive failed): build a window here.
             w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
             if ([delegate respondsToSelector:@selector(setWindow:)]) delegate.window = w;
 
-            NSBundle *main = NSBundle.mainBundle;
-            NSDictionary *info = main.infoDictionary;
-            NSString *sbName = info[@"UIMainStoryboardFile"] ?: info[@"UILaunchStoryboardName"];
+            // Prefer the app's MAIN storyboard; else its principal class; NEVER the
+            // launch storyboard (showing a launch screen forever was the old bug).
+            NSString *sbName = info[@"UIMainStoryboardFile"];
             if (sbName.length) {
-                UIStoryboard *sb = [UIStoryboard storyboardWithName:sbName bundle:main];
-                w.rootViewController = [sb instantiateInitialViewController];
+                UIStoryboard *sb = [UIStoryboard storyboardWithName:sbName bundle:NSBundle.mainBundle];
+                w.rootViewController = [sb instantiateInitialViewController] ?: [UIViewController new];
             } else {
                 NSString *pc = info[@"NSPrincipalClass"];
-                if (pc.length) {
-                    Class vc = NSClassFromString(pc);
-                    w.rootViewController = vc ? [[vc alloc] init] : [UIViewController new];
-                } else {
-                    w.rootViewController = [UIViewController new];
-                }
+                Class vcCls = pc.length ? NSClassFromString(pc) : nil;
+                w.rootViewController = vcCls ? [[vcCls alloc] init] : [UIViewController new];
             }
+            RyAttachWindowScene(w);   // bind to the host scene so it actually renders
+            w.windowLevel = UIWindowLevelAlert; // above the container
+            [w makeKeyAndVisible];
         }
-        w.windowLevel = UIWindowLevelAlert; // above the container
-        [w makeKeyAndVisible];
     }
     return 0; // do NOT re-enter the run loop; RyBox's loop drives the guest
 }
@@ -192,6 +342,10 @@ void RySetGuestMainExecutablePath(const char *guestExecPath) {
 
 void RyInstallGuestDyldHooks(void) {
     int count = (int)_dyld_image_count();
+
+    // Route every guest-shown UIWindow through RyAttachWindowScene, and fix the
+    // status-bar frame for non-scene guests. Installed once; idempotent.
+    RyInstallUIKitSwizzles();
 
     // Find RyBox host (the MH_EXECUTE image) and the guest dylib by path.
     for (int i = 0; i < count; i++) {
