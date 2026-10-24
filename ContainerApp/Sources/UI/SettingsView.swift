@@ -5,14 +5,7 @@ import UniformTypeIdentifiers
 /// Hosts the signing identity (p12 + mobileprovision) the import→sign→run
 /// chain depends on, plus desktop/Dock customization and about info.
 struct SettingsView: View {
-    @State private var p12Password = ""
-    @State private var p12Name: String = "未选择"
-    @State private var provName: String = "未选择"
     @State private var message: String = ""
-
-    /// Staged file contents (imported only when the user taps "应用配置").
-    @State private var stagedP12: Data?
-    @State private var stagedProv: Data?
 
     @ObservedObject private var store = CertificateStore.shared
     @ObservedObject private var desktop = DesktopStore.shared
@@ -31,46 +24,10 @@ struct SettingsView: View {
         .navigationTitle("设置")
     }
 
-    // MARK: 签名身份
+    // MARK: 签名身份（状态只读，证书在「初始设置」中配置）
 
     private var signingSection: some View {
         Section {
-            HStack {
-                Text("证书文件（.p12）")
-                Spacer()
-                Text(p12Name)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { pickP12() }
-
-            SecureField("p12 密码（无密码可直接留空）", text: $p12Password)
-
-            HStack {
-                Text("描述文件")
-                Spacer()
-                Text(provName)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { pickProv() }
-
-            Button {
-                apply()
-            } label: {
-                if stagedP12 == nil || stagedProv == nil {
-                    Text("应用配置（需先选择证书与描述文件）").foregroundColor(.secondary)
-                } else {
-                    Text("应用配置").bold()
-                }
-            }
-            // NOTE: an EMPTY password is allowed — plenty of distribution p12
-            // files are exported without one, and requiring text here used to
-            // silently block the whole configuration step.
-            .disabled(stagedP12 == nil || stagedProv == nil)
-
             HStack {
                 Text("状态")
                 Spacer()
@@ -89,12 +46,19 @@ struct SettingsView: View {
                     Text(team).foregroundColor(.secondary)
                 }
             }
+            if let info = store.certificateInfo {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("证书信息").font(.caption).foregroundColor(.secondary)
+                    Text(info)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         } header: {
             Text("签名身份")
         } footer: {
-            Text(store.isConfigured
-                 ? "支持分发证书（无 get-task-allow）：GUI 走 LiveContainer 进程内模型，CLI 在微内核内直接运行。"
-                 : "请先选择 p12 与 mobileprovision 并点「应用配置」，否则导入 App 时会因未配置证书而失败。")
+            Text("证书与描述文件在首次启动的「初始设置」中配置，并会自动保存；重新进入 RyBox 无需再次导入。如需更换，请在初始设置中重新导入。")
         }
     }
 
@@ -271,21 +235,6 @@ struct SettingsView: View {
         }
     }
 
-    private func pickTheme() {
-        message = "正在打开文件选择器…"
-        DocPicker.present { result in
-            switch result {
-            case .success(let url):
-                switch ThemeEngine.shared.importTheme(from: url) {
-                case .success(let t): message = "已导入并启用主题：\(t.name)"
-                case .failure(let e): message = "主题导入失败：\(e.localizedDescription)"
-                }
-            case .failure(let e):
-                message = "选择失败：\(e.localizedDescription)"
-            }
-        }
-    }
-
     // MARK: 关于
 
     private var aboutSection: some View {
@@ -324,73 +273,18 @@ struct SettingsView: View {
 
     // MARK: Picker handling
 
-    private func pickP12() {
+    private func pickTheme() {
+        message = "正在打开文件选择器…"
         DocPicker.present { result in
             switch result {
             case .success(let url):
-                handle(url, isP12: true)
+                switch ThemeEngine.shared.importTheme(from: url) {
+                case .success(let t): message = "已导入并启用主题：\(t.name)"
+                case .failure(let e): message = "主题导入失败：\(e.localizedDescription)"
+                }
             case .failure(let e):
                 message = "选择失败：\(e.localizedDescription)"
             }
-        }
-    }
-
-    private func pickProv() {
-        DocPicker.present { result in
-            switch result {
-            case .success(let url):
-                handle(url, isP12: false)
-            case .failure(let e):
-                message = "选择失败：\(e.localizedDescription)"
-            }
-        }
-    }
-
-    /// The file's ROLE is detected from its CONTENT, not its extension — p12 /
-    /// pfx / extension-less files all work, and picking a profile in the cert
-    /// row simply fills the other slot.
-    private func handle(_ url: URL, isP12: Bool) {
-        do {
-            let data = try Data(contentsOf: url)
-            let name = url.lastPathComponent
-            if looksLikeProvisioning(data) {
-                stagedProv = data
-                provName = name
-                message = "已识别为描述文件：\(name)"
-            } else {
-                stagedP12 = data
-                p12Name = name
-                message = "已识别为证书：\(name)（\(data.count) 字节）"
-            }
-        } catch {
-            message = "读取文件失败：\(error.localizedDescription)"
-        }
-    }
-
-    private func looksLikeProvisioning(_ data: Data) -> Bool {
-        guard let s = String(data: data.prefix(1 << 20), encoding: .isoLatin1) else { return false }
-        if s.contains("mobileprovision") { return true }
-        if s.contains("<?xml"),
-           (s.contains("TeamIdentifier") || s.contains("ProvisionedDevices")
-            || s.contains("Entitlements") || s.contains("AppIDName")) { return true }
-        return false
-    }
-
-    private func apply() {
-        guard let p12 = stagedP12, let prov = stagedProv else {
-            message = "请先选择 p12 与 mobileprovision"
-            return
-        }
-        switch store.importP12(p12, password: p12Password) {
-        case .success:
-            switch store.importProvisioning(prov) {
-            case .success:
-                message = "配置成功：证书 + 描述文件已就绪"
-            case .failure(let m):
-                message = "证书已就绪，但描述文件有问题：\(m.message)"
-            }
-        case .failure(let m):
-            message = m.message      // detailed diagnosis (key-only cert / PEM / OpenSSL 3 p12 / wrong password)
         }
     }
 }
