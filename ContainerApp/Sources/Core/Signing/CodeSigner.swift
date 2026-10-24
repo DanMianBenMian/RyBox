@@ -89,10 +89,25 @@ public final class CodeSigner {
               (try? prov.write(to: provURL)) != nil else { return .failure(.stageFailed) }
 
         // 2) stage entitlements (from provisioning's embedded Entitlements dict)
+        //
+        //    SPECIAL PERMISSIONS ARE STRIPPED HERE (2026-10-25, user-requested
+        //    "特殊权限分配"): `platform-application`, `com.apple.private.*`,
+        //    `task_for_pid-allow`, … never go into the guest's signature. A
+        //    guest runs in-process (dlopen'd into RyBox), so its runtime
+        //    entitlement queries are answered by the HOST process — the
+        //    special keys would buy it nothing and only risk AMFI rejection.
+        //    What was stripped is MARKED in EntitlementPolicy (takenOver) and
+        //    re-granted at runtime through the entitlement oracle, where the
+        //    user can switch each one on/off per app (Settings → 特殊权限分配).
         let entsURL = tmp.appendingPathComponent("guest.entitlements.plist")
         let profileEnts = CertificateStore.shared.guestEntitlements() ?? [:]
         EntitlementPolicy.shared.updateProfile(profileEnts)
-        if let entsData = try? PropertyListSerialization.data(fromPropertyList: profileEnts,
+        let sanitized = EntitlementPolicy.sanitizeForSigning(profile: profileEnts)
+        if !sanitized.stripped.isEmpty {
+            RyLog.shared.log("签名 entitlements 已剥离 \(sanitized.stripped.count) 项特殊权限（由 RyBox 接管分配）：\(sanitized.stripped.joined(separator: ", "))",
+                             level: .info, tag: "sign")
+        }
+        if let entsData = try? PropertyListSerialization.data(fromPropertyList: sanitized.signed,
                                                              format: .xml, options: 0) {
             try? entsData.write(to: entsURL)
         }
@@ -155,9 +170,35 @@ public final class CodeSigner {
                                                  keyIsEC ? 1 : 0, provURL.path, entsURL.path,
                                                  team, certsDir.path)
         if rc != 0 {
-            return .failure(.signFailed(rc, signFailureReason(rc)))
+            // rc=6 ("sign the main executable failed") covers a dozen internal
+            // causes; the signer keeps the precise one in rysign_last_subcode().
+            let detail = signFailureReason(rc)
+            if rc == 6 {
+                let sub = rysign_last_subcode()
+                RyLog.shared.log("rysign 子码 \(sub)：\(subcodeReason(sub))",
+                                 level: .error, tag: "sign")
+                return .failure(.signFailed(rc, detail + "（\(subcodeReason(sub))）"))
+            }
+            return .failure(.signFailed(rc, detail))
         }
         return .success(())
+    }
+
+    /// Turn a rysign internal sub-code into something a human can act on.
+    private func subcodeReason(_ sub: Int32) -> String {
+        switch sub {
+        case -1:  return "主可执行文件读不出来或不完整"
+        case -2:  return "二进制没有 LC_CODE_SIGNATURE，且头部没有空间补一个"
+        case -3:  return "Requirements 构件失败"
+        case -4:  return "CodeDirectory 构件失败"
+        case -5:  return "CMS 签名失败：系统拒绝用这把私钥签名（多为 EC/RSA 类型不匹配或密钥不可用，见日志里的 osstatus）"
+        case -6:  return "SuperBlob 组装失败"
+        case -7:  return "写签名时内存不足"
+        case -8:  return "主可执行文件路径不是普通文件"
+        case -9:  return "主可执行文件不是 arm64 64 位 Mach-O"
+        case -10: return "签名写回磁盘失败"
+        default:  return "内部错误（子码 \(sub)）"
+        }
     }
 
     /// Turn a rysign exit code into something a human can act on. The old code
