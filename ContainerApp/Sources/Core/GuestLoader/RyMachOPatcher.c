@@ -43,11 +43,33 @@ static int patchSlice(struct mach_header_64 *hdr) {
     return 0;
 }
 
+/// Does this Mach-O already carry an LC_RPATH with exactly this string?
+static bool hasRPath(const char *path, const struct mach_header_64 *hdr) {
+    const struct load_command *lc = (const struct load_command *)((const uint8_t *)hdr + sizeof(*hdr));
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        if (lc->cmd == LC_RPATH) {
+            const struct rpath_command *rp = (const struct rpath_command *)lc;
+            const char *p = (const char *)rp + rp->path.offset;
+            if (strcmp(p, path) == 0) return true;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return false;
+}
+
 /// Inject an LC_RPATH if there is room before __TEXT (best-effort).
+///
+/// Idempotent: a guest is patched on EVERY launch (patch → re-sign), so without
+/// the `hasRPath` check each relaunch appended two more copies until the free
+/// space before __TEXT ran out. The binary still loaded, but the header slowly
+/// filled with junk and the patch result depended on how many times the app had
+/// been opened before.
 static void injectRPath(const char *path, struct mach_header_64 *hdr) {
     // Only inject if there is free space between the load commands and __TEXT,
     // otherwise skip silently (guest already signed with the needed rpaths, or we
     // rely on @loader_path which is implicit).
+    if (hasRPath(path, hdr)) return;
+
     struct load_command *lc = (struct load_command *)((uint8_t *)hdr + sizeof(*hdr));
     uint32_t textOffset = 0;
     for (uint32_t i = 0; i < hdr->ncmds; i++) {
