@@ -7,22 +7,34 @@ import UniformTypeIdentifiers
 struct SettingsView: View {
     @State private var message: String = ""
     @State private var themeToDelete: RyTheme?
+    /// Mirrors the floating ball's on/off state so the toggle stays in sync
+    /// (the ball is a plain singleton, not an ObservableObject).
+    @State private var floatBallOn = FloatingLogBall.shared.isVisible
 
     @ObservedObject private var store = CertificateStore.shared
     @ObservedObject private var desktop = DesktopStore.shared
     @ObservedObject private var firm = FirmwareImporter.shared
     @ObservedObject private var theme = ThemeEngine.shared
+    @ObservedObject private var log = RyLog.shared
     @EnvironmentObject private var env: RuntimeEnvironment
 
     var body: some View {
         Form {
             signingSection
             firmwareSection
+            logSection
             desktopSection
             themeSection
             aboutSection
         }
         .navigationTitle("设置")
+        .onChange(of: floatBallOn) { on in
+            if on {
+                FloatingLogBall.shared.show()
+            } else {
+                FloatingLogBall.shared.hide()
+            }
+        }
         .alert("删除主题？", isPresented: Binding(
             get: { themeToDelete != nil },
             set: { if !$0 { themeToDelete = nil } }
@@ -157,6 +169,69 @@ struct SettingsView: View {
                 firm.message = "选择失败：\(e.localizedDescription)"
                 firm.phase = .failed
             }
+        }
+    }
+
+    // MARK: 日志与浮窗（实时诊断）
+
+    private var logSection: some View {
+        Section {
+            NavigationLink {
+                LogConsoleView()
+            } label: {
+                Label("实时日志", systemImage: "text.alignleft")
+            }
+
+            Toggle(isOn: $floatBallOn) {
+                Label("悬浮球浮窗", systemImage: "circle.circle.fill")
+            }
+
+            HStack {
+                Text("已记录日志")
+                Spacer()
+                Text("\(log.entries.count) 行")
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+
+            if !entitlementRows.isEmpty {
+                ForEach(entitlementRows, id: \.bundleID) { row in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(row.bundleID)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                        Text(row.summary)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        } header: {
+            Text("日志与诊断")
+        } footer: {
+            Text("实时日志记录容器的每一步真实动作（导入、签名、Entitlements、补丁、dlopen、scene 驱动）。打开悬浮球浮窗后，日志球会浮在所有界面之上——包括 guest App 运行时——点一下即可展开查看。\n\nEntitlements 一栏显示每个已导入 App 原本声明的能力：签名里放的是你证书描述文件授权的内容（AMFI 会校验），原始能力则由容器代为「放行」。")
+        }
+    }
+
+    /// Per-app entitlement summary (original capabilities vs. signed set).
+    private struct EntitlementRow {
+        let bundleID: String
+        let summary: String
+    }
+
+    private var entitlementRows: [EntitlementRow] {
+        EntitlementPolicy.shared.original.keys.sorted().map { bid in
+            let original = EntitlementPolicy.shared.original[bid] ?? [:]
+            let simulated = EntitlementPolicy.simulatedEntitlements(
+                original: original,
+                profile: EntitlementPolicy.shared.profile)
+            let diff = EntitlementPolicy.diff(original: original,
+                                             profile: EntitlementPolicy.shared.profile)
+            return EntitlementRow(
+                bundleID: bid,
+                summary: "原始 \(original.count) 项 · 放行 \(simulated.count) 项 · 身份键改用证书 \(diff.dropped.count) 项")
         }
     }
 
