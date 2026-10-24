@@ -137,7 +137,10 @@ final class JbRoot {
     /// touch the virtual root by itself — replacing an extracted root is
     /// destructive (installed debs are lost), so the UI confirms first and
     /// then calls `reset()` + `bootstrap()`.
-    func importBootstrap(from url: URL) -> Result<String, String> {
+    ///
+    /// NOTE: the Failure type is `RyMessageError`, not a bare `String` —
+    /// `Result<String, String>` does not compile (String is not an Error).
+    func importBootstrap(from url: URL) -> Result<String, RyMessageError> {
         guard let fh = try? FileHandle(forReadingFrom: url) else {
             return .failure("打不开所选文件")
         }
