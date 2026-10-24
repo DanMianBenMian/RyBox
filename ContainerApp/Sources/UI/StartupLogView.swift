@@ -86,11 +86,13 @@ struct StartupLogView: View {
             // 1) Virtual root mount.
             VirtualRoot.shared.ensure()
             log("挂载虚拟根 / → \(VirtualRoot.shared.rootURL.path)")
+            log("fs   WRITE  \(VirtualRoot.shared.rootURL.path)  (virtual root mounted)")
             await tick()
 
             // 2) Theme engine load (real theme count under /Library/Themes).
             let themeCount = ThemeEngine.shared.reload()
             log("载入主题引擎 → /Library/Themes（\(themeCount) 个主题）")
+            log("fs   READ   Library/Themes  (\(themeCount) theme dirs)")
             await tick()
 
             // 3) Desktop layout + Dock restore, including previously imported apps.
@@ -99,6 +101,14 @@ struct StartupLogView: View {
             DesktopStore.shared.ensurePlaced(isIPad: isPad)
             let iconCount = DesktopStore.shared.allItems.count
             log("还原桌面布局与 Dock（\(iconCount) 个图标，还原 \(restored) 个已导入 App）")
+            log("fs   READ   Apps/  (\(restored) guest bundles) · WRITE UserDefaults slots")
+            await tick()
+
+            // 3b) Scene capability — the surface in-process GUI guests attach their
+            //     window to (see RyDyldHooks.m). Must be >= 1 or guests show only a
+            //     launch image.
+            let sceneCount = UIApplication.shared.connectedScenes.count
+            log("ui   SCENE  connectedScenes=\(sceneCount)  (guest windows attach here)")
             await tick()
 
             // 4) User-space microkernel process manager (POSIX spawn / PID space /
@@ -106,6 +116,7 @@ struct StartupLogView: View {
             _ = ProcessManager.shared
             let procCount = ProcessManager.shared.list().count
             log("初始化微内核进程管理器（PID 空间 / 信号 / waitpid，当前 \(procCount) 个进程）")
+            log("ks   EXEC   process manager (posix_spawn shim)")
             await tick()
 
             // 5) Signing identity (real cert/team state).
@@ -115,6 +126,7 @@ struct StartupLogView: View {
                 } else {
                     log("应用签名身份（p12 + mobileprovision）")
                 }
+                log("ks   READ   p12 + mobileprovision  (signing identity)")
             } else {
                 log("签名身份未配置（导入/运行 App 可能受限）")
             }
