@@ -290,14 +290,34 @@ struct SpringBoardView: View {
                 // Home pages ONLY: 0..<store.pageCount. The App Library is the
                 // last page and is placed separately below, so there is exactly
                 // one view per page index and no ghost page overlapping it.
+                //
+                // The offset MUST be a function of the page's own index:
+                //     x = (i - page) * w + drag
+                // The old code used `-page * w` for every page — a value that
+                // does not mention `i` at all — so every home page was stacked
+                // at the same x and the whole strip collapsed onto itself. With
+                // a single home page that was invisible, but the App Library was
+                // parked at `-pageCount * w`, i.e. permanently one screen-width
+                // too far LEFT, so swiping onto it always landed on an empty
+                // screen. That is the "资源库空白" report.
                 ForEach(0..<store.pageCount, id: \.self) { i in
                     pageView(i)
                         .frame(width: w, height: geo.size.height)
-                        .offset(x: -CGFloat(page) * w + pageDragOffset)
+                        .offset(x: CGFloat(i - page) * w + pageDragOffset)
+                        // Only the page the user is looking at may take touches.
+                        // An off-screen page still exists in the view hierarchy
+                        // (SwiftUI does not clip a ZStack), and a full-height
+                        // invisible page carrying its own ScrollView is exactly
+                        // the sort of thing that makes icons "probabilistically
+                        // untappable".
+                        .allowsHitTesting(i == page)
                 }
+                // The App Library is page number `store.pageCount` — the page
+                // right after the last home page.
                 AppLibraryView { item in open(item) }
                     .frame(width: w, height: geo.size.height)
-                    .offset(x: -CGFloat(store.pageCount) * w + pageDragOffset)
+                    .offset(x: CGFloat(store.pageCount - page) * w + pageDragOffset)
+                    .allowsHitTesting(store.pageCount == page)
             }
             .frame(width: w, height: geo.size.height, alignment: .topLeading)
             .contentShape(Rectangle())
