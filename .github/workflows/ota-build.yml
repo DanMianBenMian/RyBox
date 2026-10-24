@@ -79,6 +79,26 @@ jobs:
           echo "staged preinstalled:"
           ls -la "$APP/Preinstalled"
 
+      - name: Build RyFsRedirect child dylib (best-effort)
+        run: |
+          set -eo pipefail
+          APP="${{ steps.locate.outputs.app_path }}"
+          SYSROOT=$(xcrun --show-sdk-path -sdk iphoneos)
+          # A drop-in redirect dylib for guest subprocesses (dpkg/apt): it loads
+          # via DYLD_INSERT_LIBRARIES (injected by the parent's posix_spawn hook)
+          # and redirects the child's file ops into the jbroot too. Best-effort:
+          # if clang fails for any reason the app still builds, child redirect is
+          # just absent.
+          clang -dynamiclib -arch arm64 \
+            -isysroot "$SYSROOT" \
+            -I ContainerApp/Sources/Core/GuestLoader \
+            -framework Foundation -framework Security \
+            ContainerApp/Sources/Core/Filesystem/RyFsRedirect.m \
+            ContainerApp/Sources/Core/GuestLoader/litehook.c \
+            -o "$APP/RyFsRedirect.dylib" || \
+            echo "RyFsRedirect.dylib build skipped (clang step failed)"
+          ls -la "$APP/RyFsRedirect.dylib" 2>/dev/null || echo "no dylib (child redirect disabled)"
+
       - name: Ad-hoc sign + package IPA
         run: |
           set -eo pipefail
