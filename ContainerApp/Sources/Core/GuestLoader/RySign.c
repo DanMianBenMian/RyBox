@@ -5,13 +5,28 @@
 // inside the (non-jailbroken) RyBox process.
 //
 // Uses ONLY Security + CommonCrypto + libSystem (no OpenSSL, no third-party
-// dependency) so it cross-compiles for iOS with a plain clang invocation and
-// bundles as the `codesign` auxiliary executable.
+// dependency) so it cross-compiles for iOS with a plain clang invocation.
 //
-// The output is a standard LC_CODE_SIGNATURE SuperBlob containing a
-// CodeDirectory (SHA-256, v4 with team id), an embedded-entitlements blob, and a
-// CMS/PKCS#7 SignedData (RSA PKCS#1 v1.5 over SHA-256) carrying the cert chain
-// — the exact shape AMFI validates.
+// ---------------------------------------------------------------------------
+// THE MODEL (measured, not guessed — validated byte-for-byte against the
+// official Sileo signature, see ContainerApp/tools/golden_check.py)
+// ---------------------------------------------------------------------------
+//
+//   * The signature lives in a SuperBlob inside `LC_CODE_SIGNATURE`.
+//   * The CodeDirectory (CS_CodeDirectory, v0x20400) has an 88-byte header,
+//     special slots BELOW hashOffset, code slots ABOVE it, and hashes only the
+//     REAL remaining bytes of the last page.
+//   * The new SuperBlob is written AT the existing `LC_CODE_SIGNATURE.dataoff`
+//     (zsign's `ZArchO::Sign` → `memcpy(m_pBase + m_uCodeLength, …)`): the file
+//     body NEVER moves, so no load-command offset needs repairing. Growing only
+//     extends the file tail and bumps `__LINKEDIT`.
+//   * The CMS is DETACHED (Apple codesign / zsign parity) with the two private
+//     signed attributes 1.2.840.113635.100.9.1 (cdhashes plist) and
+//     1.2.840.113635.100.9.2 (CDHashes2). An in-place (non-adhoc) signature is
+//     what AMFI requires on a non-jailbroken device.
+//
+// The platform-independent byte layout lives in `RySignCore.c`; this file is
+// the iOS glue: file IO, DER/CMS assembly, and the zsign-style write path.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +38,7 @@
 #include <stdint.h>
 #include <dirent.h>
 
-#include <CommonCrypto/CommonCrypto.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -32,100 +47,168 @@
 #include <mach-o/arch.h>
 #include <libkern/OSByteOrder.h>
 
+#include "RySignCore.h"
+
 #ifndef MH_DYLIB
 #define MH_DYLIB 0x6
 #endif
 
-// ---- CS magic / slot numbers (from Apple's csblob.h) ----------------------
-#define CSMAGIC_EMBEDDED_SIGNATURE 0xFADE0CC0u
-#define CSMAGIC_CODEDIRECTORY     0xFADE0C02u
-#define CSMAGIC_EMBEDDED_ENTITLEMENTS 0xFADE7171u
-#define CSMAGIC_BLOBWRAPPER       0xFADE0B01u
-#define CSSLOT_CODEDIRECTORY      0
-#define CSSLOT_ENTITLEMENTS       5
-#define CSSLOT_SIGNATURESLOT      0x10000u
-
-// ---- Global provisioning-profile pointer (set once per bundle sign) --------
-static const unsigned char *g_prov = NULL;
-static size_t g_prov_len = 0;
-
 // ---- CodeDirectory identifier override (LiveContainer parity) -------------
-// LiveContainer drives ZSign with `bundleId: NSBundle.mainBundle.bundleIdentifier`
-// — the HOST app's identifier, NOT the guest's. The guest is signed with the
-// host's certificate AND the host's provisioning profile, so the identifier
-// written into the CodeDirectory has to be the one that profile authorises.
-// Using the guest's own CFBundleIdentifier here is what made the signature
-// disagree with the profile. `NULL` keeps the guest's own id as a fallback.
-static const char *g_ident_override = NULL;
+// ZSign is driven with `bundleId: NSBundle.mainBundle.bundleIdentifier` — the
+// HOST app's identifier, because the guest is signed with the host's cert and
+// profile. Swift sets this; NULL keeps the guest's own CFBundleIdentifier.
+static char *g_ident_override = NULL;
 
-void rysign_set_code_identity(const char *ident) {
-    if (g_ident_override){ free((void*)g_ident_override); g_ident_override = NULL; }
-    if (ident && ident[0]){
-        size_t n = strlen(ident) + 1;
-        char *copy = malloc(n);
-        if (copy){ memcpy(copy, ident, n); g_ident_override = copy; }
-    }
-}
+/// The guest's Info.plist FILE BYTES (special slot -1). Swift can hand them
+/// over via `rysign_set_info_plist`; if it does not, the signer reads them from
+/// disk. (The in-C parser that used to `strstr` for `<string` failed on every
+/// binary plist — that is what produced rc=6.)
+static unsigned char *g_info_plist = NULL;
+static size_t g_info_plist_len = 0;
+static char g_exe_name[1024] = {0};
+
+/// The leaf certificate's subject CN, for the designated requirement.
+static char g_subject_cn[256] = {0};
 
 // ---- Explicit trust-chain certificates (set by Swift) --------------------
-// A `.mobileprovision` is a CMS-wrapped *binary* plist; the in-C profile
-// parser (which greps for `<dict>`/`<array>` byte strings) cannot read it, so
-// the CMS used to ship with only the leaf certificate and AMFI could not build
-// a trust chain. Swift decodes the profile and passes the full chain here.
 unsigned char **g_extra_certs = NULL;
 size_t *g_extra_certs_lens = NULL;
 int g_extra_certs_n = 0;
 
-// Forward declaration — defined later, used by `rysign_sign_bundle_robust`.
-static int pkcs1_modulus_bits(const unsigned char *der, size_t len);
+// ---- Provisioning profile bytes (embedded only) ---------------------------
+static unsigned char *g_prov = NULL;
+static size_t g_prov_len = 0;
 
-// ---- DER builders --------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Public setters (Swift calls these before a signing run)
+// ---------------------------------------------------------------------------
+
+void rysign_set_code_identity(const char *ident) {
+    if (g_ident_override) { free(g_ident_override); g_ident_override = NULL; }
+    if (ident && ident[0]) {
+        size_t n = strlen(ident) + 1;
+        char *copy = (char *)malloc(n);
+        if (copy) { memcpy(copy, ident, n); g_ident_override = copy; }
+    }
+}
+
+void rysign_set_extra_certs(unsigned char **c, size_t *l, int n) {
+    if (g_extra_certs) {
+        for (int i = 0; i < g_extra_certs_n; i++) free(g_extra_certs[i]);
+        free(g_extra_certs);
+    }
+    if (g_extra_certs_lens) free(g_extra_certs_lens);
+    g_extra_certs = c;
+    g_extra_certs_lens = l;
+    g_extra_certs_n = n;
+}
+
+void rysign_set_info_plist(const char *exeName,
+                           const unsigned char *plist, size_t len) {
+    if (g_info_plist) { free(g_info_plist); g_info_plist = NULL; }
+    g_info_plist_len = 0;
+    if (plist && len) {
+        g_info_plist = (unsigned char *)malloc(len);
+        if (g_info_plist) { memcpy(g_info_plist, plist, len); g_info_plist_len = len; }
+    }
+    g_exe_name[0] = 0;
+    if (exeName && exeName[0]) {
+        strncpy(g_exe_name, exeName, sizeof(g_exe_name) - 1);
+        g_exe_name[sizeof(g_exe_name) - 1] = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hash back-ends for RySignCore (CommonCrypto)
+// ---------------------------------------------------------------------------
+
+static int ry_sha1(const void *data, size_t len, unsigned char *out) {
+    CC_SHA1(data, (CC_LONG)len, out);
+    return 0;
+}
+static int ry_sha256(const void *data, size_t len, unsigned char *out) {
+    CC_SHA256(data, (CC_LONG)len, out);
+    return 0;
+}
+static const RySignHash g_hash = { ry_sha1, ry_sha256 };
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+static unsigned char *read_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return NULL; }
+    unsigned char *buf = (unsigned char *)malloc(sz ? (size_t)sz : 1);
+    size_t r = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    *len = r;
+    return buf;
+}
+static int write_file(const char *path, const unsigned char *d, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t w = fwrite(d, 1, n, f);
+    fclose(f);
+    return (w == n) ? 0 : -1;
+}
+static size_t rnd4(size_t v) { return (v + 3) & ~((size_t)3); }
+
+// ---------------------------------------------------------------------------
+// DER builders — used to build the CMS SignedData
+// ---------------------------------------------------------------------------
+
 typedef struct { unsigned char *p; size_t len; size_t cap; } Buf;
-static void buf_init(Buf *b){ b->p = malloc(64); b->len = 0; b->cap = 64; }
-static void buf_free(Buf *b){ if(b->p){ free(b->p); } b->p = NULL; b->len = 0; b->cap = 0; }
-static void buf_reserve(Buf *b, size_t n){
-    if (b->len + n > b->cap){ size_t nc = b->cap; while (b->len + n > nc) nc *= 2; b->p = realloc(b->p, nc); b->cap = nc; }
+
+static void buf_init(Buf *b) { b->p = (unsigned char *)malloc(64); b->len = 0; b->cap = b->p ? 64 : 0; }
+static void buf_free(Buf *b) { if (b->p) free(b->p); b->p = NULL; b->len = 0; b->cap = 0; }
+static void buf_reserve(Buf *b, size_t n) {
+    if (b->p && b->len + n <= b->cap) return;
+    size_t nc = b->cap ? b->cap : 64;
+    while (b->len + n > nc) nc *= 2;
+    unsigned char *np = (unsigned char *)realloc(b->p, nc);
+    if (!np) return;
+    b->p = np; b->cap = nc;
 }
-static void buf_put(Buf *b, const void *d, size_t n){ buf_reserve(b, n); memcpy(b->p + b->len, d, n); b->len += n; }
-static void buf_u8(Buf *b, unsigned char v){ buf_put(b, &v, 1); }
-static void buf_be32(Buf *b, uint32_t v){
-    unsigned char t[4] = { (v>>24)&0xff, (v>>16)&0xff, (v>>8)&0xff, v&0xff }; buf_put(b, t, 4);
+static void buf_put(Buf *b, const void *d, size_t n) {
+    if (!b->p) buf_init(b);
+    buf_reserve(b, n);
+    if (!b->p) return;
+    memcpy(b->p + b->len, d, n);
+    b->len += n;
 }
-static void der_len(Buf *b, size_t n){
-    if (n < 0x80){ buf_u8(b, (unsigned char)n); }
-    else if (n < 0x100){ buf_u8(b, 0x81); buf_u8(b, (unsigned char)n); }
-    else if (n < 0x10000){ buf_u8(b, 0x82); buf_u8(b, (unsigned char)(n>>8)); buf_u8(b, (unsigned char)(n&0xff)); }
-    else { buf_u8(b, 0x83); buf_u8(b, (unsigned char)(n>>16)); buf_u8(b, (unsigned char)(n>>8)); buf_u8(b, (unsigned char)(n&0xff)); }
+static void buf_u8(Buf *b, unsigned char v) { buf_put(b, &v, 1); }
+static void der_len(Buf *b, size_t n) {
+    if (n < 0x80) { buf_u8(b, (unsigned char)n); }
+    else if (n < 0x100) { buf_u8(b, 0x81); buf_u8(b, (unsigned char)n); }
+    else if (n < 0x10000) { buf_u8(b, 0x82); buf_u8(b, (unsigned char)(n >> 8)); buf_u8(b, (unsigned char)(n & 0xff)); }
+    else { buf_u8(b, 0x83); buf_u8(b, (unsigned char)(n >> 16)); buf_u8(b, (unsigned char)(n >> 8)); buf_u8(b, (unsigned char)(n & 0xff)); }
 }
-static void der_wrap(Buf *out, unsigned char tag, const Buf *c){
+static void der_wrap(Buf *out, unsigned char tag, const Buf *c) {
     buf_u8(out, tag); der_len(out, c->len); buf_put(out, c->p, c->len);
 }
 #define der_seq(out, c)  der_wrap(out, 0x30, c)
 #define der_set(out, c)  der_wrap(out, 0x31, c)
 #define der_octet(out, c) der_wrap(out, 0x04, c)
-static void der_int(Buf *b, const unsigned char *d, size_t n){
-    // trim leading zero bytes (keep at least one), prepend 0x00 if high bit set
-    while (n > 1 && d[0] == 0){ d++; n--; }
-    if (d[0] & 0x80){
-        Buf t; buf_init(&t); unsigned char z = 0; buf_put(&t, &z, 1); buf_put(&t, d, n);
-        der_wrap(b, 0x02, &t); buf_free(&t);
-    } else {
-        Buf t; buf_init(&t); buf_put(&t, d, n); der_wrap(b, 0x02, &t); buf_free(&t);
-    }
-}
-static void der_oid(Buf *b, const unsigned char *d, size_t n){
+static void der_oid(Buf *b, const unsigned char *d, size_t n) {
     Buf t; buf_init(&t); buf_put(&t, d, n); der_wrap(b, 0x06, &t); buf_free(&t);
 }
-// [n] IMPLICIT: tag 0xA0 + n
-static void der_ctx0(Buf *b, int n, const Buf *c){
-    buf_u8(b, (unsigned char)(0xA0 + n)); der_len(b, c->len); buf_put(b, c->p, c->len);
+static void der_int(Buf *b, const unsigned char *d, size_t n) {
+    while (n > 1 && d[0] == 0) { d++; n--; }
+    Buf t; buf_init(&t);
+    if (n && (d[0] & 0x80)) { unsigned char z = 0; buf_put(&t, &z, 1); }
+    buf_put(&t, d, n);
+    der_wrap(b, 0x02, &t);
+    buf_free(&t);
 }
-// [0] IMPLICIT OCTET STRING (tag 0x80) — used for CMS eContent
-static void der_octet_implicit0(Buf *b, const unsigned char *d, size_t n){
-    buf_u8(b, 0x80); der_len(b, n); buf_put(b, d, n);
+// [0] IMPLICIT — used for CMS eContent, signedAttrs and the cert set.
+static void der_ctx0(Buf *b, const Buf *c) {
+    buf_u8(b, 0xA0); der_len(b, c->len); buf_put(b, c->p, c->len);
 }
 
-// ---- OIDs ----------------------------------------------------------------
+// ---- OIDs ------------------------------------------------------------------
 static const unsigned char OID_SHA256[]    = {0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01};
 static const unsigned char OID_RSA[]       = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
 static const unsigned char OID_DATA[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x07,0x01};
@@ -133,900 +216,533 @@ static const unsigned char OID_SIGNED[]    = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01
 static const unsigned char OID_SHA256RSA[] = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
 static const unsigned char OID_CTYPE[]     = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x03};
 static const unsigned char OID_MSGDIGEST[] = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x04};
+static const unsigned char OID_APPLE_CDHASHES[]  = {0x2A,0x86,0x48,0x86,0xF7,0x63,0x64,0x09,0x01};
+static const unsigned char OID_APPLE_CDHASHES2[] = {0x2A,0x86,0x48,0x86,0xF7,0x63,0x64,0x09,0x02};
 
-// ---- base64 (for extracting DeveloperCertificates from the profile) -------
-static int b64_val(char c){
-    if (c>='A'&&c<='Z') return c-'A';
-    if (c>='a'&&c<='z') return c-'a'+26;
-    if (c>='0'&&c<='9') return c-'0'+52;
-    if (c=='+') return 62; if (c=='/') return 63;
-    return -1;
-}
-static int b64_decode(const char *in, size_t inlen, unsigned char *out, size_t outcap, size_t *outlen){
-    size_t bits=0, acc=0, o=0;
-    for (size_t i=0;i<inlen;i++){
-        int v = b64_val(in[i]);
-        if (v<0) continue;
-        acc = (acc<<6)|v; bits+=6;
-        if (bits>=8){ bits-=8; unsigned char b=(acc>>bits)&0xff; if (o<outcap) out[o++]=b; }
-    }
-    *outlen=o; return 0;
-}
+// ---------------------------------------------------------------------------
+// Minimal DER cursor — for reading the leaf certificate
+// ---------------------------------------------------------------------------
 
-// ---- SHA-256 helper ------------------------------------------------------
-static void sha256(const unsigned char *d, size_t n, unsigned char out[CC_SHA256_DIGEST_LENGTH]){
-    CC_SHA256(d, (CC_LONG)n, out);
-}
-
-// ---- Read / write whole file ---------------------------------------------
-static unsigned char *read_file(const char *path, size_t *len){
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz < 0){ fclose(f); return NULL; }
-    unsigned char *buf = malloc(sz ? (size_t)sz : 1);
-    size_t r = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    *len = r; return buf;
-}
-static int write_file(const char *path, const unsigned char *d, size_t n){
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    size_t w = fwrite(d, 1, n, f);
-    fclose(f);
-    return (w==n)?0:-1;
-}
-
-// ---- Minimal DER cursor (for parsing the leaf certificate) ----------------
 typedef struct { const unsigned char *p; size_t len; size_t pos; } Cur;
-static int cur_read_len(Cur *c, size_t *out){
-    if (c->pos>=c->len) return -1;
+
+static int cur_read_len(Cur *c, size_t *out) {
+    if (c->pos >= c->len) return -1;
     unsigned char b = c->p[c->pos++];
-    if (b & 0x80){
-        int n = b & 0x7f; size_t v=0;
-        for (int i=0;i<n;i++){ if(c->pos>=c->len) return -1; v=(v<<8)|c->p[c->pos++]; }
-        *out=v;
-    } else *out=b;
+    if (b & 0x80) {
+        int n = b & 0x7f; size_t v = 0;
+        for (int i = 0; i < n; i++) { if (c->pos >= c->len) return -1; v = (v << 8) | c->p[c->pos++]; }
+        *out = v;
+    } else *out = b;
     return 0;
 }
-static int cur_read_tlv(Cur *c, unsigned char *tag, const unsigned char **content, size_t *clen){
-    if (c->pos>=c->len) return -1;
+static int cur_read_tlv(Cur *c, unsigned char *tag, const unsigned char **content, size_t *clen) {
+    if (c->pos >= c->len) return -1;
     *tag = c->p[c->pos++];
-    size_t l; if (cur_read_len(c, &l)!=0) return -1;
+    size_t l;
+    if (cur_read_len(c, &l) != 0) return -1;
     if (c->pos + l > c->len) return -1;
     *content = c->p + c->pos; *clen = l;
     c->pos += l;
     return 0;
 }
 
-// Extract (issuer Name DER, serial INTEGER DER) from a certificate DER.
 static int parse_cert_ids(const unsigned char *cert, size_t certlen,
-                          Buf *issuer, Buf *serial){
-    Cur c; c.p=cert; c.len=certlen; c.pos=0;
+                          Buf *issuer, Buf *serial) {
+    Cur c; c.p = cert; c.len = certlen; c.pos = 0;
     unsigned char tag; const unsigned char *content; size_t clen;
-    if (cur_read_tlv(&c, &tag, &content, &clen)!=0 || tag!=0x30) return -1; // Certificate SEQUENCE
-    Cur t; t.p=content; t.len=clen; t.pos=0;
-    if (cur_read_tlv(&t, &tag, &content, &clen)!=0 || tag!=0x30) return -1; // TBSCertificate SEQUENCE
-    Cur tbs; tbs.p=content; tbs.len=clen; tbs.pos=0;
-    if (tbs.pos<tbs.len && tbs.p[tbs.pos]==0xA0){
-        if (cur_read_tlv(&tbs, &tag, &content, &clen)!=0) return -1; // optional [0] version
+    if (cur_read_tlv(&c, &tag, &content, &clen) != 0 || tag != 0x30) return -1;
+    Cur t; t.p = content; t.len = clen; t.pos = 0;
+    if (cur_read_tlv(&t, &tag, &content, &clen) != 0 || tag != 0x30) return -1;
+    Cur tbs; tbs.p = content; tbs.len = clen; tbs.pos = 0;
+    if (tbs.pos < tbs.len && tbs.p[tbs.pos] == 0xA0) {
+        if (cur_read_tlv(&tbs, &tag, &content, &clen) != 0) return -1;
     }
-    if (cur_read_tlv(&tbs, &tag, &content, &clen)!=0 || tag!=0x02) return -1; // serialNumber INTEGER
+    if (cur_read_tlv(&tbs, &tag, &content, &clen) != 0 || tag != 0x02) return -1;
     buf_put(serial, content, clen);
-    if (cur_read_tlv(&tbs, &tag, &content, &clen)!=0) return -1;              // signature alg (skip)
-    if (cur_read_tlv(&tbs, &tag, &content, &clen)!=0 || tag!=0x30) return -1; // issuer Name SEQUENCE
+    if (cur_read_tlv(&tbs, &tag, &content, &clen) != 0) return -1;
+    if (cur_read_tlv(&tbs, &tag, &content, &clen) != 0 || tag != 0x30) return -1;
     buf_put(issuer, content, clen);
     return 0;
 }
 
-// Extract DeveloperCertificates (base64 DER) from a mobileprovision plist text.
-static int extract_profile_certs(const unsigned char *prov, size_t provlen,
-                                 unsigned char ***out_certs, size_t **out_lens, int *out_n){
-    char *text = malloc(provlen+1);
-    for (size_t i=0;i<provlen;i++) text[i] = (char)prov[i];
-    text[provlen]=0;
-    char *key = strstr(text, "DeveloperCertificates");
-    if (!key){ free(text); return -1; }
-    char *arr = strstr(key, "<array");
-    if (!arr){ free(text); return -1; }
-    char *end = strstr(arr, "</array>");
-    if (!end) end = text + provlen;
-    int n=0; for (char *s=arr; s<end; ){ char *d=strstr(s,"<data>"); if(!d||d>=end) break; n++; s=d+6; }
-    if (n==0){ free(text); return -1; }
-    unsigned char **certs = malloc(sizeof(void*)*n);
-    size_t *lens = malloc(sizeof(size_t)*n);
-    int k=0;
-    for (char *s=arr; s<end; ){
-        char *d = strstr(s,"<data>"); if(!d||d>=end) break;
-        char *de = strstr(d,"</data>"); if(!de||de>=end) break;
-        size_t blen = (size_t)(de - (d+6));
-        unsigned char *dec = malloc(blen);
-        size_t dl=0;
-        b64_decode(d+6, blen, dec, blen, &dl);
-        certs[k] = dec; lens[k] = dl; k++;
-        s = de + 7;
-    }
-    free(text);
-    *out_certs = certs; *out_lens = lens; *out_n = k;
-    return 0;
+static int read_subject_cn(SecCertificateRef cert, char *out, size_t outcap) {
+    CFStringRef cn = SecCertificateCopySubjectSummary(cert);
+    if (!cn) return -1;
+    const char *s = CFStringGetCStringPtr(cn, kCFStringEncodingUTF8);
+    if (!s) { CFRelease(cn); return -1; }
+    const char *p = strstr(s, "CN=");
+    p = p ? p + 3 : s;
+    size_t n = 0;
+    while (p[n] && p[n] != ',' && n + 1 < outcap) n++;
+    memcpy(out, p, n);
+    out[n] = 0;
+    CFRelease(cn);
+    return out[0] ? 0 : -1;
 }
 
-// Extract the provisioning profile's embedded Entitlements dict and wrap it in
-// a full XML plist (this is exactly what codesign embeds as the entitlements
-// blob). Returns malloc'd buffer, or NULL if not found.
-static unsigned char *extract_profile_entitlements(const unsigned char *prov, size_t provlen, size_t *outlen){
-    char *text = malloc(provlen+1);
-    for (size_t i=0;i<provlen;i++) text[i]=(char)prov[i]; text[provlen]=0;
-    char *key = strstr(text, "Entitlements");
-    if (!key){ free(text); return NULL; }
-    char *dict = strstr(key, "<dict");
-    if (!dict){ free(text); return NULL; }
-    int depth=0; char *p=dict; char *end=NULL;
-    while (*p){
-        if (strncmp(p,"<dict",5)==0){ depth++; p+=5; continue; }
-        if (strncmp(p,"</dict>",7)==0){ depth--; p+=7; if(depth==0){ end=p; break; } continue; }
-        p++;
-    }
-    if (!end){ free(text); return NULL; }
-    size_t dl = (size_t)(end - dict);
-    const char *hdr = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n";
-    const char *ftr = "\n</plist>\n";
-    size_t total = strlen(hdr) + dl + strlen(ftr);
-    unsigned char *out = malloc(total);
-    size_t o=0;
-    memcpy(out+o, hdr, strlen(hdr)); o+=strlen(hdr);
-    memcpy(out+o, dict, dl); o+=dl;
-    memcpy(out+o, ftr, strlen(ftr)); o+=strlen(ftr);
-    free(text);
-    *outlen = o;
-    return out;
-}
+// ---------------------------------------------------------------------------
+// CMS / PKCS#7 SignedData (DETACHED — Apple codesign / zsign parity)
+// ---------------------------------------------------------------------------
 
-static size_t rnd4(size_t v){ return (v + 3) & ~((size_t)3); }
-
-// ---- CodeDirectory (v4 / 0x20400) ----------------------------------------
-#pragma pack(push,1)
-struct CS_CodeDirectory {
-    uint32_t magic;
-    uint32_t length;
-    uint32_t version;
-    uint32_t flags;
-    uint32_t hashOffset;
-    uint32_t identOffset;
-    uint32_t nSpecialSlots;
-    uint32_t nCodeSlots;
-    uint32_t codeLimit;
-    uint8_t  hashSize;
-    uint8_t  hashType;
-    uint8_t  platform;
-    uint8_t  pageSize;
-    uint32_t spare2;
-    uint32_t scatterOffset;
-    uint32_t teamIDOffset;
-    uint32_t spare3;
-    uint32_t spare4;
-    uint32_t spare5;
-};
-#pragma pack(pop)
-
-static int build_codedirectory(const unsigned char *file, size_t file_len,
-                               const char *ident, const char *team,
-                               const unsigned char *infoplist, size_t info_len,
-                               const unsigned char *ent, size_t ent_len,
-                               Buf *out_cd){
-    const uint32_t pageSize = 12;               // 2^12 = 4096
-    const uint32_t hashSize = CC_SHA256_DIGEST_LENGTH;
-    const int nSpecial = 4;                      // Info.plist, Requirements, Resources, Entitlements
-    uint32_t codeLimit = (uint32_t)file_len;
-    uint32_t nCodeSlots = (codeLimit + ((uint32_t)1<<pageSize) - 1) / ((uint32_t)1<<pageSize);
-
-    size_t ident_len = strlen(ident) + 1;
-    size_t team_len = (team && team[0]) ? strlen(team)+1 : 1;
-
-    size_t off_ident = sizeof(struct CS_CodeDirectory);
-    size_t off_team = off_ident + rnd4(ident_len);
-    size_t off_hashes = off_team + rnd4(team_len);
-    size_t total = off_hashes + (size_t)nSpecial*hashSize + (size_t)nCodeSlots*hashSize;
-
-    unsigned char *cd = malloc(total);
-    memset(cd, 0, total);
-    struct CS_CodeDirectory *c = (struct CS_CodeDirectory*)cd;
-    c->magic = OSSwapHostToBigInt32(CSMAGIC_CODEDIRECTORY);
-    c->length = OSSwapHostToBigInt32((uint32_t)total);
-    c->version = OSSwapHostToBigInt32(0x20400u);
-    c->flags = 0;
-    c->hashOffset = OSSwapHostToBigInt32((uint32_t)off_hashes);
-    c->identOffset = OSSwapHostToBigInt32((uint32_t)off_ident);
-    c->nSpecialSlots = OSSwapHostToBigInt32((uint32_t)nSpecial);
-    c->nCodeSlots = OSSwapHostToBigInt32(nCodeSlots);
-    c->codeLimit = OSSwapHostToBigInt32(codeLimit);
-    c->hashSize = (uint8_t)hashSize;
-    c->hashType = 2;                              // SHA-256
-    c->platform = 0;
-    c->pageSize = (uint8_t)pageSize;
-    c->spare2 = 0;
-    c->scatterOffset = 0;
-    c->teamIDOffset = OSSwapHostToBigInt32((uint32_t)(team && team[0] ? off_team : 0));
-    c->spare3 = 0; c->spare4 = 0; c->spare5 = 0;
-
-    memcpy(cd + off_ident, ident, strlen(ident)+1);
-    if (team && team[0]) memcpy(cd + off_team, team, strlen(team)+1);
-
-    unsigned char *hp = cd + off_hashes;
-    unsigned char empty[CC_SHA256_DIGEST_LENGTH];
-    sha256((const unsigned char*)"", 0, empty);
-    // Special slots are stored in memory in this order:
-    //   index0 = slot -4 (Entitlements)
-    //   index1 = slot -3 (Resources)
-    //   index2 = slot -2 (Requirements)
-    //   index3 = slot -1 (Info.plist)
-    if (ent && ent_len) sha256(ent, ent_len, hp); else memcpy(hp, empty, hashSize);
-    hp += hashSize;                               // -4 entitlements
-    memcpy(hp, empty, hashSize); hp += hashSize;  // -3 resources
-    memcpy(hp, empty, hashSize); hp += hashSize;  // -2 requirements
-    if (infoplist && info_len) sha256(infoplist, info_len, hp); else memcpy(hp, empty, hashSize);
-    hp += hashSize;                               // -1 Info.plist
-
-    uint32_t ps = (uint32_t)1 << pageSize;
-    for (uint32_t i=0;i<nCodeSlots;i++){
-        size_t start = (size_t)i * ps;
-        size_t end = start + ps; if (end > file_len) end = file_len;
-        size_t plen = end - start;
-        unsigned char page[4096]; memset(page, 0, ps);
-        memcpy(page, file + start, plen);
-        sha256(page, ps, hp);
-        hp += hashSize;
-    }
-
-    buf_init(out_cd);
-    buf_put(out_cd, cd, total);
-    free(cd);
-    return 0;
-}
-
-// ---- CMS / PKCS#7 SignedData over the CodeDirectory ----------------------
-static int build_cms(const unsigned char *cd, size_t cd_len,
+/// Build the detached CMS SignedData carrying the cert chain and the signature
+/// over the primary CodeDirectory.
+///
+/// Per zsign (`openssl.cpp::GenerateCMS`):
+///   * flags CMS_PARTIAL|CMS_DETACHED|CMS_NOSMIMECAP|CMS_BINARY
+///   * eContent is ABSENT (detached) — the content is the primary CD, attested
+///     to by the messageDigest signed attribute.
+///   * signed attributes: contentType, messageDigest, 1.2.840.113635.100.9.1
+///     (cdhashes plist) and 1.2.840.113635.100.9.2 (CDHashes2).
+///   * SignedData / SignerInfo version 3 (signedAttrs present).
+///
+/// `cd1` is the primary (SHA-1) CodeDirectory; `cd2` the alternate (SHA-256).
+/// On success `*out_cms` is the RAW CMS DER (the BLOBWRAPPER header is added by
+/// the SuperBlob assembler).
+static int build_cms(const unsigned char *cd1, size_t cd1_len,
+                     const unsigned char *cd2, size_t cd2_len,
                      SecKeyRef privKey,
                      unsigned char **certs, size_t *cert_lens, int n_certs,
                      const unsigned char *issuer, size_t issuer_len,
                      const unsigned char *serial, size_t serial_len,
-                     Buf *out_cms){
-    if (!privKey){ return -1; }          // caller must never pass NULL
-    unsigned char md[CC_SHA256_DIGEST_LENGTH];
-    sha256(cd, cd_len, md);
+                     RyBuf *out_cms) {
+    if (!privKey) return -1;
 
-    // signedAttrs — raw concatenation of attributes (no SET tag yet; the SET is
-    // used for the signature, and the [0] IMPLICIT form for embedding).
+    unsigned char cd1_sha1[20], cd1_sha256[32], cd2_sha256[32];
+    ry_sha1(cd1, cd1_len, cd1_sha1);
+    ry_sha256(cd1, cd1_len, cd1_sha256);
+    ry_sha256(cd2, cd2_len, cd2_sha256);
+
+    // Apple 1.2.840.113635.100.9.1 — cdhashes plist: one entry per CD, the
+    // 20-byte truncated hash. Primary uses SHA-1 directly; alternate uses
+    // SHA-256 truncated to 20 bytes (zsign dual-hash rule).
+    RyBuf plist;
+    RyBuf cdr1 = { (unsigned char *)cd1, cd1_len, cd1_len };
+    RyBuf cdr2 = { (unsigned char *)cd2, cd2_len, cd2_len };
+    if (ry_build_cdhashes_plist(&cdr1, &cdr2, &g_hash, &plist) != 0) return -1;
+
+    // Apple 1.2.840.113635.100.9.2 — CDHashes2. zsign builds this with
+    // GenerateASN1Type(hex(SHA256(CD2))):
+    //   SEQUENCE { OBJECT:sha256, OCTET STRING:<32 raw bytes of SHA-256(CD2)> }
+    // (the OCTET STRING carries the 32 raw hash bytes, not a hex string).
+    Buf cdh2; buf_init(&cdh2);
+    {
+        Buf inner; buf_init(&inner);
+        der_oid(&inner, OID_SHA256, sizeof(OID_SHA256));
+        Buf oct; buf_init(&oct);
+        buf_put(&oct, cd2_sha256, 32);
+        Buf octw; buf_init(&octw); der_octet(&octw, &oct);
+        buf_put(&inner, octw.p, octw.len);
+        der_seq(&cdh2, &inner);                 // cdh2 = SEQUENCE{ OID sha256, OCTET STRING 32 }
+        buf_free(&inner); buf_free(&oct); buf_free(&octw);
+    }
+
+    // ---- signed attributes ------------------------------------------------
     Buf sa; buf_init(&sa);
-    { Buf ct; buf_init(&ct); der_oid(&ct, OID_DATA, sizeof(OID_DATA));
-      Buf vals; buf_init(&vals); der_set(&vals, &ct);   // SET OF AttributeValue
-      Buf a1; buf_init(&a1); der_oid(&a1, OID_CTYPE, sizeof(OID_CTYPE));
-      buf_put(&a1, vals.p, vals.len);                   // SEQUENCE{ OID, SET{value} }
-      der_wrap(&sa, 0x30, &a1); buf_free(&ct); buf_free(&vals); buf_free(&a1); }
-    { Buf mdval; buf_init(&mdval); buf_put(&mdval, md, sizeof(md));
-      Buf mos; buf_init(&mos); der_octet(&mos, &mdval);  // OCTET STRING(digest)
-      Buf vals; buf_init(&vals); der_set(&vals, &mos);   // SET OF AttributeValue
-      Buf a2; buf_init(&a2); der_oid(&a2, OID_MSGDIGEST, sizeof(OID_MSGDIGEST));
-      buf_put(&a2, vals.p, vals.len);
-      der_wrap(&sa, 0x30, &a2); buf_free(&mdval); buf_free(&mos); buf_free(&vals); buf_free(&a2); }
+    {
+        Buf oid; buf_init(&oid); der_oid(&oid, OID_DATA, sizeof(OID_DATA));
+        Buf vals; buf_init(&vals); der_set(&vals, &oid);
+        Buf attr; buf_init(&attr); der_oid(&attr, OID_CTYPE, sizeof(OID_CTYPE));
+        buf_put(&attr, vals.p, vals.len); der_seq(&sa, &attr);
+        buf_free(&oid); buf_free(&vals); buf_free(&attr);
+    }
+    {
+        Buf mdv; buf_init(&mdv); buf_put(&mdv, cd1_sha256, 32);
+        Buf oct; buf_init(&oct); der_octet(&oct, &mdv);
+        Buf vals; buf_init(&vals); der_set(&vals, &oct);
+        Buf attr; buf_init(&attr); der_oid(&attr, OID_MSGDIGEST, sizeof(OID_MSGDIGEST));
+        buf_put(&attr, vals.p, vals.len); der_seq(&sa, &attr);
+        buf_free(&mdv); buf_free(&oct); buf_free(&vals); buf_free(&attr);
+    }
+    {
+        Buf plv; buf_init(&plv); buf_put(&plv, plist.p, plist.len);
+        Buf oct; buf_init(&oct); der_octet(&oct, &plv);
+        Buf vals; buf_init(&vals); der_set(&vals, &oct);
+        Buf attr; buf_init(&attr); der_oid(&attr, OID_APPLE_CDHASHES, sizeof(OID_APPLE_CDHASHES));
+        buf_put(&attr, vals.p, vals.len); der_seq(&sa, &attr);
+        buf_free(&plv); buf_free(&oct); buf_free(&vals); buf_free(&attr);
+    }
+    {
+        Buf vals; buf_init(&vals); der_set(&vals, &cdh2);
+        Buf attr; buf_init(&attr); der_oid(&attr, OID_APPLE_CDHASHES2, sizeof(OID_APPLE_CDHASHES2));
+        buf_put(&attr, vals.p, vals.len); der_seq(&sa, &attr);
+        buf_free(&vals); buf_free(&attr);
+    }
 
-    // signature over the DER SET OF Attributes (PKCS#7 rule)
+    // Choose the signature algorithm by key type (LiveContainer parity):
+    // RSA identities sign with PKCS#1 v1.5 SHA-256; EC identities sign with
+    // ECDSA X9.62 SHA-256. Hard-coding RSA here makes build_cms() return -1
+    // for EC certs — a silent second source of the "main exe sign failed"
+    // rc=6 the user hit. Defaulting to RSA when attributes are unavailable
+    // keeps the common (Apple RSA dev/dist cert) path exactly as before.
+    SecKeyAlgorithm signAlgo = kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256;
+    {
+        CFDictionaryRef kattrs = SecKeyCopyAttributes(privKey);
+        if (kattrs) {
+            CFStringRef kt = (CFStringRef)CFDictionaryGetValue(kattrs, kSecAttrKeyType);
+            if (kt && CFEqual(kt, kSecAttrKeyTypeECSECPrimeRandom))
+                signAlgo = kSecKeyAlgorithmECDSASignatureMessageX962SHA256;
+            CFRelease(kattrs);
+        }
+    }
+
+    // The signature is over the DER SET OF the attributes (CMS rule).
     Buf saSet; buf_init(&saSet); der_set(&saSet, &sa);
     CFDataRef sigData = NULL;
-    OSStatus st = SecKeyCreateSignature(privKey,
-        kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256,
+    OSStatus st = SecKeyCreateSignature(privKey, signAlgo,
         CFDataCreate(NULL, saSet.p, (CFIndex)saSet.len), &sigData);
-    if (st != errSecSuccess){ buf_free(&sa); buf_free(&saSet); return -1; }
+    if (st != errSecSuccess) {
+        buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
+        return -1;
+    }
 
+    // ---- SignerInfo (version 3) -------------------------------------------
     Buf si; buf_init(&si);
-    { unsigned char one[1] = {3}; der_int(&si, one, 1); } // version — 3 because signedAttrs are present
-    // issuerAndSerialNumber
+    { unsigned char one[1] = {3}; der_int(&si, one, 1); }
     { Buf iasn; buf_init(&iasn); buf_put(&iasn, issuer, issuer_len);
-      der_int(&iasn, serial, serial_len);
-      der_wrap(&si, 0x30, &iasn); buf_free(&iasn); }
-    // digestAlgorithm (SEQUENCE, not SET)
+      der_int(&iasn, serial, serial_len); der_wrap(&si, 0x30, &iasn); buf_free(&iasn); }
     { Buf da; buf_init(&da); der_oid(&da, OID_SHA256, sizeof(OID_SHA256));
-      Buf daSeq; buf_init(&daSeq); der_wrap(&daSeq, 0x30, &da);
-      der_wrap(&si, 0x30, &daSeq); buf_free(&da); buf_free(&daSeq); }
-    // signedAttrs [0] IMPLICIT
-    der_ctx0(&si, 0, &sa);
-    // signatureAlgorithm (sha256WithRSAEncryption)
+      Buf dseq; buf_init(&dseq); der_wrap(&dseq, 0x30, &da);
+      der_wrap(&si, 0x30, &dseq); buf_free(&da); buf_free(&dseq); }
+    der_ctx0(&si, &sa);                                       // signedAttrs [0]
     { Buf ra; buf_init(&ra); der_oid(&ra, OID_SHA256RSA, sizeof(OID_SHA256RSA));
-      Buf raSeq; buf_init(&raSeq); der_wrap(&raSeq, 0x30, &ra);
-      der_wrap(&si, 0x30, &raSeq); buf_free(&ra); buf_free(&raSeq); }
-    // signature
-    { Buf sigOct; buf_init(&sigOct); buf_put(&sigOct, CFDataGetBytePtr(sigData), (size_t)CFDataGetLength(sigData));
+      Buf rseq; buf_init(&rseq); der_wrap(&rseq, 0x30, &ra);
+      der_wrap(&si, 0x30, &rseq); buf_free(&ra); buf_free(&rseq); }
+    { Buf sigOct; buf_init(&sigOct);
+      buf_put(&sigOct, CFDataGetBytePtr(sigData), (size_t)CFDataGetLength(sigData));
       der_octet(&si, &sigOct); buf_free(&sigOct); }
     Buf signerInfo; buf_init(&signerInfo); der_wrap(&signerInfo, 0x30, &si);
 
-    // SignedData
+    // ---- SignedData (version 3) -------------------------------------------
     Buf sd; buf_init(&sd);
-    // Version 3: required because SignerInfo carries signedAttrs. AMFI/trust
-    // evaluation rejects a v1 SignedData that actually contains signedAttrs.
-    { unsigned char one[1]={3}; der_int(&sd, one, 1); }
-    // digestAlgorithms SET OF AlgorithmIdentifier
+    { unsigned char one[1] = {3}; der_int(&sd, one, 1); }
     { Buf da; buf_init(&da); der_oid(&da, OID_SHA256, sizeof(OID_SHA256));
-      Buf daSeq; buf_init(&daSeq); der_wrap(&daSeq, 0x30, &da);
-      Buf daSet; buf_init(&daSet); der_set(&daSet, &daSeq);
-      buf_put(&sd, daSet.p, daSet.len); buf_free(&da); buf_free(&daSeq); buf_free(&daSet); }
-    // encapContentInfo
+      Buf dseq; buf_init(&dseq); der_wrap(&dseq, 0x30, &da);
+      Buf dset; buf_init(&dset); der_set(&dset, &dseq);
+      buf_put(&sd, dset.p, dset.len); buf_free(&da); buf_free(&dseq); buf_free(&dset); }
     { Buf eci; buf_init(&eci); der_oid(&eci, OID_DATA, sizeof(OID_DATA));
-      der_octet_implicit0(&eci, cd, cd_len);
-      der_wrap(&sd, 0x30, &eci); buf_free(&eci); }
-    // certificates [0] IMPLICIT SET OF Certificate
-    if (n_certs>0){
-        Buf certsConcat; buf_init(&certsConcat);
-        for (int i=0;i<n_certs;i++) buf_put(&certsConcat, certs[i], cert_lens[i]);
-        der_ctx0(&sd, 0, &certsConcat);
-        buf_free(&certsConcat);
+      der_wrap(&sd, 0x30, &eci); buf_free(&eci); }    // detached: NO eContent
+    if (n_certs > 0) {
+        Buf cc; buf_init(&cc);
+        for (int i = 0; i < n_certs; i++) buf_put(&cc, certs[i], cert_lens[i]);
+        der_ctx0(&sd, &cc); buf_free(&cc);
     }
-    // signerInfos SET OF SignerInfo
-    { Buf siSet; buf_init(&siSet); der_set(&siSet, &signerInfo);
-      buf_put(&sd, siSet.p, siSet.len); buf_free(&siSet); }
+    { Buf sset; buf_init(&sset); der_set(&sset, &signerInfo);
+      buf_put(&sd, sset.p, sset.len); buf_free(&sset); }
 
     Buf signedData; buf_init(&signedData); der_wrap(&signedData, 0x30, &sd);
-    // ContentInfo
     Buf ci; buf_init(&ci); der_oid(&ci, OID_SIGNED, sizeof(OID_SIGNED));
-    der_ctx0(&ci, 0, &signedData);
+    der_ctx0(&ci, &signedData);
     Buf ciSeq; buf_init(&ciSeq); der_wrap(&ciSeq, 0x30, &ci);
-    buf_init(out_cms); buf_put(out_cms, ciSeq.p, ciSeq.len);
 
-    buf_free(&sa); buf_free(&saSet); buf_free(&si); buf_free(&signerInfo); buf_free(&sd);
+    ry_buf_init(out_cms);
+    ry_buf_put(out_cms, ciSeq.p, ciSeq.len);
+
+    buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
+    buf_free(&si); buf_free(&signerInfo); buf_free(&sd);
     buf_free(&signedData); buf_free(&ci); buf_free(&ciSeq);
     if (sigData) CFRelease(sigData);
     return 0;
 }
 
-// ---- SuperBlob assembly --------------------------------------------------
-static void make_blob(Buf *out, uint32_t magic, const unsigned char *data, size_t datalen){
-    buf_be32(out, OSSwapHostToBigInt32(magic));
-    buf_be32(out, OSSwapHostToBigInt32((uint32_t)(8 + datalen)));
-    buf_put(out, data, datalen);
-}
-static int build_superblob(const unsigned char *cd, size_t cd_len,
-                           const unsigned char *ent, size_t ent_len,
-                           const unsigned char *cms, size_t cms_len,
-                           Buf *out){
-    int has_ent = (ent && ent_len>0);
-    int n = has_ent ? 3 : 2;
-    Buf cd_blob; buf_init(&cd_blob); make_blob(&cd_blob, CSMAGIC_CODEDIRECTORY, cd, cd_len);
-    Buf ent_blob; buf_init(&ent_blob);
-    if (has_ent) make_blob(&ent_blob, CSMAGIC_EMBEDDED_ENTITLEMENTS, ent, ent_len);
-    Buf cms_blob; buf_init(&cms_blob); make_blob(&cms_blob, CSMAGIC_BLOBWRAPPER, cms, cms_len);
+// ---------------------------------------------------------------------------
+// Sign a single 64-bit Mach-O — zsign-style in-place overwrite
+// ---------------------------------------------------------------------------
 
-    size_t idx_size = 8 + (size_t)n*8;
-    size_t off_cd = idx_size;
-    size_t off_ent = off_cd + cd_blob.len;
-    size_t off_cms = off_ent + ent_blob.len;
-    size_t total = off_cms + cms_blob.len;
-
-    unsigned char *sb = malloc(total);
-    memset(sb, 0, total);
-    uint32_t *w = (uint32_t*)sb;
-    w[0] = OSSwapHostToBigInt32(CSMAGIC_EMBEDDED_SIGNATURE);
-    w[1] = OSSwapHostToBigInt32((uint32_t)total);
-    w[2] = OSSwapHostToBigInt32((uint32_t)n);
-    uint32_t *idx = w + 3;
-    int e = 0;
-    idx[e*2]   = OSSwapHostToBigInt32((uint32_t)CSSLOT_CODEDIRECTORY);
-    idx[e*2+1] = OSSwapHostToBigInt32((uint32_t)off_cd); e++;
-    if (has_ent){
-        idx[e*2]   = OSSwapHostToBigInt32((uint32_t)CSSLOT_ENTITLEMENTS);
-        idx[e*2+1] = OSSwapHostToBigInt32((uint32_t)off_ent); e++;
-    }
-    idx[e*2]   = OSSwapHostToBigInt32((uint32_t)CSSLOT_SIGNATURESLOT);
-    idx[e*2+1] = OSSwapHostToBigInt32((uint32_t)off_cms); e++;
-
-    memcpy(sb + off_cd, cd_blob.p, cd_blob.len);
-    if (has_ent) memcpy(sb + off_ent, ent_blob.p, ent_blob.len);
-    memcpy(sb + off_cms, cms_blob.p, cms_blob.len);
-
-    buf_init(out);
-    buf_put(out, sb, total);
-    free(sb); buf_free(&cd_blob); buf_free(&ent_blob); buf_free(&cms_blob);
-    return 0;
-}
-
-// ---- Sign a single 64-bit Mach-O (in-place buffer via double pointer) -----
 static int sign_slice(unsigned char **pbuf, size_t *len,
                       const char *ident, const char *team,
                       const unsigned char *infoplist, size_t info_len,
                       const unsigned char *ent, size_t ent_len,
+                      const unsigned char *code_resources, size_t cr_len,
                       SecKeyRef privKey,
                       unsigned char **certs, size_t *cert_lens, int n_certs,
                       const unsigned char *issuer, size_t issuer_len,
-                      const unsigned char *serial, size_t serial_len){
+                      const unsigned char *serial, size_t serial_len) {
     unsigned char *buf = *pbuf;
-    struct mach_header_64 *hdr = (struct mach_header_64*)buf;
-    if (hdr->magic != MH_MAGIC_64) return -1;
+    struct mach_header_64 *hdr = (struct mach_header_64 *)buf;
+    if (hdr->magic != MH_MAGIC_64) { return -1; }
 
-    size_t header_size = sizeof(struct mach_header_64);
-    uint32_t old_ncmds = hdr->ncmds;
-    uint32_t old_sizeofcmds = hdr->sizeofcmds;
-    size_t cmds_end = header_size + old_sizeofcmds;
-
-    // strip any pre-existing LC_CODE_SIGNATURE (re-signing safety) AND drop the
-    // orphaned superblob it pointed at. RyBox patches + re-signs on EVERY
-    // launch, so without the truncation each pass left one dead signature
-    // behind and the executable grew by ~16 bytes + one CMS blob per launch.
-    {
-        struct load_command *lc = (struct load_command*)(buf + header_size);
-        uint32_t n = old_ncmds;
-        for (uint32_t i=0;i<n;i++){
-            if (lc->cmd == LC_CODE_SIGNATURE){
-                struct linkedit_data_command *sig = (struct linkedit_data_command*)lc;
-                uint32_t soff = sig->dataoff, ssize = sig->datasize;
-                uint32_t csz = lc->cmdsize;
-                size_t rest = old_sizeofcmds - (((unsigned char*)lc - (buf+header_size)) + csz);
-                memmove(lc, (unsigned char*)lc + csz, rest);
-                old_ncmds--; old_sizeofcmds -= csz;
-                cmds_end = header_size + old_sizeofcmds;
-                hdr->ncmds = old_ncmds; hdr->sizeofcmds = old_sizeofcmds;
-                if (ssize > 0 && soff >= cmds_end && (size_t)soff + ssize <= *len){
-                    *len = soff;
-                }
-                break;
-            }
-            lc = (struct load_command*)((unsigned char*)lc + lc->cmdsize);
+    uint32_t ncmds = hdr->ncmds;
+    struct load_command *lc = (struct load_command *)(buf + sizeof(struct mach_header_64));
+    uint32_t sig_dataoff = 0, sig_datasize = 0;
+    struct linkedit_data_command *sig_lc = NULL;
+    struct segment_command_64 *linkedit = NULL;
+    struct segment_command_64 *textseg = NULL;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (lc->cmd == LC_CODE_SIGNATURE) {
+            sig_lc = (struct linkedit_data_command *)lc;
+            sig_dataoff = sig_lc->dataoff;
+            sig_datasize = sig_lc->datasize;
+        } else if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
+            else if (strcmp(seg->segname, "__TEXT") == 0) textseg = seg;
         }
+        lc = (struct load_command *)((unsigned char *)lc + lc->cmdsize);
+    }
+    if (!sig_lc) { fprintf(stderr, "rysign: missing LC_CODE_SIGNATURE\n"); return -2; }
+
+    // CodeDirectory hashes everything before the signature — zsign's m_uCodeLength.
+    uint64_t code_limit = (uint64_t)sig_dataoff;
+
+    RySignMeta meta; memset(&meta, 0, sizeof(meta));
+    meta.bundle_id = ident;
+    meta.team_id = (team && team[0]) ? team : NULL;
+    meta.subject_cn = g_subject_cn[0] ? g_subject_cn : NULL;
+    meta.info_plist = infoplist; meta.info_plist_len = info_len;
+    meta.code_resources = code_resources; meta.code_resources_len = cr_len;
+
+    RyBuf req;
+    if (ry_build_requirements(&meta, &req) != 0) return -3;
+    meta.requirements_blob = req.p; meta.requirements_blob_len = req.len;
+
+    // Entitlements blob (XML) WITH its native 8-byte header — what the special
+    // slot -5 hashes, and what the SuperBlob slot 5 wraps.
+    RyBuf ent_blob; ry_buf_init(&ent_blob);
+    if (ent && ent_len) {
+        ry_buf_be32(&ent_blob, RY_CSMAGIC_EMBEDDED_ENTITLEMENTS);
+        ry_buf_be32(&ent_blob, (uint32_t)(8 + ent_len));
+        ry_buf_put(&ent_blob, ent, ent_len);
+    }
+    meta.entitlements_blob = ent_blob.p; meta.entitlements_blob_len = ent_blob.len;
+    // The DER entitlements blob (slot 7) is intentionally omitted for a dylib
+    // guest — matching zsign's `IsExecute() ? … : ""`. AMFI falls back to slot
+    // 5 (XML), which we DO populate with the real profile entitlements.
+
+    // CodeDirectories: primary SHA-1 (cd1), alternate SHA-256 (cd2). is_execute
+    // = 0 (guest patched to MH_DYLIB → five special slots, no -7/-6);
+    // is_adhoc = 0 (real, in-place signature AMFI requires).
+    uint64_t exec_seg_limit = textseg ? (uint64_t)textseg->vmsize : 0;
+    uint64_t exec_seg_flags = 0;
+
+    RyBuf cd1, cd2;
+    if (ry_build_codedirectory(0, buf, code_limit, &meta, 0, 0,
+                               exec_seg_limit, exec_seg_flags, &g_hash, &cd1) != 0) {
+        ry_buf_free(&req); ry_buf_free(&ent_blob); return -4;
+    }
+    if (ry_build_codedirectory(1, buf, code_limit, &meta, 0, 0,
+                               exec_seg_limit, exec_seg_flags, &g_hash, &cd2) != 0) {
+        ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1); return -4;
     }
 
-    const size_t LC_SIZE = 16;
-    size_t new_code_limit = *len + LC_SIZE;
-
-    // Build new (unsigned) code region: header + old cmds + new LC + shifted data
-    unsigned char *nbuf = malloc(new_code_limit);
-    memcpy(nbuf, buf, header_size);
-    memcpy(nbuf + header_size, buf + header_size, old_sizeofcmds);
-    struct load_command *nlc = (struct load_command*)(nbuf + header_size + old_sizeofcmds);
-    nlc->cmd = LC_CODE_SIGNATURE;
-    nlc->cmdsize = (uint32_t)LC_SIZE;
-    ((struct linkedit_data_command*)nlc)->dataoff = (uint32_t)new_code_limit;
-    ((struct linkedit_data_command*)nlc)->datasize = 0;
-    memcpy(nbuf + header_size + old_sizeofcmds + LC_SIZE, buf + cmds_end, *len - cmds_end);
-
-    struct mach_header_64 *nh = (struct mach_header_64*)nbuf;
-    nh->ncmds = old_ncmds + 1;
-    nh->sizeofcmds = old_sizeofcmds + (uint32_t)LC_SIZE;
-
-    struct load_command *lc = (struct load_command*)(nbuf + header_size);
-    for (uint32_t i=0;i<nh->ncmds;i++){
-        if (lc->cmd == LC_SEGMENT_64){
-            struct segment_command_64 *seg = (struct segment_command_64*)lc;
-            if (seg->fileoff >= (uint64_t)cmds_end) seg->fileoff += LC_SIZE;
-            struct section_64 *sects = (struct section_64*)(seg + 1);
-            for (uint32_t s=0;s<seg->nsects;s++){
-                if (sects[s].offset >= (uint32_t)cmds_end) sects[s].offset += (uint32_t)LC_SIZE;
-            }
-        }
-        // EVERY other load command that stores a FILE offset has to move with
-        // the body. The old code only fixed LC_SEGMENT_64/section_64, which
-        // left these 16 bytes stale:
-        //
-        //   * LC_DYLD_CHAINED_FIXUPS.dataoff  -> dyld read the chained-fixups
-        //     blob from 16 bytes before the real one. On a modern Swift app
-        //     (Sileo, anything linked with the Xcode 15+ linker) that blob is
-        //     what every pointer rebind is derived from, so the guest came up
-        //     with a garbage bind table and never showed a window.
-        //   * LC_SYMTAB.symoff / stroff       -> symbol lookups resolve wrong.
-        //   * LC_DYLD_INFO(_ONLY).*_off       -> legacy rebase/bind tables.
-        //   * LC_FUNCTION_STARTS / LC_DATA_IN_CODE / LC_DYLD_EXPORTS_TRIE.
-        //   * LC_MAIN.entryoff                -> the guest's entry point, which
-        //     is exactly the address RyLaunchGuestExecutable jumps to. A stale
-        //     entryoff lands 16 bytes into the middle of some other function.
-        //
-        // A `codesign`-style signer never has this problem because it appends
-        // the LC_CODE_SIGNATURE command into the header's free space and the
-        // superblob at the end of the file instead of shifting the body.
-        else if (lc->cmd == LC_MAIN){
-            struct entry_point_command *ep = (struct entry_point_command*)lc;
-            if (ep->entryoff >= (uint64_t)cmds_end) ep->entryoff += LC_SIZE;
-        }
-        else if (lc->cmd == LC_SYMTAB){
-            struct symtab_command *st = (struct symtab_command*)lc;
-            if (st->symoff >= cmds_end) st->symoff += LC_SIZE;
-            if (st->stroff >= cmds_end) st->stroff += LC_SIZE;
-        }
-        else if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY){
-            struct dyld_info_command *di = (struct dyld_info_command*)lc;
-            if (di->rebase_off    && di->rebase_off    >= cmds_end) di->rebase_off    += LC_SIZE;
-            if (di->bind_off      && di->bind_off      >= cmds_end) di->bind_off      += LC_SIZE;
-            if (di->weak_bind_off && di->weak_bind_off >= cmds_end) di->weak_bind_off += LC_SIZE;
-            if (di->lazy_bind_off && di->lazy_bind_off >= cmds_end) di->lazy_bind_off += LC_SIZE;
-            if (di->export_off    && di->export_off    >= cmds_end) di->export_off    += LC_SIZE;
-        }
-        else if (lc->cmd == LC_CODE_SIGNATURE || lc->cmd == LC_FUNCTION_STARTS ||
-                 lc->cmd == LC_DATA_IN_CODE    || lc->cmd == LC_DYLD_CHAINED_FIXUPS ||
-                 lc->cmd == LC_DYLD_EXPORTS_TRIE){
-            struct linkedit_data_command *ld = (struct linkedit_data_command*)lc;
-            if (ld->dataoff >= cmds_end) ld->dataoff += LC_SIZE;
-        }
-        else if (lc->cmd == LC_ENCRYPTION_INFO || lc->cmd == LC_ENCRYPTION_INFO_64){
-            // FairPlay-encrypted binaries cannot be re-signed meaningfully; the
-            // import path is expected to reject them. Say so rather than
-            // silently producing a broken signature. The cryptoff field is a
-            // file offset too, so shift it with the body.
-            struct encryption_info_command *ei = (struct encryption_info_command*)lc;
-            if (ei->cryptoff >= cmds_end) ei->cryptoff += (uint32_t)LC_SIZE;
-            if (ei->cryptid != 0){
-                fprintf(stderr, "rysign: WARNING binary is FairPlay-encrypted "
-                                "(cryptid=%u); its signature will not validate\n", ei->cryptid);
-            }
-        }
-        else if (lc->cmd == LC_LINKER_OPTIMIZATION_HINT || lc->cmd == LC_DYLIB_CODE_SIGN_DRS
-                 || lc->cmd == LC_SEGMENT_SPLIT_INFO){
-            // These modern load commands carry a `dataoff` file offset that must
-            // move with the body when the LC_CODE_SIGNATURE command is inserted.
-            // Missing them (Sileo, any binary linked by Xcode 14+) produced a
-            // corrupt binary whose chained-fixups / split-info blob was read 16
-            // bytes out of place — dyld rejected it and the guest never launched.
-            struct linkedit_data_command *ld = (struct linkedit_data_command*)lc;
-            if (ld->dataoff >= cmds_end) ld->dataoff += LC_SIZE;
-        }
-        lc = (struct load_command*)((unsigned char*)lc + lc->cmdsize);
+    RyBuf cms;
+    if (build_cms(cd1.p, cd1.len, cd2.p, cd2.len, privKey, certs, cert_lens, n_certs,
+                  issuer, issuer_len, serial, &cms) != 0) {
+        fprintf(stderr, "rysign: build_cms failed\n");
+        ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1); ry_buf_free(&cd2);
+        return -5;
     }
 
-    // signature over the new code region
-    Buf cd; if (build_codedirectory(nbuf, new_code_limit, ident, team, infoplist, info_len, ent, ent_len, &cd)!=0){ free(nbuf); return -2; }
-    Buf cms; if (build_cms(cd.p, cd.len, privKey, certs, cert_lens, n_certs, issuer, issuer_len, serial, serial_len, &cms)!=0){ buf_free(&cd); free(nbuf); return -3; }
-    Buf ent_blob; buf_init(&ent_blob); if (ent && ent_len) buf_put(&ent_blob, ent, ent_len);
-    Buf sb; if (build_superblob(cd.p, cd.len, ent_blob.p, ent_blob.len, cms.p, cms.len, &sb)!=0){ buf_free(&cd); buf_free(&cms); buf_free(&ent_blob); free(nbuf); return -4; }
+    RyBuf sb;
+    if (ry_build_superblob(&cd1, &req, ent_blob.len ? &ent_blob : NULL, NULL,
+                           &cd2, &cms, &sb) != 0) {
+        ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+        ry_buf_free(&cd2); ry_buf_free(&cms); return -6;
+    }
 
-    ((struct linkedit_data_command*)nlc)->datasize = (uint32_t)sb.len;
+    // Write in place at dataoff; grow the file tail only if the new blob is
+    // larger than the old signature region (zsign parity).
+    size_t avail = (*len) - (size_t)sig_dataoff;
+    if (sb.len <= avail) {
+        memcpy(buf + sig_dataoff, sb.p, sb.len);
+        if (avail > sb.len) memset(buf + sig_dataoff + sb.len, 0, avail - sb.len);
+        sig_lc->datasize = (uint32_t)sb.len;
+    } else {
+        size_t new_len = (size_t)sig_dataoff + sb.len;
+        if (linkedit) {
+            linkedit->filesize = (uint64_t)new_len - linkedit->fileoff;
+            uint64_t new_vmsize = (linkedit->filesize + 0xFFFULL) & ~(uint64_t)0xFFFULL;
+            if (new_vmsize > linkedit->vmsize) linkedit->vmsize = new_vmsize;
+        }
+        sig_lc->datasize = (uint32_t)sb.len;
+        unsigned char *nb = (unsigned char *)realloc(buf, new_len);
+        if (!nb) {
+            ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+            ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
+            return -7;
+        }
+        memset(nb + *len, 0, new_len - *len);
+        memcpy(nb + sig_dataoff, sb.p, sb.len);
+        *pbuf = nb; *len = new_len;
+    }
 
-    size_t final_len = new_code_limit + sb.len;
-    unsigned char *final = malloc(final_len);
-    memcpy(final, nbuf, new_code_limit);
-    memcpy(final + new_code_limit, sb.p, sb.len);
-
-    free(nbuf); buf_free(&cd); buf_free(&cms); buf_free(&ent_blob); buf_free(&sb);
-    free(buf);
-    *pbuf = final; *len = final_len;
+    ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+    ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
     return 0;
 }
 
-// ---- Sign a whole file (fat or single) -----------------------------------
-// Takes the leaf CERTIFICATE (not a SecIdentity) so the caller may have built
-// it either from SecPKCS12Import or from RyBox's own PKCS#12 decoder — the
-// signing path does not care where the cert came from.
-static int sign_macho_file_at(const char *path, SecCertificateRef leaf, SecKeyRef privKey,
+// ---------------------------------------------------------------------------
+// Sign a whole Mach-O file (single 64-bit slice)
+// ---------------------------------------------------------------------------
+static int sign_macho_file_at(const char *path, const char *bundlePath,
+                              SecCertificateRef leaf, SecKeyRef privKey,
                               const char *team, const char *ident,
-                              const unsigned char *ent, size_t ent_len){
+                              const unsigned char *ent, size_t ent_len) {
     size_t len; unsigned char *buf = read_file(path, &len);
     if (!buf) return -1;
 
-    uint32_t magic = *(uint32_t*)buf;
+    uint32_t magic = *(uint32_t *)buf;
+    if (magic != MH_MAGIC_64) { free(buf); return -9; }
 
-    if (magic == MH_MAGIC_64){
-        Buf issuer; Buf serial; buf_init(&issuer); buf_init(&serial);
-        unsigned char **certs=NULL; size_t *clens=NULL; int nc=0;
-        if (leaf){
-            CFDataRef ld = SecCertificateCopyData(leaf);
-            const unsigned char *ldp = CFDataGetBytePtr(ld); size_t ldl = (size_t)CFDataGetLength(ld);
-            parse_cert_ids(ldp, ldl, &issuer, &serial);
-            certs = malloc(sizeof(void*)); clens = malloc(sizeof(size_t));
-            certs[0] = (unsigned char*)ldp; clens[0] = ldl; nc = 1;
-            unsigned char **pc=NULL; size_t *pl=NULL; int pn=0;
-            if (extract_profile_certs(g_prov, g_prov_len, &pc, &pl, &pn)==0){
-                certs = realloc(certs, sizeof(void*)*(1+pn));
-                clens = realloc(clens, sizeof(size_t)*(1+pn));
-                for (int i=0;i<pn;i++){ certs[1+i]=pc[i]; clens[1+i]=pl[i]; }
-                nc = 1+pn;
+    Buf issuer; Buf serial; buf_init(&issuer); buf_init(&serial);
+    unsigned char **certs = NULL; size_t *cert_lens = NULL; int nc = 0;
+    if (leaf) {
+        CFDataRef ld = SecCertificateCopyData(leaf);
+        const unsigned char *ldp = CFDataGetBytePtr(ld);
+        size_t ldl = (size_t)CFDataGetLength(ld);
+        parse_cert_ids(ldp, ldl, &issuer, &serial);
+        certs = malloc(sizeof(void *));
+        cert_lens = malloc(sizeof(size_t));
+        certs[0] = (unsigned char *)ldp; cert_lens[0] = ldl; nc = 1;
+        if (g_extra_certs_n > 0) {
+            certs = realloc(certs, sizeof(void *) * (nc + g_extra_certs_n));
+            cert_lens = realloc(cert_lens, sizeof(size_t) * (nc + g_extra_certs_n));
+            for (int i = 0; i < g_extra_certs_n; i++) {
+                certs[nc + i] = g_extra_certs[i]; cert_lens[nc + i] = g_extra_certs_lens[i];
             }
-            if (g_extra_certs_n > 0){
-                certs = realloc(certs, sizeof(void*)*(nc + g_extra_certs_n));
-                clens = realloc(clens, sizeof(size_t)*(nc + g_extra_certs_n));
-                for (int i=0;i<g_extra_certs_n;i++){ certs[nc+i]=g_extra_certs[i]; clens[nc+i]=g_extra_certs_lens[i]; }
-                nc += g_extra_certs_n;
-            }
-            int rc = sign_slice(&buf, &len, ident, team, NULL, 0, ent, ent_len,
-                                privKey, certs, clens, nc, issuer.p, issuer.len, serial.p, serial.len);
-        fprintf(stderr, "rysign: sign_slice(main) rc=%d magic=%08x leaf=%d\n", rc, magic, (leaf!=NULL));
-        if (rc==0){
-            write_file(path, buf, len);
-            // buf now points to the signed (final) data; intentionally not freed (one-shot)
-        } else {
-            free(buf);   // on failure sign_slice leaves the original buffer intact
+            nc += g_extra_certs_n;
         }
         if (ld) CFRelease(ld);
-        return rc;
-        } else {
-            free(buf);
-            return -2;
-        }
-    } else if (magic == FAT_MAGIC || magic == FAT_CIGAM){
-        int swap = (magic == FAT_CIGAM);
-        struct fat_header *fh = (struct fat_header*)buf;
-        uint32_t n = swap ? OSSwapInt32(fh->nfat_arch) : fh->nfat_arch;
-        typedef struct { unsigned char *b; size_t len; uint32_t cputype, cpusub; int signedd; } Slice;
-        Slice *slices = calloc(n, sizeof(Slice));
-        struct fat_arch *arch = (struct fat_arch*)(fh+1);
-        for (uint32_t i=0;i<n;i++){
-            struct fat_arch a = arch[i];
-            if (swap){ a.cputype=OSSwapInt32(a.cputype); a.cpusubtype=OSSwapInt32(a.cpusubtype); a.offset=OSSwapInt32(a.offset); a.size=OSSwapInt32(a.size); }
-            slices[i].cputype=a.cputype; slices[i].cpusub=a.cpusubtype;
-            if (a.cputype==CPU_TYPE_ARM64){
-                unsigned char *sb = malloc(a.size);
-                memcpy(sb, buf+a.offset, a.size);
-                size_t sl = a.size;
-                Buf issuer; Buf serial; buf_init(&issuer); buf_init(&serial);
-                unsigned char **certs=NULL; size_t *clens=NULL; int nc=0;
-                if (leaf){
-                    CFDataRef ld=SecCertificateCopyData(leaf); const unsigned char*ldp=CFDataGetBytePtr(ld); size_t ldl=CFDataGetLength(ld);
-                    parse_cert_ids(ldp,ldl,&issuer,&serial);
-                    certs=malloc(sizeof(void*)); clens=malloc(sizeof(size_t)); certs[0]=(unsigned char*)ldp; clens[0]=ldl; nc=1;
-                    unsigned char **pc=NULL; size_t *pl=NULL; int pn=0;
-                    if (extract_profile_certs(g_prov,g_prov_len,&pc,&pl,&pn)==0){ certs=realloc(certs,sizeof(void*)*(1+pn)); clens=realloc(clens,sizeof(size_t)*(1+pn)); for(int j=0;j<pn;j++){certs[1+j]=pc[j];clens[1+j]=pl[j];} nc=1+pn; } if (g_extra_certs_n>0){ certs=realloc(certs,sizeof(void*)*(nc+g_extra_certs_n)); clens=realloc(clens,sizeof(size_t)*(nc+g_extra_certs_n)); for(int j=0;j<g_extra_certs_n;j++){certs[nc+j]=g_extra_certs[j];clens[nc+j]=g_extra_certs_lens[j];} nc+=g_extra_certs_n; }
-                    sign_slice(&sb, &sl, ident, team, NULL, 0, ent, ent_len, privKey, certs, clens, nc, issuer.p, issuer.len, serial.p, serial.len);
-                    if (ld) CFRelease(ld);
-                }
-                slices[i].b=sb; slices[i].len=sl; slices[i].signedd=1;
-            } else {
-                slices[i].b = malloc(a.size); memcpy(slices[i].b, buf+a.offset, a.size); slices[i].len=a.size;
-            }
-        }
-        size_t align = 0x4000;
-        size_t head = sizeof(struct fat_header) + n*sizeof(struct fat_arch);
-        size_t cur = (head + align - 1) & ~(align-1);
-        size_t totalsize = cur;
-        for (uint32_t i=0;i<n;i++){ totalsize = (totalsize + slices[i].len + align -1) & ~(align-1); }
-        unsigned char *nf = malloc(totalsize);
-        memset(nf, 0, totalsize);
-        struct fat_header *nfh = (struct fat_header*)nf;
-        nfh->magic = OSSwapHostToBigInt32(FAT_MAGIC);
-        nfh->nfat_arch = OSSwapHostToBigInt32(n);
-        struct fat_arch *na = (struct fat_arch*)(nfh+1);
-        cur = (head + align -1) & ~(align-1);
-        for (uint32_t i=0;i<n;i++){
-            na[i].cputype = OSSwapHostToBigInt32(slices[i].cputype);
-            na[i].cpusubtype = OSSwapHostToBigInt32(slices[i].cpusub);
-            na[i].offset = OSSwapHostToBigInt32((uint32_t)cur);
-            na[i].size = OSSwapHostToBigInt32((uint32_t)slices[i].len);
-            na[i].align = OSSwapHostToBigInt32(14);
-            memcpy(nf+cur, slices[i].b, slices[i].len);
-            cur = (cur + slices[i].len + align - 1) & ~(align-1);
-        }
-        write_file(path, nf, totalsize);
-        for (uint32_t i=0;i<n;i++) free(slices[i].b);
-        free(slices); free(nf); free(buf);
-        return 0;
     }
+
+    unsigned char *info = NULL; size_t info_len = 0;
+    if (g_info_plist && g_info_plist_len) {
+        info = g_info_plist; info_len = g_info_plist_len;
+    } else if (bundlePath) {
+        char ip[2048]; snprintf(ip, sizeof(ip), "%s/Info.plist", bundlePath);
+        info = read_file(ip, &info_len);
+    }
+    unsigned char *cr = NULL; size_t cr_len = 0;
+    if (bundlePath) {
+        char crp[2048]; snprintf(crp, sizeof(crp), "%s/_CodeSignature/CodeResources", bundlePath);
+        cr = read_file(crp, &cr_len);
+    }
+
+    int rc = sign_slice(&buf, &len, ident, team, info, info_len, ent, ent_len,
+                        cr, cr_len, privKey, certs, cert_lens, nc,
+                        issuer.p, issuer.len, serial.p, serial.len);
+
+    if (rc == 0) write_file(path, buf, len);
+    else fprintf(stderr, "rysign: sign_slice '%s' rc=%d\n", path, rc);
+
     free(buf);
-    return -9;
+    if (certs) free(certs);
+    if (cert_lens) free(cert_lens);
+    if (info != g_info_plist && info) free(info);
+    if (cr) free(cr);
+    return rc;
 }
 
-// ---- Recursively sign every Mach-O under a directory ----------------------
-static int is_macho_at(const char *path){
-    size_t n; unsigned char *b = read_file(path, &n);
-    if (!b) return 0;
-    int r = 0;
-    if (n >= 4){
-        uint32_t m = *(uint32_t*)b;
-        if (m==MH_MAGIC_64 || m==FAT_MAGIC || m==FAT_CIGAM) r = 1;
-    }
-    free(b);
-    return r;
-}
+// ---------------------------------------------------------------------------
+// Recursively sign every Mach-O under a directory
+// ---------------------------------------------------------------------------
 static void sign_walk(const char *dir, SecCertificateRef leaf, SecKeyRef privKey,
                       const char *team, const char *ident,
-                      const unsigned char *ent, size_t ent_len){
+                      const unsigned char *ent, size_t ent_len) {
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *de;
-    while ((de = readdir(d)) != NULL){
-        if (de->d_name[0]=='.') continue;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
         char path[2048];
         snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
         struct stat st;
-        if (stat(path, &st)!=0) continue;
-        if (S_ISDIR(st.st_mode)){
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
             sign_walk(path, leaf, privKey, team, ident, ent, ent_len);
-        } else if (S_ISREG(st.st_mode)){
-            if (is_macho_at(path)){
-                sign_macho_file_at(path, leaf, privKey, team, ident, ent, ent_len);
-            }
+        } else if (S_ISREG(st.st_mode)) {
+            size_t n; unsigned char *b = read_file(path, &n);
+            if (!b) continue;
+            int is_macho = (n >= 4) &&
+                (*(uint32_t *)b == MH_MAGIC_64 || *(uint32_t *)b == FAT_MAGIC ||
+                 *(uint32_t *)b == FAT_CIGAM);
+            free(b);
+            if (is_macho) sign_macho_file_at(path, NULL, leaf, privKey, team, ident, ent, ent_len);
         }
     }
     closedir(d);
 }
 
-// ---- Shared bundle-signing body (identity already in hand) ----------------
-// Returns 0 on success. Exit-code convention:
-//   5  main executable not found
-//   6  signing the main executable failed
-static int sign_bundle_with_leaf_key(const char *bundlePath,
-                                     SecCertificateRef leaf, SecKeyRef privKey,
-                                     const char *provPath,
-                                     const char *entitlementsPath){
-    // 2. Provisioning profile
-    size_t provlen; unsigned char *prov = read_file(provPath, &provlen);
-    if (!prov){ fprintf(stderr, "rysign: cannot read provisioning\n"); return 4; }
-    g_prov = prov; g_prov_len = provlen;
-
-    // team id
-    char team[64] = {0};
-    {
-        char *text = malloc(provlen+1);
-        for (size_t i=0;i<provlen;i++) text[i]=(char)prov[i]; text[provlen]=0;
-        char *ti = strstr(text, "TeamIdentifier");
-        if (ti){
-            char *arr = strstr(ti, "<array");
-            char *sa = arr ? strstr(arr, "<string") : NULL;
-            if (sa){
-                char *se = strstr(sa, "</string>");
-                if (se){ size_t l = (size_t)(se - (sa+8)); if (l < sizeof(team)){ memcpy(team, sa+8, l); team[l]=0; } }
-            }
-        }
-        free(text);
-    }
-
-    // 3. entitlements (explicit file preferred, else from profile)
-    unsigned char *ent = NULL; size_t ent_len = 0;
-    if (entitlementsPath && access(entitlementsPath, F_OK)==0){
-        ent = read_file(entitlementsPath, &ent_len);
-    }
-    if (!ent){
-        ent = extract_profile_entitlements(prov, provlen, &ent_len);
-    }
-
-    // 4. main executable + bundle id from Info.plist
-    char exe_path[2048];
-    snprintf(exe_path, sizeof(exe_path), "%s/Info.plist", bundlePath);
-    unsigned char *info = NULL; size_t info_len = 0;
-    info = read_file(exe_path, &info_len);
-    char bid[256]={0};
-    if (info){
-        char *t = malloc(info_len+1); for(size_t i=0;i<info_len;i++) t[i]=(char)info[i]; t[info_len]=0;
-        char *fe = strstr(t, "CFBundleExecutable");
-        if (fe){ char *s=strstr(fe,"<string"); if(s){ char *e=strstr(s+7,"</string>"); if(e){ size_t l=(size_t)(e-(s+7)); char exen[1024]={0}; if(l<1024){memcpy(exen,s+7,l);} snprintf(exe_path,sizeof(exe_path),"%s/%s",bundlePath,exen); } } }
-        char *bi = strstr(t, "CFBundleIdentifier");
-        if (bi){ char *s=strstr(bi,"<string"); if(s){ char *e=strstr(s+7,"</string>"); if(e){ size_t l=(size_t)(e-(s+7)); if(l<256){memcpy(bid,s+7,l);} } } }
-        free(t); free(info);
-    }
-    if (access(exe_path, F_OK)!=0){
-        fprintf(stderr, "rysign: cannot locate main executable in bundle\n");
-        free(prov); if(ent)free(ent);
-        return 5;
-    }
-    // LiveContainer parity: the CodeDirectory identifier is the HOST app's
-    // bundle id (the identity the provisioning profile authorises). Fall back
-    // to the guest's own CFBundleIdentifier when Swift never set an override.
-    const char *ident = (g_ident_override && g_ident_override[0]) ? g_ident_override : bid;
-    int rc = sign_macho_file_at(exe_path, leaf, privKey, team, ident, ent, ent_len);
-    if (rc != 0){
-        fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc);
-        free(prov); if(ent)free(ent);
-        // -3 from sign_slice means the RSA signature over the CodeDirectory
-        // could not be produced — i.e. SecKeyCreateSignature refused the key.
-        return (rc == -3) ? 9 : 6;
-    }
-
-    // 5. sign frameworks / plugins dylibs
-    const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };
-    for (int s=0;s<3;s++){
-        char d[2048]; snprintf(d,sizeof(d),"%s/%s",bundlePath,subdirs[s]);
-        sign_walk(d, leaf, privKey, team, ident, ent, ent_len);
-    }
-
-    // 6. embed provisioning profile (AMFI requires profile to match signature)
-    char emb[2048]; snprintf(emb,sizeof(emb),"%s/embedded.mobileprovision",bundlePath);
-    write_file(emb, prov, provlen);
-
-    free(prov); if(ent)free(ent);
-    return 0;
-}
-
-// ---- Explicit trust-chain certificates (set by Swift) --------------------
-// A `.mobileprovision` is a CMS-wrapped *binary* plist — the in-C profile
-// parser (which greps for `<dict>`/`<array>` byte strings) can never read it,
-// so `extract_profile_certs` returns nothing and the CMS used to ship with only
-// the leaf certificate. AMFI then cannot build a chain to a trusted root and
-// rejects the guest. Swift now decodes the profile properly and hands the whole
-// chain here; `sign_macho_file_at` appends it after the leaf.
-// (The globals are declared near the top of this file.)
-
-void rysign_set_extra_certs(unsigned char **c, size_t *l, int n) {
-    if (g_extra_certs) { for (int i=0;i<g_extra_certs_n;i++) free(g_extra_certs[i]); free(g_extra_certs); }
-    if (g_extra_certs_lens) free(g_extra_certs_lens);
-    g_extra_certs = c; g_extra_certs_lens = l; g_extra_certs_n = n;
-}
-
-/// Read every `*.der` in `dir` (sorted by name) into a malloc'd cert array.
-static int read_certs_dir(const char *dir, unsigned char ***out, size_t **outl, int *outn) {
-    DIR *d = opendir(dir); if (!d) return -1;
-    char **names = NULL; int n = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        size_t len = strlen(de->d_name);
-        if (len < 4 || strcmp(de->d_name + len - 4, ".der") != 0) continue;
-        names = realloc(names, sizeof(char*) * (n + 1));
-        names[n++] = strdup(de->d_name);
-    }
-    closedir(d);
-    for (int i = 1; i < n; i++)
-        for (int j = i; j > 0 && strcmp(names[j-1], names[j]) > 0; j--) {
-            char *t = names[j-1]; names[j-1] = names[j]; names[j] = t;
-        }
-    unsigned char **certs = n ? malloc(sizeof(void*) * n) : NULL;
-    size_t *lens = n ? malloc(sizeof(size_t) * n) : NULL;
-    for (int i = 0; i < n; i++) {
-        char path[2048]; snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
-        size_t l = 0; unsigned char *b = read_file(path, &l);
-        certs[i] = b; lens[i] = l;
-        free(names[i]);
-    }
-    free(names);
-    *out = certs; *outl = lens; *outn = n;
-    return 0;
-}
-
-// ---- Robust bundle signing: all material pre-decoded by Swift -------------
-// Swift decodes the provisioning profile with `CMSDecoder` + `PropertyList-
-// Serialization` (which handles the binary plist), then passes the team id,
-// the entitlements plist, and the full certificate chain. This module no
-// longer parses the profile at all — it only embeds it.
-//
-// Exit codes mirror `sign_bundle_with_leaf_key`:
-//   5  main executable not found
-//   6  signing the main executable failed
-//   7  cert/key DER unusable
-//   8  private key could not be created
+// ---------------------------------------------------------------------------
+// Shared bundle-signing body (identity already in hand)
+// ---------------------------------------------------------------------------
+// Exit codes: 5 main executable not found · 6 signing the main executable failed
 static int sign_bundle_core(const char *bundlePath,
                             SecCertificateRef leaf, SecKeyRef privKey,
                             const char *team,
                             const unsigned char *ent, size_t ent_len,
                             const char *provPath) {
-    // Provisioning profile — embedded only (AMFI requires it to match).
     size_t provlen; unsigned char *prov = read_file(provPath, &provlen);
     if (!prov) { fprintf(stderr, "rysign: cannot read provisioning\n"); return 4; }
     g_prov = prov; g_prov_len = provlen;
 
-    // main executable + bundle id from Info.plist (host id comes from the
-    // CodeDirectory-identifier override set by Swift).
-    char exe_path[2048];
-    snprintf(exe_path, sizeof(exe_path), "%s/Info.plist", bundlePath);
-    unsigned char *info = NULL; size_t info_len = 0;
-    info = read_file(exe_path, &info_len);
-    char bid[256] = {0};
-    if (info) {
-        char *t = malloc(info_len + 1); for (size_t i=0;i<info_len;i++) t[i]=(char)info[i]; t[info_len]=0;
-        char *fe = strstr(t, "CFBundleExecutable");
-        if (fe) { char *s=strstr(fe,"<string"); if(s){ char *e=strstr(s+7,"</string>"); if(e){ size_t l=(size_t)(e-(s+7)); char exen[1024]={0}; if(l<1024){memcpy(exen,s+7,l);} snprintf(exe_path,sizeof(exe_path),"%s/%s",bundlePath,exen); } } }
-        char *bi = strstr(t, "CFBundleIdentifier");
-        if (bi) { char *s=strstr(bi,"<string"); if(s){ char *e=strstr(s+7,"</string>"); if(e){ size_t l=(size_t)(e-(s+7)); if(l<256){memcpy(bid,s+7,l);} } } }
-        free(t); free(info);
+    if (leaf) {
+        if (read_subject_cn(leaf, g_subject_cn, sizeof(g_subject_cn)) != 0)
+            g_subject_cn[0] = 0;
     }
+
+    // main executable + bundle id from Info.plist (CoreFoundation parses BOTH
+    // XML and binary plists — this is what fixes the old rc=6 on Sileo, whose
+    // Info.plist is `bplist00`).
+    char exe_path[2048];
+    char exe_name[1024] = {0};
+    char bid[256] = {0};
+    {
+        char ip[2048]; snprintf(ip, sizeof(ip), "%s/Info.plist", bundlePath);
+        size_t il; unsigned char *info = read_file(ip, &il);
+        if (info) {
+            CFDataRef d = CFDataCreate(NULL, info, (CFIndex)il);
+            CFPropertyListRef plist =
+                CFPropertyListCreateWithData(NULL, d, kCFPropertyListImmutable, NULL, NULL);
+            if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+                CFDictionaryRef dict = (CFDictionaryRef)plist;
+                CFStringRef v;
+                if ((v = CFDictionaryGetValue(dict, CFSTR("CFBundleExecutable"))))
+                    CFStringGetCString(v, exe_name, sizeof(exe_name), kCFStringEncodingUTF8);
+                if ((v = CFDictionaryGetValue(dict, CFSTR("CFBundleIdentifier"))))
+                    CFStringGetCString(v, bid, sizeof(bid), kCFStringEncodingUTF8);
+            }
+            if (plist) CFRelease(plist);
+            CFRelease(d);
+            free(info);
+        }
+    }
+    if (g_exe_name[0]) snprintf(exe_path, sizeof(exe_path), "%s/%s", bundlePath, g_exe_name);
+    else snprintf(exe_path, sizeof(exe_path), "%s/%s", bundlePath, exe_name);
+
     if (access(exe_path, F_OK) != 0) {
         fprintf(stderr, "rysign: cannot locate main executable in bundle\n");
-        free(prov); if(ent)free(ent);
+        free(prov); if (ent) free((void *)ent);
         return 5;
     }
     const char *ident = (g_ident_override && g_ident_override[0]) ? g_ident_override : bid;
     fprintf(stderr, "rysign: signing '%s' team='%s' ident='%s' hasEnt=%d\n",
-            exe_path, team ? team : "", ident, (ent && ent_len>0)?1:0);
-    int rc = sign_macho_file_at(exe_path, leaf, privKey, team, ident, ent, ent_len);
+            exe_path, team ? team : "", ident, (ent && ent_len > 0) ? 1 : 0);
+
+    int rc = sign_macho_file_at(exe_path, bundlePath, leaf, privKey, team, ident, ent, ent_len);
     if (rc != 0) {
         fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc);
-        free(prov); if(ent)free(ent);
-        return (rc == -3) ? 9 : 6;
+        free(prov); if (ent) free((void *)ent);
+        return 6;
     }
 
-    // sign frameworks / plugins dylibs
     const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };
-    for (int s=0;s<3;s++) {
-        char d[2048]; snprintf(d,sizeof(d),"%s/%s",bundlePath,subdirs[s]);
-        sign_walk(d, leaf, privKey, team, ident, ent, ent_len);
+    for (int s = 0; s < 3; s++) {
+        char dd[2048]; snprintf(dd, sizeof(dd), "%s/%s", bundlePath, subdirs[s]);
+        sign_walk(dd, leaf, privKey, team, ident, ent, ent_len);
     }
 
-    // embed provisioning profile
-    char emb[2048]; snprintf(emb,sizeof(emb),"%s/embedded.mobileprovision",bundlePath);
+    char emb[2048]; snprintf(emb, sizeof(emb), "%s/embedded.mobileprovision", bundlePath);
     write_file(emb, prov, provlen);
 
-    free(prov); if(ent)free(ent);
+    free(prov); if (ent) free((void *)ent);
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Robust bundle signing: all material pre-decoded by Swift
+// ---------------------------------------------------------------------------
+// Exit codes mirror sign_bundle_core: 4 prov · 5 no exe · 6 sign failed
+//   7 cert/key DER unusable · 8 private key could not be created
 int rysign_sign_bundle_robust(const char *bundlePath,
                               const char *leafCertDerPath,
                               const char *keyDerPath,
@@ -1055,12 +771,22 @@ int rysign_sign_bundle_robust(const char *bundlePath,
     CFDictionarySetValue(attrs, kSecAttrKeyType,
                          keyIsEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA);
     if (!keyIsEC) {
-        int bits = pkcs1_modulus_bits(kd, klen);
+        int bits = 0;
+        Cur c; c.p = kd; c.len = klen; c.pos = 0;
+        unsigned char tag; const unsigned char *content; size_t clen2;
+        if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x30) { }
+        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
+        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
+        else {
+            const unsigned char *m = content; size_t n = clen2;
+            while (n > 1 && m[0] == 0) { m++; n--; }
+            bits = (int)(n * 8);
+        }
         if (bits > 0) {
             int bitsRef = bits;
-            CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
-            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, n);
-            if (n) CFRelease(n);
+            CFNumberRef num = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
+            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, num);
+            if (num) CFRelease(num);
         }
     }
     CFErrorRef keyErr = NULL;
@@ -1074,12 +800,34 @@ int rysign_sign_bundle_robust(const char *bundlePath,
         return 8;
     }
 
-    // Trust chain (intermediate + root) handed in by Swift.
     unsigned char **extra = NULL; size_t *extra_lens = NULL; int extra_n = 0;
-    if (certsDir) read_certs_dir(certsDir, &extra, &extra_lens, &extra_n);
+    if (certsDir) {
+        DIR *d = opendir(certsDir);
+        if (d) {
+            char **names = NULL; int nn = 0; struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                size_t l = strlen(de->d_name);
+                if (l < 4 || strcmp(de->d_name + l - 4, ".der") != 0) continue;
+                names = realloc(names, sizeof(char *) * (nn + 1));
+                names[nn++] = strdup(de->d_name);
+            }
+            closedir(d);
+            for (int i = 1; i < nn; i++)
+                for (int j = i; j > 0 && strcmp(names[j-1], names[j]) > 0; j--) {
+                    char *t = names[j-1]; names[j-1] = names[j]; names[j] = t;
+                }
+            if (nn) { extra = malloc(sizeof(void *) * nn); extra_lens = malloc(sizeof(size_t) * nn); }
+            for (int i = 0; i < nn; i++) {
+                char p[2048]; snprintf(p, sizeof(p), "%s/%s", certsDir, names[i]);
+                size_t l = 0; unsigned char *b = read_file(p, &l);
+                extra[i] = b; extra_lens[i] = l; free(names[i]);
+            }
+            if (names) free(names);
+        }
+    }
     rysign_set_extra_certs(extra, extra_lens, extra_n);
 
-    // Entitlements — explicit plist file preferred; the caller always supplies it.
     unsigned char *ent = NULL; size_t ent_len = 0;
     if (entitlementsPath && access(entitlementsPath, F_OK) == 0)
         ent = read_file(entitlementsPath, &ent_len);
@@ -1092,17 +840,14 @@ int rysign_sign_bundle_robust(const char *bundlePath,
     return rc;
 }
 
-// ---- Bundle signing entry: PKCS#12 file ----------------------------------
-// Kept for completeness, but the app no longer uses it: the overwhelmingly
-// common p12 today is written by OpenSSL 3 (PBES2 / AES-256-CBC / PBKDF2),
-// which `SecPKCS12Import` cannot read at all — it fails with an opaque status
-// and this function returns 3. Use `rysign_sign_bundle_with_der` instead.
+// ---------------------------------------------------------------------------
+// Legacy entry: PKCS#12 file (kept for completeness; the app uses the DER path)
+// ---------------------------------------------------------------------------
 int rysign_sign_bundle(const char *bundlePath,
                        const char *p12Path,
                        const char *password,
                        const char *provPath,
-                       const char *entitlementsPath){
-    // 1. Read p12 -> identity + private key
+                       const char *entitlementsPath) {
     size_t plen; unsigned char *p12 = read_file(p12Path, &plen);
     if (!p12) { fprintf(stderr, "rysign: cannot read p12\n"); return 2; }
     CFDataRef p12Data = CFDataCreate(NULL, p12, (CFIndex)plen);
@@ -1114,9 +859,9 @@ int rysign_sign_bundle(const char *bundlePath,
         CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1, NULL, NULL);
         CFArrayRef items = NULL;
         OSStatus st = SecPKCS12Import(p12Data, opts, &items);
-        if (st != errSecSuccess){
+        if (st != errSecSuccess) {
             fprintf(stderr, "rysign: SecPKCS12Import failed (%d)\n", (int)st);
-            CFRelease(p12Data); free(p12); if(pw)CFRelease(pw); if(opts)CFRelease(opts);
+            CFRelease(p12Data); free(p12); if (pw) CFRelease(pw); if (opts) CFRelease(opts);
             return 3;
         }
         CFDictionaryRef dict = CFArrayGetValueAtIndex(items, 0);
@@ -1128,7 +873,7 @@ int rysign_sign_bundle(const char *bundlePath,
     SecIdentityCopyCertificate(identity, &leaf);
     SecIdentityCopyPrivateKey(identity, &privKey);
 
-    int rc = sign_bundle_with_leaf_key(bundlePath, leaf, privKey, provPath, entitlementsPath);
+    int rc = sign_bundle_core(bundlePath, leaf, privKey, NULL, NULL, 0, provPath);
 
     if (leaf) CFRelease(leaf);
     if (privKey) CFRelease(privKey);
@@ -1137,86 +882,67 @@ int rysign_sign_bundle(const char *bundlePath,
     return rc;
 }
 
-// Bit length of the modulus inside a PKCS#1 `RSAPrivateKey` DER, or 0 if the
-// blob is not shaped like one. Handed to `SecKeyCreateWithData` as
-// `kSecAttrKeySizeInBits`: Security accepts RSA keys without it, but stating it
-// removes any doubt about which representation the data is in.
-static int pkcs1_modulus_bits(const unsigned char *der, size_t len){
-    Cur c; c.p=der; c.len=len; c.pos=0;
-    unsigned char tag; const unsigned char *content; size_t clen;
-    if (cur_read_tlv(&c,&tag,&content,&clen)!=0 || tag!=0x30) return 0;  // RSAPrivateKey
-    if (cur_read_tlv(&c,&tag,&content,&clen)!=0 || tag!=0x02) return 0;  // version
-    if (cur_read_tlv(&c,&tag,&content,&clen)!=0 || tag!=0x02) return 0;  // modulus
-    const unsigned char *m = content; size_t n = clen;
-    while (n > 1 && m[0]==0){ m++; n--; }
-    return (int)(n * 8);
-}
-
-// ---- Bundle signing entry: DER certificate + DER private key -------------
-// This is the path RyBox actually uses. The p12 was already decoded by
-// `RyP12` (Swift), which handles the OpenSSL 3 schemes Apple's importer
-// refuses; here we only have to turn the two DER blobs back into Security
-// objects and sign. No `SecIdentity` is ever created, so nothing depends on
-// `SecPKCS12Import` succeeding.
-//
-// `keyIsEC` selects the key type. Apple's iOS development / distribution
-// certificates are RSA, so the CMS builder below assumes RSA.
+// ---------------------------------------------------------------------------
+// Bundle signing entry: DER certificate + DER private key (the path RyBox uses)
+// ---------------------------------------------------------------------------
 int rysign_sign_bundle_with_der(const char *bundlePath,
                                 const char *certDerPath,
                                 const char *keyDerPath,
                                 int keyIsEC,
                                 const char *provPath,
-                                const char *entitlementsPath){
+                                const char *entitlementsPath) {
     size_t clen = 0, klen = 0;
     unsigned char *cd = read_file(certDerPath, &clen);
     unsigned char *kd = read_file(keyDerPath, &klen);
-    if (!cd || !kd || clen == 0 || klen == 0){
+    if (!cd || !kd || clen == 0 || klen == 0) {
         fprintf(stderr, "rysign: cannot read cert/key DER\n");
         if (cd) free(cd); if (kd) free(kd);
         return 7;
     }
-
     CFDataRef certData = CFDataCreate(NULL, cd, (CFIndex)clen);
     SecCertificateRef leaf = SecCertificateCreateWithData(NULL, certData);
-    if (!leaf){
+    if (!leaf) {
         fprintf(stderr, "rysign: SecCertificateCreateWithData failed\n");
         CFRelease(certData); free(cd); free(kd);
         return 7;
     }
-
     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
     CFDictionarySetValue(attrs, kSecAttrKeyType,
                          keyIsEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA);
-    if (!keyIsEC){
-        // RSA only: EC keys get their size from the curve OID in the DER.
-        int bits = pkcs1_modulus_bits(kd, klen);
-        if (bits > 0){
+    if (!keyIsEC) {
+        int bits = 0;
+        Cur c; c.p = kd; c.len = klen; c.pos = 0;
+        unsigned char tag; const unsigned char *content; size_t clen2;
+        if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x30) { }
+        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
+        else if (cur_read_tlv(&c, &tag, &content, &clen2) != 0 || tag != 0x02) { }
+        else {
+            const unsigned char *m = content; size_t n = clen2;
+            while (n > 1 && m[0] == 0) { m++; n--; }
+            bits = (int)(n * 8);
+        }
+        if (bits > 0) {
             int bitsRef = bits;
-            CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
-            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, n);
-            if (n) CFRelease(n);
+            CFNumberRef num = CFNumberCreate(NULL, kCFNumberIntType, &bitsRef);
+            CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, num);
+            if (num) CFRelease(num);
         }
     }
     CFErrorRef keyErr = NULL;
     CFDataRef keyData = CFDataCreate(NULL, kd, (CFIndex)klen);
     SecKeyRef privKey = SecKeyCreateWithData(keyData, attrs, &keyErr);
     CFRelease(keyData); CFRelease(attrs);
-    if (!privKey){
+    if (!privKey) {
         fprintf(stderr, "rysign: SecKeyCreateWithData failed\n");
         if (keyErr) CFRelease(keyErr);
         CFRelease(certData); CFRelease(leaf); free(cd); free(kd);
         return 8;
     }
 
-    int rc = sign_bundle_with_leaf_key(bundlePath, leaf, privKey, provPath, entitlementsPath);
+    int rc = sign_bundle_core(bundlePath, leaf, privKey, NULL, NULL, 0, provPath);
 
-    CFRelease(privKey);
-    CFRelease(leaf);
-    CFRelease(certData);
+    CFRelease(privKey); CFRelease(leaf); CFRelease(certData);
     free(cd); free(kd);
     return rc;
 }
-
-// NOTE: rysign_sign_bundle() is invoked in-process from CodeSigner.swift
-// (the RyBox app target has its own entry point, so no main() here).
