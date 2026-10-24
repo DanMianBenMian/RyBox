@@ -39,6 +39,12 @@ struct SpringBoardView: View {
     /// keeps the icons from wobbling in lockstep).
     @State private var jiggle = false
 
+    @ObservedObject private var sb = SpringBoardController.shared
+    /// Gesture-driven shell panels (深度还原 SpringBoard).
+    @State private var showControlCenter = false
+    @State private var showAppSwitcher = false
+    @State private var showNotificationCenter = false
+
     private var isIPad: Bool { hSize == .regular }
     private var columns: Int { DesktopStore.columns(isIPad: isIPad) }
     private var rows: Int { DesktopStore.rows(isIPad: isIPad) }
@@ -61,6 +67,39 @@ struct SpringBoardView: View {
             } else {
                 homeScreen
                     .transition(.opacity)
+            }
+
+            // Gesture-driven shell panels (深度还原 SpringBoard).
+            if showControlCenter {
+                ControlCenterView(onDismiss: { showControlCenter = false })
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(10)
+            }
+            if showAppSwitcher {
+                AppSwitcherView(
+                    recents: sb.recents,
+                    onOpen: { item in
+                        showAppSwitcher = false
+                        open(item)
+                    },
+                    onQuit: { id in
+                        SpringBoardController.shared.removeRecent(id)
+                    },
+                    onDismiss: { showAppSwitcher = false }
+                )
+                .transition(.opacity)
+                .zIndex(10)
+            }
+            if showNotificationCenter {
+                NotificationCenterView(
+                    onOpen: { item in
+                        showNotificationCenter = false
+                        open(item)
+                    },
+                    onDismiss: { showNotificationCenter = false }
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(10)
             }
         }
         .animation(.easeInOut(duration: 0.25), value: respringing)
@@ -114,6 +153,15 @@ struct SpringBoardView: View {
                 VStack(spacing: 0) {
                     StatusBarView()
                         .padding(.top, max(0, geo.safeAreaInsets.top - 4))
+                        .onLongPressGesture(minimumDuration: 0.4) { showControlCenter = true }
+                        .simultaneousGesture(
+                            DragGesture(minimumDistance: 24)
+                                .onEnded { v in
+                                    if v.translation.height > 40 && abs(v.translation.width) < 50 {
+                                        showNotificationCenter = true
+                                    }
+                                }
+                        )
 
                     pager
                         .frame(maxHeight: .infinity)
@@ -533,6 +581,7 @@ struct SpringBoardView: View {
                     .shadow(color: .black.opacity(0.28), radius: 9, y: 3)
             }
             .buttonStyle(.plain)
+            .onLongPressGesture(minimumDuration: 0.4) { showAppSwitcher = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .padding(.bottom, geo.safeAreaInsets.bottom + 4)
@@ -573,6 +622,7 @@ struct SpringBoardView: View {
 
     private func open(_ item: DesktopItem) {
         guard !store.editMode else { return }
+        SpringBoardController.shared.recordOpen(item.id)
         withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) { activeApp = item }
     }
 
@@ -583,6 +633,9 @@ struct SpringBoardView: View {
     private func goHome() {
         closeActiveApp()
         withAnimation { store.editMode = false }
+        showControlCenter = false
+        showAppSwitcher = false
+        showNotificationCenter = false
     }
 
     private func delete(_ item: DesktopItem) {
