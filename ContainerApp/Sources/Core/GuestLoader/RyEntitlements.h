@@ -1,5 +1,11 @@
 #ifndef RyEntitlements_h
 #define RyEntitlements_h
+
+// `size_t` is used in the API below. A bridging header is included very early
+// in the translation unit, before <stddef.h> may have been pulled in, so the
+// type has to be pulled in explicitly.
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
