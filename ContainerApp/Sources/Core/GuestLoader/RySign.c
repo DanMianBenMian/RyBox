@@ -526,7 +526,7 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
 
     RyBuf cms;
     if (build_cms(cd1.p, cd1.len, cd2.p, cd2.len, privKey, certs, cert_lens, n_certs,
-                  issuer, issuer_len, serial, &cms) != 0) {
+                  issuer, issuer_len, serial, serial_len, &cms) != 0) {
         fprintf(stderr, "rysign: build_cms failed\n");
         ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1); ry_buf_free(&cd2);
         return -5;
