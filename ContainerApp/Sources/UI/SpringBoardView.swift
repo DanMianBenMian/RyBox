@@ -49,6 +49,13 @@ struct SpringBoardView: View {
     @State private var renameTarget: RyFolder?
     @State private var renameText = ""
     @State private var toast = ""
+    /// The icon whose long-press menu is open, plus that icon's frame in the
+    /// shared "root" space (so the menu can be anchored to it). Long-pressing
+    /// an icon WITHOUT dragging shows this; long-pressing and THEN dragging
+    /// enters edit mode instead. Both used to fight each other through
+    /// `contextMenu` + two drag gestures on the same cell.
+    @State private var menuItem: DesktopItem?
+    @State private var menuFrame: CGRect = .zero
     /// Drives the edit-mode jiggle (one shared flag; per-slot duration/parity
     /// keeps the icons from wobbling in lockstep).
     @State private var jiggle = false
@@ -82,6 +89,12 @@ struct SpringBoardView: View {
     private var rowPitch: CGFloat { cellHeight + (isIPad ? 16 : 12) }
 
     /// Home pages plus the App Library page.
+    ///
+    /// `store.pageCount` is the number of HOME pages; the App Library is the
+    /// page right after them. The old code rendered `ForEach(0..<pageCount)`
+    /// over this combined count, which produced one EXTRA home page (an empty
+    /// ghost) sitting exactly underneath the App Library — the library looked
+    /// blank/unreachable and the extra page dots were wrong.
     private var pageCount: Int { store.pageCount + 1 }
 
     var body: some View {
@@ -217,6 +230,9 @@ struct SpringBoardView: View {
 
                 if store.editMode { editHint.zIndex(4) }
                 if !toast.isEmpty { toastView.zIndex(5) }
+                if menuItem != nil {
+                    iconMenuOverlay(geo.size).zIndex(6)
+                }
             }
             .coordinateSpace(name: "root")
         }
@@ -271,14 +287,17 @@ struct SpringBoardView: View {
         GeometryReader { geo in
             let w = geo.size.width
             ZStack(alignment: .topLeading) {
-                ForEach(0..<pageCount, id: \.self) { i in
+                // Home pages ONLY: 0..<store.pageCount. The App Library is the
+                // last page and is placed separately below, so there is exactly
+                // one view per page index and no ghost page overlapping it.
+                ForEach(0..<store.pageCount, id: \.self) { i in
                     pageView(i)
                         .frame(width: w, height: geo.size.height)
                         .offset(x: -CGFloat(page) * w + pageDragOffset)
                 }
                 AppLibraryView { item in open(item) }
                     .frame(width: w, height: geo.size.height)
-                    .offset(x: -CGFloat(pageCount - 1) * w + pageDragOffset)
+                    .offset(x: -CGFloat(store.pageCount) * w + pageDragOffset)
             }
             .frame(width: w, height: geo.size.height, alignment: .topLeading)
             .contentShape(Rectangle())
@@ -290,18 +309,36 @@ struct SpringBoardView: View {
                 pageDots
                     .padding(.bottom, dockHeight + 22)
             }
-            // The grid's geometry: page-local origin + pitch, plus the page's
-            // own origin in root space. Combining them gives the grid's
-            // ROOT-space origin, which is the space the drag gesture and the
-            // Dock frame both use.
+            // The grid's geometry: page-local origin + pitch. The page's own
+            // ROOT-space origin is NOT published here — see below.
             .onPreferenceChange(PageFramePreferenceKey.self) { metrics in
                 gridPitch = metrics.pitch
                 gridCell = metrics.cell
                 gridLocalOrigin = metrics.origin
                 updateGridOrigin()
             }
-            .onPreferenceChange(PageOriginPreferenceKey.self) { pageOrigin in
-                gridPageOrigin = pageOrigin
+            // The PAGER's own frame in root space. This view never moves, so
+            // the value is stable.
+            //
+            // It used to publish each PAGE's frame instead — but a page's frame
+            // changes on every touch-move of the swipe (that is the whole point
+            // of the offset), so each frame of the drag fed a preference change
+            // back into @State, which re-rendered the pager, which moved the
+            // pages, which published a new frame… an endless feedback loop.
+            // That loop is the "滑动页面闪动" report.
+            //
+            // The current page sits exactly at the pager's origin whenever
+            // `pageDragOffset == 0`, and the pager gesture forces that to 0
+            // while an icon is being pressed — which is the only time the grid
+            // origin is needed (for the drag-and-drop hit test).
+            .background(
+                GeometryReader { g in
+                    Color.clear.preference(key: PagerFramePreferenceKey.self,
+                                           value: g.frame(in: .named("root")).origin)
+                }
+            )
+            .onPreferenceChange(PagerFramePreferenceKey.self) { origin in
+                gridPageOrigin = origin
                 updateGridOrigin()
             }
         }
@@ -345,8 +382,11 @@ struct SpringBoardView: View {
                     pageDragOffset = 0
                     return
                 }
-                defer { pageDragOffset = 0 }
-                guard abs(v.translation.width) > abs(v.translation.height) * 1.4 else { return }
+                guard abs(v.translation.width) > abs(v.translation.height) * 1.4 else {
+                    // Snap the page back — animated, or it visibly jumps.
+                    withAnimation(.easeInOut(duration: 0.22)) { pageDragOffset = 0 }
+                    return
+                }
                 let threshold = pageWidth * 0.22
                 var next = page
                 if v.translation.width < -threshold {
@@ -355,8 +395,15 @@ struct SpringBoardView: View {
                     next = page - 1
                 }
                 let clamped = max(0, min(pageCount - 1, next))
-                if clamped != page {
-                    withAnimation(.easeInOut(duration: 0.28)) { page = clamped }
+                // The total offset of page i is `-page*w + pageDragOffset`. If
+                // `page` is animated to its new value while `pageDragOffset`
+                // snaps to 0 outside the animation, the rendered position jumps
+                // BACKWARDS by the drag distance first and only then glides
+                // forward — a visible flash at the end of every swipe. Both
+                // must be driven by the same transaction.
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    page = clamped
+                    pageDragOffset = 0
                 }
             }
     }
@@ -452,19 +499,16 @@ struct SpringBoardView: View {
                 // using the SAME coordinates the layout used. (Mixing page-local
                 // and root coordinates is what made the drop target appear
                 // offset from the finger.)
+                //
+                // This reports the grid's PAGE-LOCAL origin — a constant that
+                // does not depend on where the page currently sits. The page's
+                // own position comes from the pager's (stable) frame, so
+                // nothing in here changes while a swipe is in flight.
                 GeometryReader { _ in
                     Color.clear.preference(key: PageFramePreferenceKey.self,
                                            value: GridMetrics(origin: CGPoint(x: originX, y: originY),
                                                               pitch: CGSize(width: colPitch, height: rowPitch),
                                                               cell: CGSize(width: cellWidth, height: cellHeight)))
-                }
-            )
-            .background(
-                // The page's own frame in root space — combined with the grid's
-                // page-local origin it yields the grid's ROOT-space origin.
-                GeometryReader { _ in
-                    Color.clear.preference(key: PageOriginPreferenceKey.self,
-                                           value: geo.frame(in: .named("root")).origin)
                 }
             )
         }
@@ -540,37 +584,50 @@ struct SpringBoardView: View {
         .zIndex(isDragging ? 20 : 0)
         .contentShape(Rectangle())
         .onTapGesture { if !store.editMode { open(item) } }
-        .contextMenu { iconMenu(item) }
-        // Long-press-and-drag on an ICON enters edit mode and starts moving
-        // that icon — the gesture the user asked for. The drag gesture below
-        // only moves icons when edit mode is already on; this one turns edit
-        // mode ON by itself when the finger stays down and starts to move.
-        .simultaneousGesture(longPressDragGesture(item: item, slot: slot))
-        .simultaneousGesture(dragGesture(item: item, slot: slot))
+        // ONE gesture on the cell. The old stack was four competing systems —
+        // `.onTapGesture` + `.contextMenu` + a sequenced long-press/drag + a
+        // second, independent drag gesture — which is exactly why taps were
+        // unreliable ("应用概率点不动") and why a plain long press sometimes
+        // entered edit mode instead of opening the menu.
+        //
+        // Behaviour now, mirroring iOS:
+        //   * tap                            → open
+        //   * long press, no drag            → icon menu (drawn by RyBox)
+        //   * long press, then drag ≥ 16 pt  → edit mode + move the icon
+        .simultaneousGesture(iconGesture(item: item, slot: slot))
     }
 
-    /// Long-press then drag → enter edit mode and drag the icon.
+    /// The single gesture attached to an icon cell.
     ///
-    /// Implemented as a `LongPressGesture` sequenced with a `DragGesture`:
-    /// the long press must succeed first (0.28 s), and only a subsequent
-    /// movement starts the drag. A plain long press without movement still
-    /// shows the context menu (the `contextMenu` above wins that case).
-    private func longPressDragGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.28)
-            .sequenced(before: DragGesture(minimumDistance: 6))
+    /// A `LongPressGesture` sequenced with a `DragGesture`:
+    ///   * the long press must hold 0.3 s before anything else happens,
+    ///   * lifting the finger at that point opens the icon menu,
+    ///   * only a subsequent movement of ≥ 16 pt starts a drag (and turns edit
+    ///     mode on).
+    ///
+    /// The 16 pt threshold matters. `DragGesture` inside a sequenced pair
+    /// measures its translation from the START of the touch, so by the time the
+    /// long press fires the accumulated movement is whatever the finger drifted
+    /// while holding. At 6 pt that drift alone was enough to start a drag —
+    /// a resting hand moves 2–5 pt — which is why long-pressing an icon went
+    /// straight to edit mode. 16 pt is beyond resting drift but still a
+    /// comfortable deliberate drag.
+    private func iconGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.3)
+            .sequenced(before: DragGesture(minimumDistance: 16))
             .onChanged { value in
                 switch value {
                 case .first(true):
                     // The long press has fired — the finger is on an icon, so the
                     // pager must not page.
                     isIconPressing = true
+                    longPressFired = true
                 case .second(true, let drag?):
-                    // The long press already happened — if we were not in edit
-                    // mode, enter it now and start dragging this icon.
-                    //
+                    // The long press already happened and a real drag started.
                     // NOTE the `drag?` — a sequenced gesture's `.second` case
                     // carries an OPTIONAL drag value (`Value2?`), so it must be
                     // unwrapped before `.translation` can be read.
+                    longPressFired = false
                     if !store.editMode {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                             store.editMode = true
@@ -584,32 +641,97 @@ struct SpringBoardView: View {
                     break
                 }
             }
-            .onEnded { value in
+            .onEnded { _ in
                 isIconPressing = false
-                guard case .second(true, _) = value else { return }
-                finishDrag(item: item, slot: slot)
+                if longPressFired {
+                    // Long press held, no drag followed → the menu.
+                    longPressFired = false
+                    showMenu(for: item, slot: slot)
+                } else {
+                    finishDrag(item: item, slot: slot)
+                }
             }
     }
+
+    // MARK: Icon menu
+
+    /// Open the long-press menu for an icon, anchored to that icon's cell.
+    private func showMenu(for item: DesktopItem, slot: IconSlot) {
+        menuFrame = cellFrame(slot)
+        menuItem = item
+        if store.editMode {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { store.editMode = false }
+        }
+    }
+
+    /// The icon's frame in the shared "root" space, derived from the very same
+    /// origin + pitch the layout used — so the menu points at the right icon.
+    private func cellFrame(_ slot: IconSlot) -> CGRect {
+        CGRect(x: gridOrigin.x + CGFloat(slot.col) * gridPitch.width,
+               y: gridOrigin.y + CGFloat(slot.row) * gridPitch.height,
+               width: gridCell.width, height: gridCell.height)
+    }
+
+    private func closeMenu() {
+        withAnimation(.easeOut(duration: 0.15)) { menuItem = nil }
+    }
+
+    /// The long-press menu, drawn by RyBox rather than SwiftUI's `contextMenu`.
+    ///
+    /// `contextMenu` ships its own long-press recogniser; stacking that on top
+    /// of the long-press-and-drag gesture on the same cell made the two fight,
+    /// so the menu sometimes never appeared and a plain long press sometimes
+    /// started a drag. The gesture now decides what a long press means and this
+    /// view is only the result — no recogniser ambiguity left.
+    @ViewBuilder
+    private func iconMenuOverlay(_ bounds: CGSize) -> some View {
+        if let item = menuItem {
+            IconContextMenu(
+                item: item,
+                anchor: menuFrame,
+                bounds: bounds,
+                actions: menuActions(for: item),
+                onDismiss: { closeMenu() },
+                onAction: { action in
+                    closeMenu()
+                    handleMenuAction(action, for: item)
+                }
+            )
+            .transition(.opacity)
+        }
+    }
+
+    private func handleMenuAction(_ action: MenuAction, for item: DesktopItem) {
+        switch action {
+        case .open:
+            open(item)
+        case .addToDock:
+            store.addToDock(item.id)
+        case .removeFromDock:
+            store.removeFromDock(item.id)
+        case .rename:
+            if case .folder(let f) = item.kind {
+                renameTarget = f
+                renameText = f.name
+            }
+        case .dissolve:
+            if case .folder(let f) = item.kind { store.deleteFolder(f.id) }
+        case .delete:
+            delete(item)
+        }
+    }
+
+    /// True once the icon long press has fired but before any drag began.
+    /// Used in `onEnded` to tell "long press then lift" (→ menu) from "long
+    /// press then drag" (→ move), without depending on which enum case the
+    /// sequenced gesture happens to deliver on cancellation.
+    @State private var longPressFired = false
 
     /// Per-icon jiggle: different phase and direction per slot so the page
     /// wobbles organically instead of in lockstep.
     private func jiggleAngle(seed: Int) -> Double {
         let dir: Double = (seed % 2 == 0) ? 1 : -1
         return dir * 1.2
-    }
-
-    private func dragGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
-        DragGesture(minimumDistance: 7)
-            .onChanged { v in
-                guard store.editMode else { return }
-                draggingID = item.id
-                dragTranslation = v.translation
-                updateTarget(for: item, slot: slot, translation: v.translation)
-            }
-            .onEnded { v in
-                guard store.editMode else { return }
-                finishDrag(item: item, slot: slot)
-            }
     }
 
     /// Work out which cell the dragged icon currently hovers over.
@@ -671,42 +793,21 @@ struct SpringBoardView: View {
         }
     }
 
-    private func iconMenu(_ item: DesktopItem) -> some View {
-        Group {
-            Button { open(item) } label: {
-                Label("打开", systemImage: "arrow.up.right.square")
-            }
-            if store.isInDock(item.id) {
-                Button { store.removeFromDock(item.id) } label: {
-                    Label("从 Dock 移除", systemImage: "minus.square")
-                }
-            } else {
-                Button { store.addToDock(item.id) } label: {
-                    Label("添加到 Dock", systemImage: "plus.square.on.square")
-                }
-            }
-            if item.isGuest {
-                Button(role: .destructive) { delete(item) } label: {
-                    Label("删除 App", systemImage: "trash")
-                }
-            }
-            if case .folder(let f) = item.kind {
-                Button {
-                    renameTarget = f
-                    renameText = f.name
-                } label: {
-                    Label("重命名", systemImage: "pencil")
-                }
-                Button(role: .destructive) { store.deleteFolder(f.id) } label: {
-                    Label("解散文件夹", systemImage: "folder.badge.minus")
-                }
-            }
-        }
-    }
-
     private func folderMembers(for item: DesktopItem) -> [DesktopItem] {
         if case .folder(let f) = item.kind { return store.members(of: f) }
         return []
+    }
+
+    /// The actions offered in the long-press menu, in display order.
+    private func menuActions(for item: DesktopItem) -> [MenuAction] {
+        var out: [MenuAction] = [.open]
+        out.append(store.isInDock(item.id) ? .removeFromDock : .addToDock)
+        if case .folder = item.kind {
+            out.append(.rename)
+            out.append(.dissolve)
+        }
+        if item.isGuest { out.append(.delete) }
+        return out
     }
 
     // MARK: Dock
@@ -941,10 +1042,161 @@ struct PageFramePreferenceKey: PreferenceKey {
     }
 }
 
-/// The page's origin in the shared "root" space.
-struct PageOriginPreferenceKey: PreferenceKey {
+/// The PAGER's origin in the shared "root" space. Published by the pager, which
+/// never moves — so the value is stable and cannot feed back into the layout.
+/// (The previous `PageOriginPreferenceKey` published each PAGE's origin, which
+/// changes on every touch-move of a swipe and produced a render feedback loop
+/// that made paging flicker. It is gone; use `PagerFramePreferenceKey`.)
+struct PagerFramePreferenceKey: PreferenceKey {
     static var defaultValue: CGPoint = .zero
     static func reduce(value: inout CGPoint, nextValue: () -> CGPoint) {
         value = nextValue()
+    }
+}
+
+// MARK: - Long-press menu
+
+/// One row of the icon long-press menu.
+enum MenuAction {
+    case open
+    case addToDock
+    case removeFromDock
+    case rename
+    case dissolve
+    case delete
+
+    var title: String {
+        switch self {
+        case .open:          return "打开"
+        case .addToDock:     return "添加到 Dock"
+        case .removeFromDock:return "从 Dock 移除"
+        case .rename:        return "重命名"
+        case .dissolve:      return "解散文件夹"
+        case .delete:        return "删除 App"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .open:          return "arrow.up.right.square"
+        case .addToDock:     return "plus.square.on.square"
+        case .removeFromDock:return "minus.square"
+        case .rename:        return "pencil"
+        case .dissolve:      return "folder.badge.minus"
+        case .delete:        return "trash"
+        }
+    }
+
+    var isDestructive: Bool {
+        // A switch rather than `==`: `MenuAction` has no associated values but
+        // does not declare Equatable, and a bare `self == .delete` would not
+        // compile.
+        switch self {
+        case .delete, .dissolve: return true
+        default:                 return false
+        }
+    }
+}
+
+/// The icon long-press menu: a frosted card anchored to the icon it belongs to.
+///
+/// Anchored rather than centred (the old `.contextMenu` had no useful position
+/// at all on iPad), and clamped inside the screen so it can never be opened
+/// off the top edge.
+private struct IconContextMenu: View {
+    let item: DesktopItem
+    /// The icon's frame in the shared "root" space.
+    let anchor: CGRect
+    /// The host's size, used to clamp the card on screen.
+    let bounds: CGSize
+    let actions: [MenuAction]
+    var onDismiss: () -> Void
+    var onAction: (MenuAction) -> Void
+
+    private let rowHeight: CGFloat = 46
+    private let cardWidth: CGFloat = 216
+    private let cardPadding: CGFloat = 8
+
+    private var cardHeight: CGFloat {
+        CGFloat(actions.count) * rowHeight + cardPadding * 2 + 50   // + header
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            // Tap anywhere outside the card to dismiss.
+            Color.black.opacity(0.001)
+                .ignoresSafeArea()
+                .onTapGesture { onDismiss() }
+
+            VStack(spacing: 0) {
+                // Header: the app's own artwork + name, so the menu is
+                // unambiguous when two icons look alike.
+                HStack(spacing: 10) {
+                    IconArtwork(item: item, size: 34, cornerRadius: 8)
+                    Text(item.name)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+
+                // `id: \.offset` on an enumerated array would need a key path
+                // into a tuple element, which Swift does not allow — index the
+                // array instead.
+                ForEach(actions.indices, id: \.self) { index in
+                    let action = actions[index]
+                    if index > 0 {
+                        Divider()
+                            .overlay(Color.white.opacity(0.14))
+                            .padding(.horizontal, 10)
+                    }
+                    Button {
+                        onAction(action)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: action.symbol)
+                                .font(.system(size: 14, weight: .semibold))
+                                .frame(width: 20)
+                            Text(action.title)
+                                .font(.system(size: 15, weight: .medium))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .foregroundStyle(action.isDestructive
+                                         ? Color(red: 1.0, green: 0.45, blue: 0.47)
+                                         : Color.white)
+                        .padding(.horizontal, 14)
+                        .frame(height: rowHeight)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, cardPadding)
+            .frame(width: cardWidth)
+            .background(.regularMaterial,
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6)
+            )
+            .shadow(color: .black.opacity(0.34), radius: 18, y: 8)
+            .position(x: cardX, y: cardY)
+        }
+    }
+
+    /// Horizontal centre of the icon, clamped so the whole card stays on screen.
+    private var cardX: CGFloat {
+        let raw = anchor.midX
+        let half = cardWidth / 2
+        return min(max(raw, half + 10), bounds.width - half - 10)
+    }
+
+    /// Prefer ABOVE the icon (that is where a thumb is not), fall back below.
+    private var cardY: CGFloat {
+        let above = anchor.minY - cardHeight - 12
+        if above > 60 { return above + cardHeight / 2 }
+        return anchor.maxY + 12 + cardHeight / 2
     }
 }
