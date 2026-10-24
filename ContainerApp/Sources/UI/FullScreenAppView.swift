@@ -49,43 +49,33 @@ struct FullScreenAppView: View {
     }
 }
 
-/// Full-screen page for an imported guest app: info + launch controls.
+/// Full-screen page for an imported guest app. The app launches automatically
+/// once this page appears — the open animation already played, so there is no
+/// "启动 / start" button to press (the user asked for exactly that: tap the
+/// icon → open animation → straight to the app).
+///
 /// GUI guests launch in-process (LiveContainer model) and take over the screen;
 /// CLI guests run inside the microkernel (output in Terminal).
 struct GuestLaunchView: View {
     let app: ImportedApp
     @State private var status = ""
     @State private var busy = false
+    /// Guards against re-launching on every SwiftUI body evaluation — we only
+    /// fire once when the page first appears.
+    @State private var launched = false
 
     var body: some View {
-        VStack(spacing: 22) {
+        VStack(spacing: 18) {
             Spacer()
             Image(systemName: app.isGUI ? "macwindow.on.rectangle" : "terminal.fill")
-                .font(.system(size: 64))
+                .font(.system(size: 60))
                 .foregroundStyle(DesktopItem.color(for: app.bundleIdentifier))
             Text(app.name)
-                .font(.title2.bold())
+                .font(.title3.bold())
             Text(app.bundleIdentifier)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
-            if let note = app.signNote {
-                Text("未签名：\(note)")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
-            }
-            Text(app.isGUI
-                 ? "GUI App 将以 LiveContainer 模式在 RyBox 进程内启动。启动成功后本容器界面会被 guest 窗口接管，用悬浮「主屏」键返回。"
-                 : "CLI 工具在微内核内以子进程运行，输出见「终端」。")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
             if busy { ProgressView() }
-            Button(app.isGUI ? "启动" : "在终端运行") { run() }
-                .buttonStyle(.borderedProminent)
-                .disabled(busy)
             if !status.isEmpty {
                 Text(status)
                     .font(.caption)
@@ -96,15 +86,20 @@ struct GuestLaunchView: View {
             Spacer()
         }
         .padding()
+        .onAppear { runIfNeeded() }
     }
 
-    private func run() {
+    private func runIfNeeded() {
+        guard !launched else { return }
+        launched = true
         busy = true
-        status = "启动中…"
+        status = "正在启动…"
         DispatchQueue.main.async {
             if app.isGUI {
                 GuestRuntime.launchInProcess(app)
-                status = "已请求启动。若失败会自动落入沙箱视图。"
+                // The guest UI covers this page via its own window; only show a
+                // status if the launch fell back to the scaffold path.
+                status = ""
             } else {
                 status = RyLaunchCoordinator.shared.runCLIGuest(app) != nil
                     ? "已在微内核内运行，输出见「终端」。"
