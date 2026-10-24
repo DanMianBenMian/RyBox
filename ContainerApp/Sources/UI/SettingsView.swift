@@ -429,7 +429,7 @@ struct SettingsView: View {
             case .success(let url):
                 switch JbRoot.shared.importBootstrap(from: url) {
                 case .success(let note): message = note
-                case .failure(let reason): message = "jbroot 导入失败：\(reason)"
+                case .failure(let reason): message = "jbroot 导入失败：\(reason.localizedDescription)"
                 }
             case .failure(let e):
                 message = "选择失败：\(e.localizedDescription)"
