@@ -27,9 +27,23 @@ struct SpringBoardView: View {
     @State private var locked = true
     @State private var respringing = false
     @State private var dockFrame: CGRect = .zero
-    @State private var gridFrame: CGRect = .zero
+    /// The grid's origin + cell pitch, published by `pageView`. The drag
+    /// gesture uses these EXACT numbers so the drop target matches the layout.
+    /// `gridOrigin` is in the shared "root" space (same space as `dockFrame`),
+    /// so the grid hit test and the Dock hit test agree.
+    @State private var gridOrigin: CGPoint = .zero
+    @State private var gridPitch: CGSize = .zero
+    @State private var gridCell: CGSize = .zero
+    /// The grid's page-LOCAL origin and the page's origin in root space — the
+    /// two pieces `gridOrigin` is derived from.
+    @State private var gridLocalOrigin: CGPoint = .zero
+    @State private var gridPageOrigin: CGPoint = .zero
     @State private var draggingID: String?
     @State private var dragTranslation: CGSize = .zero
+    /// True while a finger is pressing an icon (before the long press fires).
+    /// The pager must not page in that window, or the page slides out from
+    /// under the finger.
+    @State private var isIconPressing = false
     @State private var target: IconSlot?
     @State private var showBuiltinAlert = false
     @State private var renameTarget: RyFolder?
@@ -38,6 +52,9 @@ struct SpringBoardView: View {
     /// Drives the edit-mode jiggle (one shared flag; per-slot duration/parity
     /// keeps the icons from wobbling in lockstep).
     @State private var jiggle = false
+    /// Live drag offset for the page-swipe gesture (so the page follows the
+    /// finger instead of jumping at the end).
+    @State private var pageDragOffset: CGFloat = 0
 
     @ObservedObject private var sb = SpringBoardController.shared
     /// Gesture-driven shell panels (深度还原 SpringBoard).
@@ -50,8 +67,19 @@ struct SpringBoardView: View {
     private var rows: Int { DesktopStore.rows(isIPad: isIPad) }
     private var iconSize: CGFloat { (isIPad ? 68 : 58) * CGFloat(store.iconScale) }
     private var dockIconSize: CGFloat { (isIPad ? 56 : 48) * CGFloat(store.iconScale) }
-    private var colPitch: CGFloat { iconSize + (isIPad ? 30 : 22) }
-    private var rowPitch: CGFloat { iconSize + (isIPad ? 34 : 26) }
+
+    /// CELL width/height. The icon artwork is `iconSize` wide, but the cell also
+    /// holds the name label, so the CELL is wider than the artwork.
+    ///
+    /// THE LAYOUT MUST USE THE CELL SIZE, NOT THE ARTWORK SIZE. The earlier
+    /// code mixed the two (artwork width for the pitch, cell width for the
+    /// frame), which made every column drift a few points to the right — the
+    /// "图标位置会偏移" report. One number, used everywhere.
+    private var cellWidth: CGFloat { iconSize + 14 }
+    private var cellHeight: CGFloat { iconSize + 22 }
+    /// Distance between two cell centres.
+    private var colPitch: CGFloat { cellWidth + (isIPad ? 18 : 12) }
+    private var rowPitch: CGFloat { cellHeight + (isIPad ? 16 : 12) }
 
     /// Home pages plus the App Library page.
     private var pageCount: Int { store.pageCount + 1 }
@@ -227,43 +255,105 @@ struct SpringBoardView: View {
 
     // MARK: Pager
 
+    /// A hand-rolled pager instead of `TabView(.page)`.
+    ///
+    /// `TabView(.page)` was the source of the "左右滑动手势触发区偏移" report:
+    /// its internal scroll view swallows the gesture in unpredictable places,
+    /// and the App Library's own vertical ScrollView competes with it, so the
+    /// last page could not be reached by swiping.
+    ///
+    /// This implementation owns the gesture end to end:
+    ///   * the horizontal drag is detected on the whole pager area,
+    ///   * the page follows the finger 1:1 (no jump at the end),
+    ///   * the App Library's vertical ScrollView keeps working, because the
+    ///     pager only reacts to clearly HORIZONTAL drags.
     private var pager: some View {
-        TabView(selection: $page) {
-            ForEach(0..<store.pageCount, id: \.self) { i in
-                pageView(i)
-                    .tag(i)
+        GeometryReader { geo in
+            let w = geo.size.width
+            ZStack(alignment: .topLeading) {
+                ForEach(0..<pageCount, id: \.self) { i in
+                    pageView(i)
+                        .frame(width: w, height: geo.size.height)
+                        .offset(x: -CGFloat(page) * w + pageDragOffset)
+                }
+                AppLibraryView { item in open(item) }
+                    .frame(width: w, height: geo.size.height)
+                    .offset(x: -CGFloat(pageCount - 1) * w + pageDragOffset)
             }
-            AppLibraryView { item in open(item) }
-                .tag(store.pageCount)
-        }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        // Explicit horizontal page swipe. The App Library page embeds a vertical
-        // ScrollView whose pan gesture competes with the TabView's built-in
-        // paging, which is why the last page (App Library) was unreachable by
-        // swipe. This gesture drives `page` directly and coexists with the
-        // TabView (both target the same value), so the library is always reachable.
-        .simultaneousGesture(pageSwipe)
-        .overlay(alignment: .bottom) {
-            pageDots
-                .padding(.bottom, dockHeight + 22)
-        }
-        .background(
-            GeometryReader { g in
-                Color.clear.preference(key: FramePreferenceKey.self, value: g.frame(in: .named("root")))
+            .frame(width: w, height: geo.size.height, alignment: .topLeading)
+            .contentShape(Rectangle())
+            // `simultaneousGesture`, not `gesture`: the App Library's vertical
+            // ScrollView must keep working. The gesture below ignores any drag
+            // that is not clearly horizontal, so the two never fight.
+            .simultaneousGesture(pageSwipeGesture(pageWidth: w))
+            .overlay(alignment: .bottom) {
+                pageDots
+                    .padding(.bottom, dockHeight + 22)
             }
-        )
-        .onPreferenceChange(FramePreferenceKey.self) { gridFrame = $0 }
+            // The grid's geometry: page-local origin + pitch, plus the page's
+            // own origin in root space. Combining them gives the grid's
+            // ROOT-space origin, which is the space the drag gesture and the
+            // Dock frame both use.
+            .onPreferenceChange(PageFramePreferenceKey.self) { metrics in
+                gridPitch = metrics.pitch
+                gridCell = metrics.cell
+                gridLocalOrigin = metrics.origin
+                updateGridOrigin()
+            }
+            .onPreferenceChange(PageOriginPreferenceKey.self) { pageOrigin in
+                gridPageOrigin = pageOrigin
+                updateGridOrigin()
+            }
+        }
     }
 
-    /// Horizontal swipe that moves between home pages AND the App Library page.
-    private var pageSwipe: some Gesture {
-        DragGesture(minimumDistance: 24)
+    /// Recompute the grid's root-space origin from its two components.
+    private func updateGridOrigin() {
+        gridOrigin = CGPoint(x: gridPageOrigin.x + gridLocalOrigin.x,
+                             y: gridPageOrigin.y + gridLocalOrigin.y)
+    }
+
+    /// Horizontal paging gesture.
+    ///
+    /// It only engages for a clearly horizontal drag, so the App Library's
+    /// vertical list scrolls normally, and it drives `page` directly so the
+    /// trigger area is exactly the pager rectangle — no offset.
+    ///
+    /// It yields to the ICON drag: while an icon is being dragged (or is being
+    /// pressed towards a long-press), the pager must not page — otherwise the
+    /// page slides away under the finger.
+    private func pageSwipeGesture(pageWidth: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 12, coordinateSpace: .named("root"))
+            .onChanged { v in
+                guard !store.editMode, draggingID == nil, !isIconPressing else {
+                    pageDragOffset = 0
+                    return
+                }
+                // Vertical intent → let the inner scroll view have it.
+                guard abs(v.translation.width) > abs(v.translation.height) * 1.4 else {
+                    pageDragOffset = 0
+                    return
+                }
+                // Rubber-band at the first / last page.
+                var offset = v.translation.width
+                if page == 0 && offset > 0 { offset *= 0.25 }
+                if page == pageCount - 1 && offset < 0 { offset *= 0.25 }
+                pageDragOffset = offset
+            }
             .onEnded { v in
-                guard !store.editMode else { return }
-                // Only a clear, predominantly-horizontal swipe pages.
-                guard abs(v.translation.width) > 60,
-                      abs(v.translation.width) > abs(v.translation.height) else { return }
-                let next = v.translation.width < 0 ? page + 1 : page - 1
+                guard !store.editMode, draggingID == nil, !isIconPressing else {
+                    pageDragOffset = 0
+                    return
+                }
+                defer { pageDragOffset = 0 }
+                guard abs(v.translation.width) > abs(v.translation.height) * 1.4 else { return }
+                let threshold = pageWidth * 0.22
+                var next = page
+                if v.translation.width < -threshold {
+                    next = page + 1
+                } else if v.translation.width > threshold {
+                    next = page - 1
+                }
                 let clamped = max(0, min(pageCount - 1, next))
                 if clamped != page {
                     withAnimation(.easeInOut(duration: 0.28)) { page = clamped }
@@ -273,6 +363,7 @@ struct SpringBoardView: View {
 
     private var pageDots: some View {
         HStack(spacing: 8) {
+            // One dot per home page, plus the App Library dot at the end.
             ForEach(0..<pageCount, id: \.self) { i in
                 Group {
                     if i == store.pageCount {
@@ -299,7 +390,9 @@ struct SpringBoardView: View {
                             .frame(width: 7, height: 7)
                     }
                 }
-                .onTapGesture { withAnimation { page = i } }
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.28)) { page = i }
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -309,28 +402,71 @@ struct SpringBoardView: View {
     }
 
     /// One home-screen page: a strict grid whose cells are filled by slot.
+    ///
+    /// The grid is laid out with ABSOLUTE positions computed from the cell
+    /// pitch, not with an HStack/VStack of flexible frames. Two reasons:
+    ///   * the cell pitch and the icon artwork size can no longer disagree
+    ///     (that mismatch is what made icons drift sideways), and
+    ///   * the drag-and-drop hit test can use the very same numbers, so an icon
+    ///     lands exactly in the cell the user aimed at.
     private func pageView(_ index: Int) -> some View {
         let items = store.items(onPage: index)
         var placed: [String: DesktopItem] = [:]
         for item in items {
             if let s = store.slot(for: item.id) { placed["\(s.row),\(s.col)"] = item }
         }
-        return VStack(spacing: 0) {
-            VStack(spacing: rowPitch - iconSize) {
+        return GeometryReader { geo in
+            let gridW = CGFloat(columns) * colPitch
+            // Centre the grid horizontally inside the page.
+            let originX = max(0, (geo.size.width - gridW) / 2)
+            let originY: CGFloat = 18
+
+            ZStack(alignment: .topLeading) {
+                // Faint slot outlines make the grid legible while dragging.
                 ForEach(0..<rows, id: \.self) { row in
-                    HStack(spacing: colPitch - iconSize) {
-                        ForEach(0..<columns, id: \.self) { col in
-                            if let item = placed["\(row),\(col)"] {
-                                iconCell(item, page: index, row: row, col: col)
-                            } else {
-                                Color.clear.frame(width: iconSize, height: iconSize + 18)
-                            }
+                    ForEach(0..<columns, id: \.self) { col in
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(Color.white.opacity(store.editMode ? 0.10 : 0.0),
+                                          lineWidth: 0.5)
+                            .frame(width: cellWidth - 6, height: cellHeight - 6)
+                            .position(x: originX + CGFloat(col) * colPitch + colPitch / 2,
+                                      y: originY + CGFloat(row) * rowPitch + rowPitch / 2)
+                    }
+                }
+
+                ForEach(0..<rows, id: \.self) { row in
+                    ForEach(0..<columns, id: \.self) { col in
+                        if let item = placed["\(row),\(col)"] {
+                            iconCell(item, page: index, row: row, col: col)
+                                .frame(width: cellWidth, height: cellHeight)
+                                .position(x: originX + CGFloat(col) * colPitch + colPitch / 2,
+                                          y: originY + CGFloat(row) * rowPitch + rowPitch / 2)
                         }
                     }
                 }
             }
-            .padding(.top, 26)
-            Spacer(minLength: 0)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .background(
+                // Publish the grid's geometry in the shared "root" space, so the
+                // drag gesture can convert a finger position into a target cell
+                // using the SAME coordinates the layout used. (Mixing page-local
+                // and root coordinates is what made the drop target appear
+                // offset from the finger.)
+                GeometryReader { _ in
+                    Color.clear.preference(key: PageFramePreferenceKey.self,
+                                           value: GridMetrics(origin: CGPoint(x: originX, y: originY),
+                                                              pitch: CGSize(width: colPitch, height: rowPitch),
+                                                              cell: CGSize(width: cellWidth, height: cellHeight)))
+                }
+            )
+            .background(
+                // The page's own frame in root space — combined with the grid's
+                // page-local origin it yields the grid's ROOT-space origin.
+                GeometryReader { _ in
+                    Color.clear.preference(key: PageOriginPreferenceKey.self,
+                                           value: geo.frame(in: .named("root")).origin)
+                }
+            )
         }
         // Long-press EMPTY SPACE → edit mode; child icons win with their own
         // long-press (context menu) so tapping an icon still opens it.
@@ -388,9 +524,9 @@ struct SpringBoardView: View {
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
-                .frame(width: iconSize + 12)
+                .frame(width: cellWidth - 2)
         }
-        .frame(width: iconSize + 12, height: iconSize + 22)
+        .frame(width: cellWidth, height: cellHeight)
         .offset(isDragging ? dragTranslation : .zero)
         .rotationEffect(.degrees(store.editMode ? (jiggle ? jiggleAngle(seed: seed)
                                                          : -jiggleAngle(seed: seed)) : 0),
@@ -405,7 +541,50 @@ struct SpringBoardView: View {
         .contentShape(Rectangle())
         .onTapGesture { if !store.editMode { open(item) } }
         .contextMenu { iconMenu(item) }
+        // Long-press-and-drag on an ICON enters edit mode and starts moving
+        // that icon — the gesture the user asked for. The drag gesture below
+        // only moves icons when edit mode is already on; this one turns edit
+        // mode ON by itself when the finger stays down and starts to move.
+        .simultaneousGesture(longPressDragGesture(item: item, slot: slot))
         .simultaneousGesture(dragGesture(item: item, slot: slot))
+    }
+
+    /// Long-press then drag → enter edit mode and drag the icon.
+    ///
+    /// Implemented as a `LongPressGesture` sequenced with a `DragGesture`:
+    /// the long press must succeed first (0.28 s), and only a subsequent
+    /// movement starts the drag. A plain long press without movement still
+    /// shows the context menu (the `contextMenu` above wins that case).
+    private func longPressDragGesture(item: DesktopItem, slot: IconSlot) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.28)
+            .sequenced(before: DragGesture(minimumDistance: 6))
+            .onChanged { value in
+                switch value {
+                case .first(true):
+                    // The long press has fired — the finger is on an icon, so the
+                    // pager must not page.
+                    isIconPressing = true
+                case .second(true, let drag):
+                    // The long press already happened — if we were not in edit
+                    // mode, enter it now and start dragging this icon.
+                    if !store.editMode {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                            store.editMode = true
+                        }
+                    }
+                    guard store.editMode else { return }
+                    draggingID = item.id
+                    dragTranslation = drag.translation
+                    updateTarget(for: item, slot: slot, translation: drag.translation)
+                default:
+                    break
+                }
+            }
+            .onEnded { value in
+                isIconPressing = false
+                guard case .second(true, _) = value else { return }
+                finishDrag(item: item, slot: slot)
+            }
     }
 
     /// Per-icon jiggle: different phase and direction per slot so the page
@@ -421,49 +600,71 @@ struct SpringBoardView: View {
                 guard store.editMode else { return }
                 draggingID = item.id
                 dragTranslation = v.translation
-                let dCol = Int((v.translation.width / colPitch).rounded())
-                let dRow = Int((v.translation.height / rowPitch).rounded())
-                let col = max(0, min(columns - 1, slot.col + dCol))
-                let row = max(0, min(rows - 1, slot.row + dRow))
-                // Where the dragged icon actually is, in "root" coordinates:
-                // grid origin + its row/col offset + the live drag translation.
-                let iconX = gridFrame.midX
-                    + (CGFloat(slot.col) - CGFloat(columns - 1) / 2) * colPitch
-                    + v.translation.width
-                let iconY = gridFrame.minY + 26 + CGFloat(slot.row) * rowPitch
-                    + iconSize / 2 + v.translation.height
-                // Dragging far enough down means "put it in the Dock".
-                if dockFrame.contains(CGPoint(x: iconX, y: iconY)) {
-                    target = nil
-                    store.dockHighlighted = true
-                } else {
-                    store.dockHighlighted = false
-                    target = IconSlot(page: slot.page, row: row, col: col)
-                }
+                updateTarget(for: item, slot: slot, translation: v.translation)
             }
             .onEnded { v in
                 guard store.editMode else { return }
-                defer {
-                    draggingID = nil
-                    dragTranslation = .zero
-                    target = nil
-                    store.dockHighlighted = false
-                }
-                if store.dockHighlighted {
-                    store.addToDock(item.id)
-                    return
-                }
-                guard let t = target, t != slot else { return }
-                if let occupant = store.items(onPage: slot.page).first(where: { store.slot(for: $0.id) == t }) {
-                    if case .folder(let f) = occupant.kind {
-                        store.addToFolder(item.id, folderID: f.id)
-                    } else {
-                        store.createFolder(with: [occupant.id, item.id])
-                    }
-                } else {
-                    store.place(item.id, at: t)
-                }
+                finishDrag(item: item, slot: slot)
             }
+    }
+
+    /// Work out which cell the dragged icon currently hovers over.
+    ///
+    /// Uses the SAME origin + pitch the layout used, so the highlighted target
+    /// is exactly the cell the icon will drop into. The old code recomputed a
+    /// different geometry (icon artwork size instead of cell size) and mixed it
+    /// with the page's mid-point — that is why icons landed in the wrong place
+    /// and the highlight appeared offset from the finger.
+    ///
+    /// `gridOrigin` is the grid's top-left in the shared "root" space, which is
+    /// the same space `dockFrame` uses — so the Dock hit test below is
+    /// consistent with the grid hit test.
+    private func updateTarget(for item: DesktopItem, slot: IconSlot, translation: CGSize) {
+        // The dragged icon's centre in root coordinates.
+        let cellCenterX = gridOrigin.x + CGFloat(slot.col) * gridPitch.width + gridPitch.width / 2
+        let cellCenterY = gridOrigin.y + CGFloat(slot.row) * gridPitch.height + gridPitch.height / 2
+        let point = CGPoint(x: cellCenterX + translation.width,
+                            y: cellCenterY + translation.height)
+
+        // Which cell is under it?
+        var col = Int(((point.x - gridOrigin.x) / gridPitch.width).rounded(.down))
+        var row = Int(((point.y - gridOrigin.y) / gridPitch.height).rounded(.down))
+        col = max(0, min(columns - 1, col))
+        row = max(0, min(rows - 1, row))
+
+        // The Dock strip sits below the grid — dragging there means "pin to Dock".
+        if dockFrame.contains(CGPoint(x: point.x, y: point.y)) {
+            target = nil
+            store.dockHighlighted = true
+        } else {
+            store.dockHighlighted = false
+            target = IconSlot(page: slot.page, row: row, col: col)
+        }
+    }
+
+    /// Commit a completed drag: pin to the Dock, drop into a folder, or place
+    /// the icon in the highlighted cell.
+    private func finishDrag(item: DesktopItem, slot: IconSlot) {
+        defer {
+            draggingID = nil
+            dragTranslation = .zero
+            target = nil
+            store.dockHighlighted = false
+        }
+        if store.dockHighlighted {
+            store.addToDock(item.id)
+            return
+        }
+        guard let t = target, t != slot else { return }
+        if let occupant = store.items(onPage: slot.page).first(where: { store.slot(for: $0.id) == t }) {
+            if case .folder(let f) = occupant.kind {
+                store.addToFolder(item.id, folderID: f.id)
+            } else {
+                store.createFolder(with: [occupant.id, item.id])
+            }
+        } else {
+            store.place(item.id, at: t)
+        }
     }
 
     private func iconMenu(_ item: DesktopItem) -> some View {
@@ -713,12 +914,33 @@ struct SpringBoardView: View {
 
 // MARK: - Preference keys (desktop / dock frames in the shared "root" space)
 
-struct FramePreferenceKey: PreferenceKey {
+struct DockFramePreferenceKey: PreferenceKey {
     static var defaultValue: CGRect = .zero
     static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
 }
 
-struct DockFramePreferenceKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+/// The home-screen grid's geometry, published by `pageView` so the drag
+/// gesture can convert a finger position into a target cell with the very
+/// same numbers the layout used.
+struct GridMetrics: Equatable {
+    var origin: CGPoint
+    var pitch: CGSize
+    var cell: CGSize
+}
+
+struct PageFramePreferenceKey: PreferenceKey {
+    static var defaultValue: GridMetrics = GridMetrics(origin: .zero,
+                                                        pitch: .zero,
+                                                        cell: .zero)
+    static func reduce(value: inout GridMetrics, nextValue: () -> GridMetrics) {
+        value = nextValue()
+    }
+}
+
+/// The page's origin in the shared "root" space.
+struct PageOriginPreferenceKey: PreferenceKey {
+    static var defaultValue: CGPoint = .zero
+    static func reduce(value: inout CGPoint, nextValue: () -> CGPoint) {
+        value = nextValue()
+    }
 }
