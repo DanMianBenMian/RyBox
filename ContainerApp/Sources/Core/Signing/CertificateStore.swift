@@ -41,6 +41,13 @@ public final class CertificateStore: ObservableObject {
     /// only stages the p12 bytes + password for the bundled helper, and the
     /// parser already proved the passphrase and the private key are real.
     private var p12VerifiedByFallback = false
+    /// Decoded identity material for the fallback path. Kept because the C
+    /// signer needs a leaf certificate + private key, and in fallback mode the
+    /// ONLY way to get them is our own decoder — `SecPKCS12Import` (which the
+    /// signer used to call) cannot read the file at all.
+    private var fallbackCertDER: Data?
+    private var fallbackKeyDER: Data?
+    private var fallbackKeyType: String = "rsa"
     private var provisioningData: Data?
     /// Raw p12 bytes (kept so CodeSigner can stage them for the bundled helper).
     private var p12Data: Data?
@@ -98,6 +105,8 @@ public final class CertificateStore: ObservableObject {
             }
             self.identity = (raw as! SecIdentity)
             self.p12VerifiedByFallback = false
+            self.fallbackCertDER = nil
+            self.fallbackKeyDER = nil
             self.p12Data = data
             self.p12Password = pw
             self.certificateInfo = Self.describe(identity: self.identity)
@@ -116,6 +125,9 @@ public final class CertificateStore: ObservableObject {
             case .success(let o):
                 self.identity = nil
                 self.p12VerifiedByFallback = true
+                self.fallbackCertDER = o.certDER
+                self.fallbackKeyDER = o.keyDER
+                self.fallbackKeyType = o.keyType
                 self.p12Data = data
                 self.p12Password = o.password
                 self.certificateInfo = "\(o.subject) · \(o.keyDescription) · \(o.scheme)"
@@ -200,6 +212,13 @@ public final class CertificateStore: ObservableObject {
     public func p12Passphrase() -> String? { p12Password }
     public func provisioningRawData() -> Data? { provisioningData }
 
+    /// True when the p12 could only be opened by RyBox's own decoder (OpenSSL 3
+    /// PBES2/AES-256-CBC files). In that mode the signer MUST take the DER path.
+    public var usesFallbackIdentity: Bool { p12VerifiedByFallback }
+    public func fallbackCertDER() -> Data? { fallbackCertDER }
+    public func fallbackKeyDER() -> Data? { fallbackKeyDER }
+    public func fallbackKeyIsEC() -> Bool { fallbackKeyType == "ec" }
+
     /// Decode the provisioning profile (CMS-wrapped plist) into its outer dict.
     public func provisioningPlist() -> [String: Any]? {
         guard let data = provisioningData else { return nil }
@@ -268,6 +287,9 @@ public final class CertificateStore: ObservableObject {
     public func reset() {
         identity = nil
         p12VerifiedByFallback = false
+        fallbackCertDER = nil
+        fallbackKeyDER = nil
+        fallbackKeyType = "rsa"
         p12Data = nil
         p12Password = nil
         provisioningData = nil
