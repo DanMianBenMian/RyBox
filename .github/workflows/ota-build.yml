@@ -60,6 +60,24 @@ jobs:
           echo "app_path=$APP" >> "$GITHUB_OUTPUT"
           echo "found: $APP"
 
+      - name: Fetch + build jbroot (best-effort)
+        # The virtual root ships as a standard Procursus bootstrap embedded in the
+        # IPA (Preinstalled/ProcursusBootstrap.zip) so RyBox unzips it on first
+        # launch — no firmware import. Built HERE from the public Procursus mirror
+        # to keep the git repo small (a committed bootstrap would bloat every
+        # clone). Best-effort: any failure only warns; Sileo still installs, its
+        # dpkg/apt tools just stay unavailable.
+        run: |
+          set -eo pipefail
+          OUT="preinstalled/ProcursusBootstrap.zip"
+          if [ -f "$OUT" ]; then echo "jbroot present, skipping fetch"; exit 0; fi
+          brew install zstd || echo "warn: zstd install failed"
+          URL="${JBROOT_URL:-https://apt.procurs.us/bootstraps/1700/bootstrap-iphoneos-arm64.tar.zst}"
+          echo "fetching bootstrap: $URL"
+          curl -fsSL -o /tmp/bootstrap.tar.zst "$URL" || { echo "jbroot download failed — skipping"; exit 0; }
+          python3 tools/make_jbroot.py --tarzst /tmp/bootstrap.tar.zst --out "$OUT" || echo "jbroot build failed — skipping"
+          ls -la "$OUT" 2>/dev/null || echo "no jbroot zip produced"
+
       - name: Stage preinstalled apps
         run: |
           set -eo pipefail
