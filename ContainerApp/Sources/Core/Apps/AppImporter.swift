@@ -5,10 +5,56 @@ import Compression
 /// sign every Mach-O with the distribution cert -> register in the app library.
 public final class AppImporter: ObservableObject {
     public static let shared = AppImporter()
-    private init() {}
+    private init() {
+        bootstrap()
+    }
 
     @Published public private(set) var lastImported: ImportedApp?
     @Published public private(set) var importedApps: [ImportedApp] = []
+
+    /// Re-register guests that were imported in a previous session. Imported
+    /// bundles live on disk under `VirtualRoot/Apps/<bid>.app`, so a relaunch
+    /// only needs to scan that directory and rebuild the in-memory registry —
+    /// the desktop then appears exactly as it did before (the earlier build lost
+    /// this: `importedApps` was in-memory only, so the desktop emptied and the
+    /// boot gate refused to proceed). Each bundle is re-signed on launch by
+    /// `GuestRuntime`, so `signNote` is left nil here.
+    func bootstrap() {
+        VirtualRoot.shared.ensure()
+        let appsDir = VirtualRoot.shared.rootURL.appendingPathComponent("Apps")
+        guard let names = try? fm.contentsOfDirectory(atPath: appsDir.path) else { return }
+        let existing = Set(importedApps.map { $0.bundleIdentifier })
+        for name in names where name.hasSuffix(".app") {
+            let bundleURL = appsDir.appendingPathComponent(name)
+            let plistURL = bundleURL.appendingPathComponent("Info.plist")
+            guard let data = try? Data(contentsOf: plistURL),
+                  let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                    as? [String: Any],
+                  let exe = plist["CFBundleExecutable"] as? String,
+                  let bid = plist["CFBundleIdentifier"] as? String,
+                  !existing.contains(bid) else { continue }
+
+            let isGUI = plist["UIApplicationSceneManifest"] != nil
+                       || plist["UILaunchStoryboardName"] != nil
+                       || plist["CFBundleIcons"] != nil
+            let displayName = (plist["CFBundleName"] as? String)
+                           ?? (plist["CFBundleDisplayName"] as? String)
+                           ?? (bid as NSString).lastPathComponent
+            let exePath = bundleURL.appendingPathComponent(exe).path
+            let iconPath = Self.extractIconPath(in: bundleURL, plist: plist)
+
+            let app = ImportedApp(name: displayName,
+                                  bundleIdentifier: bid,
+                                  executablePath: exePath,
+                                  isGUI: isGUI,
+                                  containerPath: bundleURL.path,
+                                  iconPath: iconPath,
+                                  signNote: nil)
+            DispatchQueue.main.async {
+                if !self.importedApps.contains(app) { self.importedApps.append(app) }
+            }
+        }
+    }
 
     private let fm = FileManager.default
 
