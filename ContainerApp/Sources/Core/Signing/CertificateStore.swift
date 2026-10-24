@@ -277,33 +277,50 @@ public final class CertificateStore: ObservableObject {
         let topKids = r.children(top)
         guard topKids.count >= 2, topKids[0].tag == RyASN1.OID else { return nil }
 
-        // contentType must be signedData (1.2.840.113549.1.7.2). Some profiles
-        // are wrapped in a degenerate `[0]`; walk down until we find a SEQUENCE
-        // that looks like a SignedData.
+        // contentType must be signedData (1.2.840.113549.1.7.2).
         guard RyASN1.oidString(topKids[0], r) == oidSignedData else { return nil }
 
-        // content [0] EXPLICIT -> SignedData
-        guard let contentWrapper = r.children(topKids[1]).first,
-              contentWrapper.tag == 0xA0 else { return nil }
-        guard let signedData = r.children(contentWrapper).first,
+        // content [0] EXPLICIT -> SignedData.
+        // NOTE: topKids[1] IS the [0] wrapper; its first child is the SignedData
+        // SEQUENCE. The previous code asserted the *child's* tag == 0xA0, but the
+        // child is a 0x30 SEQUENCE — so unwrapCMS always returned nil and every
+        // real profile was rejected as "无法识别". Check the wrapper, then descend.
+        guard topKids[1].tag == 0xA0,
+              let signedData = r.children(topKids[1]).first,
               signedData.tag == RyASN1.SEQUENCE else { return nil }
 
-        // SignedData children: version, digestAlgorithms, encapContentInfo, ...
-        let sdKids = r.children(signedData)
-        guard sdKids.count >= 3 else { return nil }
-        let encap = sdKids[2]
-        guard encap.tag == RyASN1.SEQUENCE else { return nil }
-
-        let encapKids = r.children(encap)
+        // SignedData children: version, digestAlgorithms, encapContentInfo,
+        // [certificates], [crls], signerInfos. Locate encapContentInfo by its
+        // `data` OID instead of hardcoding index 2, so an optional field or a
+        // slightly different encoding can't break the walk.
+        var encap: RyASN1.Reader.Element?
+        for kid in r.children(signedData) {
+            guard kid.tag == RyASN1.SEQUENCE else { continue }
+            let ek = r.children(kid)
+            guard ek.count >= 1, ek[0].tag == RyASN1.OID,
+                  RyASN1.oidString(ek[0], r) == oidData else { continue }
+            encap = kid
+            break
+        }
+        guard let encapInfo = encap else { return nil }
+        let encapKids = r.children(encapInfo)
         guard encapKids.count >= 2 else { return nil }
-        // eContentType
-        guard RyASN1.oidString(encapKids[0], r) == oidData else { return nil }
-        // eContent [0] EXPLICIT OCTET STRING
-        guard let eContentWrapper = r.children(encapKids[1]).first,
-              eContentWrapper.tag == 0xA0 else { return nil }
-        guard let octet = r.children(eContentWrapper).first,
-              octet.tag == RyASN1.OCTET_STRING else { return nil }
-        return Data(r.slice(octet))
+        // eContentType must already be `data` (matched above); eContent [0] EXPLICIT.
+        guard encapKids[1].tag == 0xA0,
+              let ec = r.children(encapKids[1]).first else { return nil }
+
+        // eContent is an OCTET STRING — primitive (0x04) normally, constructed
+        // (0x24) for large payloads. Concatenate segments in the latter case.
+        if ec.tag == RyASN1.OCTET_STRING {
+            return Data(r.slice(ec))
+        } else if ec.tag == 0x24 {
+            var out = Data()
+            for seg in r.children(ec) where seg.tag == RyASN1.OCTET_STRING {
+                out.append(Data(r.slice(seg)))
+            }
+            return out.isEmpty ? nil : out
+        }
+        return nil
     }
 
     private static let oidSignedData = "1.2.840.113549.1.7.2"
