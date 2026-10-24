@@ -28,6 +28,15 @@ void RyInstallGuestDyldHooks(void);
 /// Returns the dlopen handle (non-NULL on success) or NULL on failure.
 void *RyLaunchGuestExecutable(const char *execPath);
 
+/// Release the strong references the hook keeps on the guest's app delegate,
+/// scene delegate and window. Called when the guest is ejected ("回到主屏"),
+/// so the guest's UI objects can be deallocated.
+void RyReleaseGuestReferences(void);
+
+/// The window the guest put on screen (NULL when no guest is running).
+/// Swift uses it to raise the guest above the container window.
+void *RyGetGuestWindow(void);
+
 #ifdef __cplusplus
 }
 #endif
