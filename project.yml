@@ -40,6 +40,10 @@ settings:
     # libSystem). Link those frameworks explicitly so the C translation unit
     # resolves them.
     OTHER_LDFLAGS: "-lz -framework Security -framework CoreFoundation"
+    # Cross-directory quoted includes (e.g. Core/Filesystem/RyFsRedirect.m
+    # importing Core/GuestLoader/litehook.h) need an explicit recursive header
+    # search path, otherwise the main app build fails to resolve litehook.h.
+    HEADER_SEARCH_PATHS: "$(SRCROOT)/ContainerApp/Sources/**"
   configs:
     Debug:
       SWIFT_OPTIMIZATION_LEVEL: "-Onone"
