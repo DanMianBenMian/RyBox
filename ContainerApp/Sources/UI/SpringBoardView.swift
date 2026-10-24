@@ -564,9 +564,13 @@ struct SpringBoardView: View {
                     // The long press has fired — the finger is on an icon, so the
                     // pager must not page.
                     isIconPressing = true
-                case .second(true, let drag):
+                case .second(true, let drag?):
                     // The long press already happened — if we were not in edit
                     // mode, enter it now and start dragging this icon.
+                    //
+                    // NOTE the `drag?` — a sequenced gesture's `.second` case
+                    // carries an OPTIONAL drag value (`Value2?`), so it must be
+                    // unwrapped before `.translation` can be read.
                     if !store.editMode {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                             store.editMode = true
