@@ -14,15 +14,17 @@ final class PassThroughView: UIView {
 }
 
 /// Floating chrome shown WHILE A GUEST UI IS ON SCREEN (the container window is
-/// hidden at that point): a liquid-glass 主屏 key and a 弹出 App button.
+/// hidden at that point): a single liquid-glass 主屏 key.
 ///
-/// This window is intentionally NEVER installed at cold start. An always-on
-/// overlay window used to sit above the SpringBoard and swallow every touch in
-/// the container (document pickers, sheets, the desktop itself) — the UI only
-/// became interactive after tapping Home, which re-keyed the container window.
-/// The container's Home key is now a SwiftUI liquid-glass pill rendered INSIDE
-/// the SpringBoard window; this chrome exists only while a guest owns the
-/// screen, where it is made key so its own buttons stay tappable.
+/// The old "弹出 App" button has been removed — the virtual Home key IS the way
+/// out (it tears down the in-process guest and returns to SpringBoard), so a
+/// second eject control was redundant and confused the UI.
+///
+/// This window is intentionally NEVER installed at cold start. The container's
+/// Home key is a SwiftUI liquid-glass pill rendered INSIDE the SpringBoard
+/// window; this chrome exists only while a guest owns the screen, where it is
+/// made key so its button stays tappable while every other touch falls through
+/// to the guest window beneath.
 final class GuestChromeWindow {
     static let shared = GuestChromeWindow()
     private var window: UIWindow?
@@ -48,11 +50,7 @@ final class GuestChromeWindow {
         let home = chromeButton(title: "主屏", systemImage: "house.fill")
         home.addTarget(self, action: #selector(homeTapped), for: .touchUpInside)
 
-        let eject = chromeButton(title: "弹出 App", systemImage: "xmark")
-        eject.addTarget(self, action: #selector(ejectTapped), for: .touchUpInside)
-
         stack.addArrangedSubview(home)
-        stack.addArrangedSubview(eject)
         vc.view.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.trailingAnchor.constraint(equalTo: vc.view.safeAreaLayoutGuide.trailingAnchor,
@@ -62,7 +60,7 @@ final class GuestChromeWindow {
         ])
 
         win.rootViewController = vc
-        // Key + pass-through root: the buttons receive touches, everything
+        // Key + pass-through root: the button receives touches, everything
         // else falls through to the guest window beneath.
         win.makeKeyAndVisible()
         self.window = win
@@ -91,11 +89,7 @@ final class GuestChromeWindow {
     }
 
     @objc private func homeTapped() {
-        // Ejects the guest AND posts goHome so the SpringBoard resets.
+        // Tears down the in-process guest AND posts goHome so the SpringBoard resets.
         SpringBoardController.shared.goHome()
-    }
-
-    @objc private func ejectTapped() {
-        RyLaunchCoordinator.shared.ejectToContainer()
     }
 }
