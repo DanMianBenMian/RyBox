@@ -1,0 +1,23 @@
+name: probe
+# Throwaway diagnostics workflow: our ota-build jobs started failing instantly
+# (runner_id=0, no steps, no logs), which means GitHub never dispatched them.
+# This isolates WHY by running one trivial job per candidate label.
+on:
+  workflow_dispatch:
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ubuntu ok"
+  macos15:
+    runs-on: macos-15
+    steps:
+      - run: echo "macos-15 ok"
+  macos14:
+    runs-on: macos-14
+    steps:
+      - run: echo "macos-14 ok"
+  macoslatest:
+    runs-on: macos-latest
+    steps:
+      - run: echo "macos-latest ok"
