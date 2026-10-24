@@ -90,7 +90,7 @@ enum RyP12 {
             for bag in a3.children(scSeq) {
                 let bk = a3.children(bag)
                 guard bk.count >= 2, bk[0].tag == OID else { continue }
-                let bagId = oidString(bk[0], a3)
+                let bagId = RyASN1.oidString(bk[0], a3)
                 let inner = a3.children(bk[1])          // [0] EXPLICIT bagValue
 
                 switch bagId {
@@ -154,68 +154,14 @@ enum RyP12 {
 
     // MARK: - ASN.1
 
-    private static let SEQUENCE: UInt8 = 0x30
-    private static let OID: UInt8 = 0x06
-    private static let OCTET_STRING: UInt8 = 0x04
-    private static let INTEGER: UInt8 = 0x02
+    /// The DER primitives live in `RyASN1` — they are shared with the CMS
+    /// unwrapper in `CertificateStore`, which needs the same TLV walking.
+    private typealias ASN1 = RyASN1.Reader
 
-    private struct ASN1 {
-        typealias E = (tag: UInt8, lo: Int, hi: Int, end: Int)
-        let b: [UInt8]
-
-        init(_ data: Data) { b = [UInt8](data) }
-
-        /// Read the TLV at `i`. Handles both short and long-form lengths.
-        func at(_ i: Int) -> E? {
-            guard i + 2 <= b.count else { return nil }
-            let tag = b[i]
-            var p = i + 1
-            let lb = b[p]
-            p += 1
-            var len = 0
-            if lb & 0x80 != 0 {
-                let n = Int(lb & 0x7f)
-                guard n >= 1, n <= 8, p + n <= b.count else { return nil }
-                for k in 0..<n { len = (len << 8) | Int(b[p + k]) }
-                p += n
-            } else {
-                len = Int(lb)
-            }
-            guard p + len <= b.count else { return nil }
-            return (tag, p, p + len, p + len)
-        }
-
-        func children(_ e: E) -> [E] {
-            var out: [E] = []
-            var i = e.lo
-            while i < e.hi, let c = at(i), c.end <= e.hi {
-                out.append(c)
-                i = c.end
-            }
-            return out
-        }
-
-        func slice(_ e: E) -> [UInt8] { Array(b[e.lo..<e.hi]) }
-    }
-
-    private static func oidString(_ e: ASN1.E, _ a: ASN1) -> String {
-        let c = a.slice(e)
-        guard let first = c.first else { return "" }
-        var parts: [String] = []
-        if first < 80 {
-            parts.append(String(first / 40))
-            parts.append(String(first % 40))
-        } else {
-            parts.append("2")
-            parts.append(String(first - 80))
-        }
-        var v: UInt64 = 0
-        for byte in c.dropFirst() {
-            v = (v << 7) | UInt64(byte & 0x7f)
-            if byte & 0x80 == 0 { parts.append(String(v)); v = 0 }
-        }
-        return parts.joined(separator: ".")
-    }
+    private static let SEQUENCE = RyASN1.SEQUENCE
+    private static let OID = RyASN1.OID
+    private static let OCTET_STRING = RyASN1.OCTET_STRING
+    private static let INTEGER = RyASN1.INTEGER
 
     private static func intValue(_ c: [UInt8]) -> UInt64 {
         var v: UInt64 = 0
@@ -243,12 +189,12 @@ enum RyP12 {
 
     /// A ContentInfo is either plain `data` (an OCTET STRING holding DER) or
     /// `encryptedData` (which we have to decrypt first).
-    private static func safeContents(a: ASN1, ci: ASN1.E,
+    private static func safeContents(a: ASN1, ci: RyASN1.Element,
                                      password: String,
                                      scheme: inout String) -> [UInt8]? {
         let kids = a.children(ci)
         guard kids.count >= 2, kids[0].tag == OID else { return nil }
-        let type = oidString(kids[0], a)
+        let type = RyASN1.oidString(kids[0], a)
 
         if type == oidData {
             guard let wrapped = a.children(kids[1]).first, wrapped.tag == OCTET_STRING else {
@@ -276,11 +222,11 @@ enum RyP12 {
     /// PKCS#12 rule for the legacy schemes). The first candidate whose
     /// plaintext is a complete, well-formed DER SEQUENCE wins — a wrong
     /// password almost never satisfies that.
-    private static func decrypt(a: ASN1, algid: ASN1.E, cipher: [UInt8],
+    private static func decrypt(a: ASN1, algid: RyASN1.Element, cipher: [UInt8],
                                 password: String, scheme: inout String) -> [UInt8]? {
         let kids = a.children(algid)
         guard kids.count >= 2, kids[0].tag == OID else { return nil }
-        let alg = oidString(kids[0], a)
+        let alg = RyASN1.oidString(kids[0], a)
 
         if alg == oidPBES2 {
             return decryptPBES2(a: a, params: kids[1], cipher: cipher,
@@ -293,14 +239,14 @@ enum RyP12 {
         return nil
     }
 
-    private static func decryptPBES2(a: ASN1, params: ASN1.E, cipher: [UInt8],
+    private static func decryptPBES2(a: ASN1, params: RyASN1.Element, cipher: [UInt8],
                                      password: String, scheme: inout String) -> [UInt8]? {
         let pk = a.children(params)
         guard pk.count >= 2, pk[0].tag == SEQUENCE, pk[1].tag == SEQUENCE else { return nil }
 
         // --- PBKDF2 params ---
         let kdf = a.children(pk[0])
-        guard kdf.count >= 2, kdf[0].tag == OID, oidString(kdf[0], a) == oidPBKDF2,
+        guard kdf.count >= 2, kdf[0].tag == OID, RyASN1.oidString(kdf[0], a) == oidPBKDF2,
               kdf[1].tag == SEQUENCE else { return nil }
         let pb = a.children(kdf[1])
         guard pb.count >= 2, pb[0].tag == OCTET_STRING, pb[1].tag == INTEGER else { return nil }
@@ -317,7 +263,7 @@ enum RyP12 {
         if pb.count > idx, pb[idx].tag == SEQUENCE {
             let prfKids = a.children(pb[idx])
             if prfKids.count >= 1, prfKids[0].tag == OID {
-                switch oidString(prfKids[0], a) {
+                switch RyASN1.oidString(prfKids[0], a) {
                 case "1.2.840.113549.2.7":  prf = 1
                 case "1.2.840.113549.2.8":  prf = 4
                 case "1.2.840.113549.2.9":  prf = 2
@@ -331,7 +277,7 @@ enum RyP12 {
         // --- encryption scheme ---
         let enc = a.children(pk[1])
         guard enc.count >= 2, enc[0].tag == OID else { return nil }
-        let encOid = oidString(enc[0], a)
+        let encOid = RyASN1.oidString(enc[0], a)
         var ccAlg: Int32 = 1
         var defaultKeyLen = 32
         var ivLen = 16
@@ -373,7 +319,7 @@ enum RyP12 {
         return nil
     }
 
-    private static func decryptP12SHA1(a: ASN1, params: ASN1.E, cipher: [UInt8],
+    private static func decryptP12SHA1(a: ASN1, params: RyASN1.Element, cipher: [UInt8],
                                         password: String, scheme: inout String) -> [UInt8]? {
         let pk = a.children(params)
         guard pk.count >= 2, pk[0].tag == OCTET_STRING, pk[1].tag == INTEGER else { return nil }
@@ -471,7 +417,7 @@ enum RyP12 {
         guard kids.count >= 3, kids[1].tag == SEQUENCE, kids[2].tag == OCTET_STRING else { return nil }
         let algKids = a.children(kids[1])
         guard algKids.count >= 1, algKids[0].tag == OID else { return nil }
-        let algOid = oidString(algKids[0], a)
+        let algOid = RyASN1.oidString(algKids[0], a)
         let inner = a.slice(kids[2])            // PKCS#1 RSAPrivateKey / SEC1 ECPrivateKey
 
         var attrs: [String: Any] = [kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
@@ -505,7 +451,7 @@ enum RyP12 {
                 let ek = ec.children(e)
                 // SEC1: version, privateKey, [0] parameters OID, [1] publicKey
                 if ek.count >= 3, ek[2].tag == 0xA0, let po = ec.children(ek[2]).first, po.tag == OID {
-                    switch oidString(po, ec) {
+                    switch RyASN1.oidString(po, ec) {
                     case "1.2.840.10045.3.1.7": bits = 256; curveName = "P-256"
                     case "1.3.132.0.34":        bits = 384; curveName = "P-384"
                     case "1.3.132.0.35":        bits = 521; curveName = "P-521"
