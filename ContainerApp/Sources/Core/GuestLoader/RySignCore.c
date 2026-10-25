@@ -56,20 +56,6 @@ void ry_buf_be64(RyBuf *b, uint64_t v) {
     ry_buf_put(b, t, 8);
 }
 
-/// Append a 4-byte-length-prefixed string, zero-padded to a 4-byte boundary.
-/// This is the shape Apple's requirement expressions use for identifiers and
-/// certificate-field names.
-static void ry_put_padded(RyBuf *b, const unsigned char *s, size_t n) {
-    ry_buf_be32(b, (uint32_t)n);
-    ry_buf_put(b, s, n);
-    size_t pad = (4 - (n % 4)) % 4;
-    for (size_t i = 0; i < pad; i++) ry_buf_u8(b, 0);
-}
-
-static void ry_put_padded_str(RyBuf *b, const char *s) {
-    ry_put_padded(b, (const unsigned char *)s, strlen(s));
-}
-
 // ---------------------------------------------------------------------------
 // base64 (for the `cdhashes` plist)
 // ---------------------------------------------------------------------------
@@ -104,30 +90,36 @@ static void ry_base64(const unsigned char *in, size_t n, char *out, size_t outca
 // Requirements
 // ---------------------------------------------------------------------------
 //
-// The designated requirement is a byte-coded expression tree (zsign's
-// `SlotBuildRequirements`). The exact byte sequence below was measured
-// against BOTH:
-//   • the golden App Store Sileo signature (org.coolstar.SileoStore), and
-//   • LiveContainer's vendored zsign (`pack3`/`pack4` in SlotBuildRequirements),
-// and they agree byte-for-byte:
+// The designated requirement (DR) is a fixed byte template — LiveContainer's
+// vendored zsign (`ZSign::SlotBuildRequirements`, lc_signing.cpp:136) builds
+// the exact same bytes for every single app it signs, so this is the only
+// reference that matters. The template is:
 //
-//   opTrue
-//   opAnd opIdent("<bundleID>")
-//   opAnd opAppleGenericAnchor
-//   opAnd opCertField(slot=0, "subject.CN", match=1 /*equal*/, "<CN>")
-//   opCertGeneric(slot=1, 1.2.840.113635.100.6.2.1 /*DER content form, not
-//     NUL-terminated*/, match=0 /*exists*/)
+//   magic1  fade0c01                     (CSMAGIC_REQUIREMENTS)
+//   uLength1
+//   pack1   00000001 00000003 00000014    count=1, type=3 (designated), off=20
+//   magic2  fade0c00                     (CSMAGIC_REQUIREMENT)
+//   uLength2
+//   pack2   00000001 00000006 00000002
+//   uBundldIDLength  + padded bundle id
+//   pack3   00000006 0000000f 00000006 0000000b 00000000 00000000
+//            0000000a "subject.CN" 00000000 00000001
+//   uSubjectCNLength  + padded subject CN
+//   pack4   0000000e 00000001 0000000a
+//            2a 86 48 86 f7 63 64 06 02 01 00000000 00000000
 //
-// Note the two match words — one after the field name (1 = equal) and one
-// after the WWDR OID (0 = exists). Both are mandatory; a missing trailing
-// word truncates the expression and AMFI rejects the whole signature.
+// Semantically: opAnd(opIdent(bundleID), opAnd(opAppleGenericAnchor,
+// opAnd(opCertField(slot0,"subject.CN",equal,CN), opCertGeneric(slot1,WWDR-OID,exists)))).
 //
-// Apple's WWDR intermediate marker OID 1.2.840.113635.100.6.2.1, in DER
-// content form (the OID is not NUL-terminated).
-static const unsigned char kAppleWWDROID[] = {
-    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x02, 0x01
-};
-
+// NOTE: strings are padded with NULs to a 4-byte boundary, but the *length*
+// field keeps the UNPADDED length — that asymmetry is what zsign does and
+// what the kernel's requirement parser expects.
+//
+// An earlier revision of this file hand-built an opTrue-prefixed expression
+// tree instead. It was WRONG: the kernel's requirement parser rejected it and
+// the whole signature was refused. This template is copied byte-for-byte from
+// zsign, which is what LiveContainer ships and what AMFI accepts in the
+// field.
 int ry_build_requirements(const RySignMeta *meta, RyBuf *out) {
     if (!meta || !out) return -1;
     ry_buf_init(out);
@@ -135,7 +127,7 @@ int ry_build_requirements(const RySignMeta *meta, RyBuf *out) {
     const char *bundle = (meta->bundle_id && meta->bundle_id[0]) ? meta->bundle_id : NULL;
     const char *cn = (meta->subject_cn && meta->subject_cn[0]) ? meta->subject_cn : NULL;
 
-    // ldid-style empty requirement set: magic + length(12) + count(0).
+    // zsign's ldid-style empty requirement set: magic + length(12) + count(0).
     if (!bundle || !cn) {
         ry_buf_be32(out, RY_CSMAGIC_REQUIREMENTS);
         ry_buf_be32(out, 12);
@@ -143,43 +135,49 @@ int ry_build_requirements(const RySignMeta *meta, RyBuf *out) {
         return 0;
     }
 
-    RyBuf expr;
-    ry_buf_init(&expr);
-    ry_buf_be32(&expr, RY_REQ_OP_TRUE);
+    static const unsigned char pack1[] = {
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x14
+    };
+    static const unsigned char pack2[] = {
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x02
+    };
+    static const unsigned char pack3[] = {
+        0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x06,
+        0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+        0x73, 0x75, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x2e, 0x43, 0x4e,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+    };
+    static const unsigned char pack4[] = {
+        0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a,
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x02, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
 
-    ry_buf_be32(&expr, RY_REQ_OP_AND);
-    ry_buf_be32(&expr, RY_REQ_OP_IDENT);
-    ry_put_padded_str(&expr, bundle);
+    size_t bundle_len = strlen(bundle);
+    size_t cn_len = strlen(cn);
+    size_t bundle_pad = (4 - (bundle_len % 4)) % 4;
+    size_t cn_pad = (4 - (cn_len % 4)) % 4;
 
-    ry_buf_be32(&expr, RY_REQ_OP_AND);
-    ry_buf_be32(&expr, RY_REQ_OP_APPLE_GENERIC_ANCHOR);
+    // Lengths, computed exactly like zsign does.
+    uint32_t uLength2 = (uint32_t)(sizeof(pack2) + 4 + sizeof(pack3) + 4 + sizeof(pack4)
+                                  + 4 + bundle_len + bundle_pad
+                                  + 4 + cn_len + cn_pad);
+    uint32_t uLength1 = (uint32_t)(sizeof(pack1) + 4 + 4 + uLength2);
 
-    ry_buf_be32(&expr, RY_REQ_OP_AND);
-    ry_buf_be32(&expr, RY_REQ_OP_CERT_FIELD);
-    ry_buf_be32(&expr, 0);                  // slot 0 = leaf certificate
-    ry_put_padded_str(&expr, "subject.CN");
-    ry_buf_be32(&expr, RY_MATCH_EQUAL);     // 1 = "equal" (measured)
-    ry_put_padded_str(&expr, cn);
-
-    ry_buf_be32(&expr, RY_REQ_OP_CERT_GENERIC);
-    ry_buf_be32(&expr, 1);                  // slot 1 = intermediate certificate
-    ry_put_padded(&expr, kAppleWWDROID, sizeof(kAppleWWDROID));
-    ry_buf_be32(&expr, RY_MATCH_EXISTS);    // 0 = "exists" (measured; was missing)
-
-    // Outer vector: magic + length + count + BlobIndex{type, offset}
-    uint32_t inner_len = (uint32_t)(8 + expr.len);
-    uint32_t outer_header = 20;             // magic+length+count+index(type+offset)
-    uint32_t total = outer_header + inner_len;
-
-    ry_buf_be32(out, RY_CSMAGIC_REQUIREMENTS);
-    ry_buf_be32(out, total);
-    ry_buf_be32(out, 1);                    // count
-    ry_buf_be32(out, RY_DESIGNATED_REQUIREMENT_TYPE);
-    ry_buf_be32(out, outer_header);         // offset of the inner blob
-    ry_buf_be32(out, RY_CSMAGIC_REQUIREMENT);
-    ry_buf_be32(out, inner_len);
-    ry_buf_put(out, expr.p, expr.len);
-    ry_buf_free(&expr);
+    ry_buf_be32(out, RY_CSMAGIC_REQUIREMENTS);   // magic1
+    ry_buf_be32(out, uLength1);
+    ry_buf_put(out, pack1, sizeof(pack1));
+    ry_buf_be32(out, RY_CSMAGIC_REQUIREMENT);    // magic2
+    ry_buf_be32(out, uLength2);
+    ry_buf_put(out, pack2, sizeof(pack2));
+    ry_buf_be32(out, (uint32_t)bundle_len);       // unpadded length
+    ry_buf_put(out, bundle, bundle_len);
+    for (size_t i = 0; i < bundle_pad; i++) ry_buf_u8(out, 0);
+    ry_buf_put(out, pack3, sizeof(pack3));
+    ry_buf_be32(out, (uint32_t)cn_len);           // unpadded length
+    ry_buf_put(out, cn, cn_len);
+    for (size_t i = 0; i < cn_pad; i++) ry_buf_u8(out, 0);
+    ry_buf_put(out, pack4, sizeof(pack4));
     return 0;
 }
 
