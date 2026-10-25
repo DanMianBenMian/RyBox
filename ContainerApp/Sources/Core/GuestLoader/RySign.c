@@ -514,7 +514,11 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         // (errSecUnsupportedAlgorithm?) style codes point at a key/algorithm
         // mismatch, which is exactly the failure that used to surface as a
         // bare "exit code 6". It now reaches the user through RyLog.
-        if (st == errSecSuccess) st = errSecUnsupportedAlgorithm; // all 4 skipped
+        // Every variant was skipped by SecKeyIsAlgorithmSupported. The count
+        // below already tells the story ("4 种算法密钥不支持"); the status is
+        // just a placeholder because errSecUnsupportedAlgorithm does not
+        // exist in the iOS SDK's SecBase.h.
+        if (st == errSecSuccess) st = errSecInternalComponent; // all 4 skipped
         g_sign_osstatus = (int)st;
         fprintf(stderr, "rysign: SecKeyCreateSignature failed osstatus=%d "
                 "(tried 4 algorithm variants, %d unsupported)\n", (int)st, skipped);
