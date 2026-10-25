@@ -195,7 +195,7 @@ final class DevBridge {
         }
 
         func pump() {
-            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _ in
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, _ in
                 guard let data = data, !data.isEmpty else {
                     // Connection closed.
                     if let p = pendingPush, let h = p.handle { try? h.close() }
@@ -301,26 +301,64 @@ final class DevBridge {
         return "ERR not utf8 (\(data.count)B binary)"
     }
 
+    // iOS has no `Process`; spawn via posix_spawn exactly like ProcessManager.
     private func runShell(_ shell: String) -> String {
         guard !shell.isEmpty else { return "ERR empty command" }
-        let pipeOut = Pipe(); let pipeErr = Pipe()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-        proc.arguments = ["-c", shell]
-        proc.standardOutput = pipeOut
-        proc.standardError = pipeErr
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            let out = pipeOut.fileHandleForReading.readDataToEndOfFile()
-            let err = pipeErr.fileHandleForReading.readDataToEndOfFile()
-            var s = "exit=\(proc.terminationStatus)\n"
-            if let o = String(data: out, encoding: .utf8), !o.isEmpty { s += "--- stdout ---\n\(o)" }
-            if let e = String(data: err, encoding: .utf8), !e.isEmpty { s += "--- stderr ---\n\(e)" }
-            return s
-        } catch {
-            return "ERR spawn: \(error)"
+        let path = "/bin/sh"
+        let args: [String] = ["-c", shell]
+
+        var pid: pid_t = 0
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+
+        var ioPipe: [Int32] = [0, 0]
+        pipe(&ioPipe)
+        // Redirect both stdout and stderr to the SAME pipe so a single drain
+        // cannot deadlock waiting on a full sibling pipe (ProcessManager does
+        // the same).
+        posix_spawn_file_actions_adddup2(&fileActions, ioPipe[1], 1)
+        posix_spawn_file_actions_adddup2(&fileActions, ioPipe[1], 2)
+        posix_spawn_file_actions_addclose(&fileActions, ioPipe[0])
+        posix_spawn_file_actions_addclose(&fileActions, ioPipe[1])
+
+        var argsC: [UnsafeMutablePointer<CChar>?] =
+            ([path] + args).map { $0.withCString(strdup) }
+        argsC.append(nil)
+
+        var envC: [UnsafeMutablePointer<CChar>?] = [ strdup("PATH=/usr/bin:/bin") ]
+        envC.append(nil)
+
+        let rc = posix_spawn(&pid, path, &fileActions, nil, &argsC, &envC)
+        argsC.forEach { free($0) }
+        envC.forEach { free($0) }
+        posix_spawn_file_actions_destroy(&fileActions)
+
+        guard rc == 0 else {
+            return "ERR spawn errno=\(rc) (\(String(cString: strerror(rc))))"
         }
+
+        close(ioPipe[1])
+        let data = readAll(fd: ioPipe[0])
+        close(ioPipe[0])
+
+        var st: Int32 = 0
+        waitpid(pid, &st, 0)
+        let exitCode = WIFEXITED(st) ? WEXITSTATUS(st) : -1
+
+        var s = "exit=\(exitCode)\n"
+        if let o = String(data: data, encoding: .utf8), !o.isEmpty { s += "--- output ---\n\(o)" }
+        return s
+    }
+
+    private func readAll(fd: Int32) -> Data {
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var n: ssize_t = 0
+        repeat {
+            n = read(fd, &buf, buf.count)
+            if n > 0 { data.append(buf, count: Int(n)) }
+        } while n > 0
+        return data
     }
 
     private func resign(_ bid: String) -> String {
