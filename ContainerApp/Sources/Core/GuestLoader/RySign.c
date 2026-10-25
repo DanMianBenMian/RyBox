@@ -765,13 +765,34 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     fprintf(stderr, "rysign: SuperBlob built (%zu bytes), writing at dataoff=%u\n",
             sb.len, sig_dataoff);
 
-    // Write in place at dataoff; grow the file tail only if the new blob is
-    // larger than the old signature region (zsign parity).
+    // ---- write back (LiveContainer / zsign parity — the errno=85 fix) -----
     //
-    // A stale or corrupt LC_CODE_SIGNATURE can point PAST EOF (a decrypted or
-    // hand-patched binary). `avail` is a size_t subtraction, so it would wrap
-    // around to a huge value and the memcpy below would write far past the
-    // buffer — a hard crash instead of a clean error. Refuse instead.
+    // HARD RULE, paid for on the device (2026-10-25): the CodeDirectory
+    // hashes page 0, and page 0 CONTAINS the load commands. Any write to
+    // LC_CODE_SIGNATURE.datasize — or to __LINKEDIT.filesize/vmsize — AFTER
+    // the hashes were computed silently invalidates them, and the kernel
+    // then refuses dlopen with
+    //     code signature invalid … (errno=85) … codeBlobOffset=…, codeBlobSize=…
+    // even though the SuperBlob itself is perfectly well-formed. That is
+    // exactly what happened with Sileo: the original datasize is 64848, our
+    // blob is 61312, and the old code "helpfully" shrank the field
+    // post-hash. The kernel FOUND the blob (it printed offset+size) and
+    // rejected it — the page-0 hash no longer matched.
+    //
+    // zsign's ZArchO::Sign() therefore does a BARE memcpy when the reserved
+    // region fits: it never touches the load commands, and the stale,
+    // LARGER datasize is fine (the kernel parses the SuperBlob by its own
+    // header length). When the region does not fit,
+    // ZArchO::ReallocCodeSignSpace() FIRST finalises __LINKEDIT and the
+    // LC_CODE_SIGNATURE command — i.e. every hashed byte — grows the file,
+    // and only THEN builds the signature. Same order here: mutate the
+    // hashed bytes, then re-hash and rebuild.
+    //
+    // A stale or corrupt LC_CODE_SIGNATURE can also point PAST EOF (a
+    // decrypted or hand-patched binary). `avail` is a size_t subtraction,
+    // so it would wrap around to a huge value and the memcpy below would
+    // write far past the buffer — a hard crash instead of a clean error.
+    // Refuse instead.
     if (sig_dataoff > *len) {
         fprintf(stderr, "rysign: LC_CODE_SIGNATURE.dataoff=%u is past EOF (%zu bytes)\n",
                 sig_dataoff, *len);
@@ -780,29 +801,85 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         return -11;
     }
     size_t avail = (*len) - (size_t)sig_dataoff;
-    if (sb.len <= avail) {
+    int need_grow = (sb.len > avail);                          // blob doesn't fit
+    int need_ds   = (sig_lc->datasize < (uint32_t)sb.len);     // LC claims too small a region
+
+    if (!need_grow && !need_ds) {
+        // Fits, and the LC already claims a region >= the blob: a bare
+        // memcpy, ZERO load-command mutation (zsign ZArchO::Sign parity).
         memcpy(buf + sig_dataoff, sb.p, sb.len);
-        if (avail > sb.len) memset(buf + sig_dataoff + sb.len, 0, avail - sb.len);
-        sig_lc->datasize = (uint32_t)sb.len;
+        // Hygiene only: blank the tail of the OLD signature region, and
+        // never past it — bytes beyond dataoff+datasize can be real
+        // __LINKEDIT data (symbol tables etc.), and they sit outside the
+        // hashed range anyway.
+        size_t old_region = ((size_t)sig_datasize < avail) ? (size_t)sig_datasize : avail;
+        if (old_region > sb.len)
+            memset(buf + sig_dataoff + sb.len, 0, old_region - sb.len);
     } else {
-        size_t new_len = (size_t)sig_dataoff + sb.len;
-        if (linkedit) {
-            linkedit->filesize = (uint64_t)new_len - linkedit->fileoff;
-            uint64_t new_vmsize = (linkedit->filesize + 0xFFFULL) & ~(uint64_t)0xFFFULL;
-            if (new_vmsize > linkedit->vmsize) linkedit->vmsize = new_vmsize;
-        } else {
-            fprintf(stderr, "rysign: no __LINKEDIT segment; growing file without it\n");
+        // The layout must change. Finalise EVERY hashed byte FIRST.
+        if (need_grow) {
+            size_t new_len = (size_t)sig_dataoff + sb.len;
+            if (linkedit) {
+                linkedit->filesize = (uint64_t)new_len - linkedit->fileoff;
+                uint64_t new_vmsize = (linkedit->filesize + 0xFFFULL) & ~(uint64_t)0xFFFULL;
+                if (new_vmsize > linkedit->vmsize) linkedit->vmsize = new_vmsize;
+            } else {
+                fprintf(stderr, "rysign: no __LINKEDIT segment; growing file without it\n");
+            }
         }
         sig_lc->datasize = (uint32_t)sb.len;
-        unsigned char *nb = (unsigned char *)realloc(buf, new_len);
-        if (!nb) {
+        if (need_grow) {
+            unsigned char *nb = (unsigned char *)realloc(buf, (size_t)sig_dataoff + sb.len);
+            if (!nb) {
+                ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+                ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
+                return -7;
+            }
+            memset(nb + *len, 0, (size_t)sig_dataoff + sb.len - *len);
+            buf = nb; *pbuf = nb; *len = (size_t)sig_dataoff + sb.len;
+            // hdr/sig_lc/linkedit/textseg now dangle — nothing below
+            // dereferences them; the rebuild only reads `buf`.
+        }
+
+        // ... then RE-HASH the now-final bytes and rebuild the signature.
+        // Only page 0 changed, so every length is identical and the second
+        // pass produces a blob of exactly the same size (the LC we just
+        // wrote is therefore still correct).
+        ry_buf_free(&cd1); ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
+        if (ry_build_codedirectory(0, buf, code_limit, &meta, 0, 0,
+                                   exec_seg_limit, exec_seg_flags, &g_hash, &cd1) != 0 ||
+            ry_build_codedirectory(1, buf, code_limit, &meta, 0, 0,
+                                   exec_seg_limit, exec_seg_flags, &g_hash, &cd2) != 0) {
+            ry_buf_free(&req); ry_buf_free(&ent_blob);
+            ry_buf_free(&cd1); ry_buf_free(&cd2);
+            return -4;
+        }
+        if (build_cms(cd1.p, cd1.len, cd2.p, cd2.len, privKey, certs, cert_lens, n_certs,
+                      issuer, issuer_len, serial, serial_len, &cms) != 0) {
+            fprintf(stderr, "rysign: build_cms (rebuild pass) failed\n");
+            ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+            ry_buf_free(&cd2); ry_buf_free(&cms);
+            return -5;
+        }
+        if (ry_build_superblob(&cd1, &req, ent_blob.len ? &ent_blob : NULL, NULL,
+                               &cd2, &cms, &sb) != 0) {
             ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
             ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
-            return -7;
+            return -6;
         }
-        memset(nb + *len, 0, new_len - *len);
-        memcpy(nb + sig_dataoff, sb.p, sb.len);
-        *pbuf = nb; *len = new_len;
+        if (sb.len > (size_t)(*len - (size_t)sig_dataoff)) {
+            // Paranoia: the rebuild must not have GROWN (a shrink would be
+            // the harmless zsign-stale case; a grow would overflow the
+            // region we just told the LC about). Never touches sig_lc —
+            // after a grow it dangles.
+            fprintf(stderr, "rysign: rebuild grew the blob past the region "
+                            "(room %zu, blob %zu)\n",
+                    (size_t)(*len - (size_t)sig_dataoff), sb.len);
+            ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+            ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
+            return -6;
+        }
+        memcpy(buf + sig_dataoff, sb.p, sb.len);
     }
 
     ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
