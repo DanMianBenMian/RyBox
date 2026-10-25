@@ -954,9 +954,10 @@ struct SpringBoardView: View {
                 .onLongPressGesture(minimumDuration: 0.4) { showAppSwitcher = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        // Same source as the guest chrome (UIScreen's real safe-area inset) so
-        // the key never jumps when a guest opens or closes.
-        .padding(.bottom, UIScreen.main.safeAreaInsets.bottom + 4)
+        // Same source as the guest chrome (DeviceSafeArea's real safe-area
+        // inset, read from the host window) so the key never jumps when a guest
+        // opens or closes.
+        .padding(.bottom, DeviceSafeArea.bottomInset() + 4)
     }
 
     private var editHint: some View {
