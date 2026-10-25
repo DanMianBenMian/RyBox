@@ -105,16 +105,22 @@ static void ry_base64(const unsigned char *in, size_t n, char *out, size_t outca
 // ---------------------------------------------------------------------------
 //
 // The designated requirement is a byte-coded expression tree (zsign's
-// `SlotBuildRequirements`):
+// `SlotBuildRequirements`). The exact byte sequence below was measured
+// against BOTH:
+//   • the golden App Store Sileo signature (org.coolstar.SileoStore), and
+//   • LiveContainer's vendored zsign (`pack3`/`pack4` in SlotBuildRequirements),
+// and they agree byte-for-byte:
 //
-//   true and (
-//     ident("<bundleID>") and (
-//       appleGenericAnchor and (
-//         certField(leaf, "subject.CN", equal, "<CN>") and
-//         certGeneric(1, 1.2.840.113635.100.6.2.1, exists)
-//       )
-//     )
-//   )
+//   opTrue
+//   opAnd opIdent("<bundleID>")
+//   opAnd opAppleGenericAnchor
+//   opAnd opCertField(slot=0, "subject.CN", match=1 /*equal*/, "<CN>")
+//   opCertGeneric(slot=1, 1.2.840.113635.100.6.2.1 /*DER content form, not
+//     NUL-terminated*/, match=0 /*exists*/)
+//
+// Note the two match words — one after the field name (1 = equal) and one
+// after the WWDR OID (0 = exists). Both are mandatory; a missing trailing
+// word truncates the expression and AMFI rejects the whole signature.
 //
 // Apple's WWDR intermediate marker OID 1.2.840.113635.100.6.2.1, in DER
 // content form (the OID is not NUL-terminated).
@@ -152,12 +158,13 @@ int ry_build_requirements(const RySignMeta *meta, RyBuf *out) {
     ry_buf_be32(&expr, RY_REQ_OP_CERT_FIELD);
     ry_buf_be32(&expr, 0);                  // slot 0 = leaf certificate
     ry_put_padded_str(&expr, "subject.CN");
-    ry_buf_be32(&expr, RY_MATCH_EQUAL);
+    ry_buf_be32(&expr, RY_MATCH_EQUAL);     // 1 = "equal" (measured)
     ry_put_padded_str(&expr, cn);
 
     ry_buf_be32(&expr, RY_REQ_OP_CERT_GENERIC);
     ry_buf_be32(&expr, 1);                  // slot 1 = intermediate certificate
     ry_put_padded(&expr, kAppleWWDROID, sizeof(kAppleWWDROID));
+    ry_buf_be32(&expr, RY_MATCH_EXISTS);    // 0 = "exists" (measured; was missing)
 
     // Outer vector: magic + length + count + BlobIndex{type, offset}
     uint32_t inner_len = (uint32_t)(8 + expr.len);
