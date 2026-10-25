@@ -39,6 +39,15 @@ enum RyP12 {
         /// wants: PKCS#1 `RSAPrivateKey` for RSA, SEC1 `ECPrivateKey` for EC
         /// (i.e. the INNER key, not the PKCS#8 wrapper).
         let keyDER: Data
+        /// The FULL decrypted PKCS#8 `PrivateKeyInfo` (wrapper included).
+        ///
+        /// Why both forms: the device log (2026-10-25, rc=8 "私钥无法创建")
+        /// proved `SecKeyCreateWithData` can refuse a well-formed key — and we
+        /// were throwing away the CFError that says which form it wanted, so
+        /// nobody could tell PKCS#1 from PKCS#8 rejection. The signer now tries
+        /// BOTH readings of the material, and the keychain importer takes the
+        /// PKCS#8 first.
+        let keyPKCS8: Data
         /// "rsa" or "ec".
         let keyType: String
     }
@@ -149,6 +158,7 @@ enum RyP12 {
                                 isModernEncryption: usedScheme.contains("PBES2"),
                                 certDER: Data(certBytes),
                                 keyDER: Data(keyInfo.inner),
+                                keyPKCS8: Data(key8),
                                 keyType: keyInfo.keyType))
     }
 
@@ -469,7 +479,23 @@ enum RyP12 {
         // Returns nil (rather than throwing) when Security dislikes the blob;
         // for EC keys that happens on some iOS versions even with valid DER,
         // which is why a nil key here is not treated as a hard failure.
-        _ = SecKeyCreateWithData(Data(inner) as CFData, attrs as CFDictionary, &error)
+        //
+        // 2026-10-25: the device then went on to fail with rc=8 "私钥无法创建"
+        // and we had NO idea why, because this CFError was being dropped on the
+        // floor (and the C signer dropped its copy too). Log it: the domain +
+        // code + description distinguish "unsupported key format" from
+        // "parameters rejected" — which is the difference between feeding
+        // Security the PKCS#1 inner vs the full PKCS#8.
+        let probe = SecKeyCreateWithData(Data(inner) as CFData, attrs as CFDictionary, &error)
+        if let probe {
+            CFRelease(probe)
+        } else if let e = error?.takeRetainedValue() {
+            let ns = e as NSError
+            RyLog.shared.log("RyP12 探测 SecKeyCreateWithData 失败：\(ns.localizedDescription)（domain=\(ns.domain) code=\(ns.code)）——仍继续，签名器会尝试完整 PKCS#8 与钥匙串两条路",
+                             level: .warn, tag: "sign")
+        } else {
+            RyLog.shared.log("RyP12 探测 SecKeyCreateWithData 返回 nil 且无 CFError", level: .warn, tag: "sign")
+        }
         return KeyMaterial(description: description, keyType: keyType, inner: inner)
     }
 }
