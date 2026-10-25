@@ -388,33 +388,48 @@ final class DevBridge {
     }
 
     /// Best-effort LAN IPv4 of the device, for the Settings screen.
+    ///
+    /// The old version only matched a hard-coded allow-list (`en0` / `pdp_ip0`
+    /// / `bridge0`); on any device whose active interface is named differently
+    /// (USB Ethernet, a tethered/`en1` Wi-Fi, a personal-hotspot bridge, …) it
+    /// fell through to `"unknown"` and the Settings screen showed `:2222`.
+    /// We now take the first usable non-loopback IPv4 address, preferring Wi-Fi
+    /// (`en0`) when present, then any `en*`, then cellular / bridge interfaces.
     func localIP() -> String {
-        var addr = "unknown"
         var ifaddrs: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddrs) == 0, let first = ifaddrs else { return addr }
+        guard getifaddrs(&ifaddrs) == 0, let first = ifaddrs else { return "unknown" }
         defer { freeifaddrs(ifaddrs) }
+
+        var candidates: [String: String] = [:]   // interface name -> IPv4
         var p = first
         while true {
-            guard p.pointee.ifa_addr != nil else {
-                if p.pointee.ifa_next == nil { break }
-                p = p.pointee.ifa_next
-                continue
-            }
-            let fam = p.pointee.ifa_addr.pointee.sa_family
-            if fam == UInt8(AF_INET) {
+            if let addr = p.pointee.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_INET) {
                 let name = String(cString: p.pointee.ifa_name)
-                if name == "en0" || name == "pdp_ip0" || name == "bridge0" {
-                    var sin = p.pointee.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                // Skip loopback and the Apple wireless / tunnel virtuals.
+                let skip = name == "lo0"
+                    || name.hasPrefix("awdl")
+                    || name.hasPrefix("llw")
+                    || name.hasPrefix("utun")
+                if !skip {
+                    var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
                     var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
                     if let c = inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) {
-                        addr = String(cString: c)
-                        if name == "en0" { break }
+                        let ip = String(cString: c)
+                        if ip != "127.0.0.1" { candidates[name] = ip }
                     }
                 }
             }
             if p.pointee.ifa_next == nil { break }
             p = p.pointee.ifa_next
         }
-        return addr
+
+        // Preference order: Wi-Fi, then any wired/en*, then cellular, then bridge,
+        // then whatever else we found.
+        if let en0 = candidates["en0"] { return en0 }
+        if let en = candidates.first(where: { $0.key.hasPrefix("en") })?.value { return en }
+        if let pdp = candidates.first(where: { $0.key.hasPrefix("pdp") })?.value { return pdp }
+        if let bridge = candidates.first(where: { $0.key.hasPrefix("bridge") })?.value { return bridge }
+        return candidates.first?.value ?? "unknown"
     }
 }
