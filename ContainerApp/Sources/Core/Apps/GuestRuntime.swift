@@ -48,7 +48,10 @@ enum GuestRuntime {
             let patchRC = RyPatchGuestExecutable(exePath)
             guard patchRC == 0 else {
                 RyLog.shared.log("Mach-O 补丁失败 (rc=\(patchRC))：\(exePath)", level: .error, tag: "guest")
-                DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
+                DispatchQueue.main.async {
+                    GuestWindowHost.shared.presentScaffold(bundleURL,
+                        reason: "Mach-O 补丁失败（退出码 \(patchRC)）")
+                }
                 return
             }
             RyLog.shared.log("fs  WRITE  \(exePath) (Mach-O patched MH_EXECUTE->MH_DYLIB)", level: .info, tag: "guest")
@@ -56,7 +59,14 @@ enum GuestRuntime {
             // 2) Re-sign the patched binary (JIT-less; required by AMFI).
             if case .failure(let err) = CodeSigner.shared.sign(bundleAt: bundleURL.path) {
                 RyLog.shared.log("guest 重新签名失败：\(err.localizedDescription)", level: .error, tag: "guest")
-                DispatchQueue.main.async { GuestWindowHost.shared.presentScaffold(bundleURL) }
+                DispatchQueue.main.async {
+                    // Show the REAL reason. This screen used to render the
+                    // guest's storyboard instead, which looked like the app
+                    // half-launched (Sileo: black screen + tab bar) while none
+                    // of its code had run.
+                    GuestWindowHost.shared.presentScaffold(bundleURL,
+                        reason: err.localizedDescription)
+                }
                 return
             }
             RyLog.shared.log("ks  WRITE  \(bundleURL.path) (bundle re-signed)", level: .info, tag: "guest")
@@ -86,7 +96,8 @@ enum GuestRuntime {
                 RyLog.shared.log("ks  EXEC   \(exePath) (guest entry point)", level: .info, tag: "guest")
                 if RyLaunchGuestExecutable(exePath) == nil {
                     RyLog.shared.log("guest dlopen/启动失败", level: .error, tag: "guest")
-                    GuestWindowHost.shared.presentScaffold(bundleURL)
+                    GuestWindowHost.shared.presentScaffold(bundleURL,
+                        reason: "dlopen 或入口跳转失败（签名后的二进制仍无法载入）")
                 }
             }
         }
