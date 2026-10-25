@@ -56,6 +56,17 @@ public final class CertificateStore: ObservableObject {
     /// `RyP12.Outcome.keyPKCS8`.
     private var decodedKeyPKCS8: Data?
     private var fallbackKeyType: String = "rsa"
+    /// Full certificate chain carried by the p12 (leaf + intermediates), as
+    /// DER. Sourced from `kSecImportItemCertChain` (SecPKCS12Import path) or
+    /// from every certBag in RyP12 (fallback path). The signer needs this to
+    /// embed the WWDR intermediate at CMS slot 1 — the DR requires
+    /// `certificate 1[1.2.840.113635.100.6.2.1 exists]`, and a leaf-only CMS
+    /// fails trust evaluation on a non-jailbroken device (errno=85).
+    private var identityCertChain: [Data]?
+    /// The leaf certificate as a live `SecCertificateRef`, kept so the signer
+    /// can build the rest of the chain (intermediate / root) from the system
+    /// trust store via `SecTrust` when the p12 omits the intermediate.
+    private var signingLeafCert: SecCertificate?
     private var provisioningData: Data?
     /// Raw p12 bytes (kept so CodeSigner can stage them for the bundled helper).
     private var p12Data: Data?
@@ -118,6 +129,30 @@ public final class CertificateStore: ObservableObject {
             self.decodedKeyPKCS8 = nil
             self.p12Data = data
             self.p12Password = pw
+            // Capture the FULL chain the importer resolved (leaf + any
+            // intermediates it could find), so the signer can embed the WWDR
+            // intermediate at CMS slot 1. `kSecImportItemCertChain` is present
+            // when the p12 carries more than the leaf.
+            if let chain = first[kSecImportItemCertChain as String] as? [Any] {
+                var derChain: [Data] = []
+                for item in chain {
+                    let cf = item as CFTypeRef
+                    if CFGetTypeID(cf) == SecCertificateGetTypeID() {
+                        if let d = SecCertificateCopyData(cf as! SecCertificate) as Data? {
+                            derChain.append(d)
+                        }
+                    }
+                }
+                self.identityCertChain = derChain.isEmpty ? nil : derChain
+            } else {
+                self.identityCertChain = nil
+            }
+            // Keep the leaf certificate so the signer can extend the chain from
+            // the system trust store at sign time.
+            var leaf: SecCertificate? = nil
+            if SecIdentityCopyCertificate(self.identity!, &leaf) == errSecSuccess {
+                self.signingLeafCert = leaf
+            }
             self.certificateInfo = Self.describe(identity: self.identity)
             refresh()
             save()
@@ -138,6 +173,14 @@ public final class CertificateStore: ObservableObject {
                 self.decodedKey = o.keyDER
                 self.decodedKeyPKCS8 = o.keyPKCS8
                 self.fallbackKeyType = o.keyType
+                // RyP12 decodes every certBag, so the full chain (leaf +
+                // intermediates) is available even from an OpenSSL-3 p12 that
+                // SecPKCS12Import cannot read. Feed it to the signer so the
+                // WWDR intermediate reaches CMS slot 1.
+                self.identityCertChain = o.certChain.isEmpty ? nil : o.certChain
+                if let leaf = SecCertificateCreateWithData(nil, o.certDER as CFData) {
+                    self.signingLeafCert = leaf
+                }
                 // A DIFFERENT p12 means a DIFFERENT key: drop the keychain item
                 // left by the previous import, or the SecItemAdd later (same
                 // application tag) would fail with a duplicate-item error and
@@ -514,6 +557,112 @@ public final class CertificateStore: ObservableObject {
         return plist["DeveloperCertificates"] as? [Data]
     }
 
+    /// The certificate set to embed in the guest's CMS, EXCLUDING the leaf
+    /// (the signer always prepends the leaf as slot 0). The result is ordered
+    /// so the **WWDR intermediate lands at slot 1** — the DR requires
+    /// `certificate 1[1.2.840.113635.100.6.2.1 exists]`, so slot 1 MUST be the
+    /// WWDR intermediate; anything else there fails trust evaluation
+    /// (`code signature invalid`, errno=85) even with perfect hashes.
+    ///
+    /// Sources, unioned and de-duplicated:
+    ///   1. the WWDR intermediate resolved from the system trust store via
+    ///      `SecTrust` (most reliable — the device ships the Apple root + WWDR
+    ///      as anchors, and `SecTrust` supplies the intermediate even when the
+    ///      p12 carries only the leaf),
+    ///   2. the full chain carried by the p12 (`identityCertChain`),
+    ///   3. the profile's `DeveloperCertificates`,
+    ///   4. a direct `SecItem` scan of the certificate store for the WWDR
+    ///      (covers iOS builds where `SecTrust` is unusually constrained).
+    ///
+    /// The leaf's DER is excluded so it cannot displace the intermediate at
+    /// slot 1.
+    public func signingIntermediateCertificates() -> [Data] {
+        let leafDER = (signingLeafCert.flatMap { SecCertificateCopyData($0) as Data? })
+        var seen = Set<Data>()
+        var wwdr: [Data] = []
+        var others: [Data] = []
+
+        func take(_ c: Data, wwdrFirst: Bool) {
+            guard c.count > 0 else { return }
+            if let leaf = leafDER, leaf == c { return }   // never re-add the leaf
+            if seen.contains(c) { return }
+            seen.insert(c)
+            if isWWDR(c) {
+                if wwdrFirst { wwdr.append(c) } else { others.append(c) }
+            } else {
+                others.append(c)
+            }
+        }
+
+        // 1) system-trust chain of the leaf (gives the WWDR intermediate)
+        for c in systemTrustChain().dropFirst(1) { take(c, wwdrFirst: true) }
+        // 2) p12 chain
+        if let chain = identityCertChain { for c in chain { take(c, wwdrFirst: true) } }
+        // 3) profile
+        if let prof = provisioningCertificates() { for c in prof { take(c, wwdrFirst: true) } }
+        // 4) direct WWDR scan of the certificate store
+        for c in systemWWDRCertificates() { take(c, wwdrFirst: true) }
+
+        // WWDR first, then any remaining intermediates/roots. This guarantees
+        // the FIRST extra cert (→ CMS slot 1) is the WWDR intermediate.
+        return wwdr + others
+    }
+
+    /// True when `cert` is an Apple Worldwide Developer Relations
+    /// Certification Authority certificate (the intermediate the DR checks for).
+    private func isWWDR(_ cert: Data) -> Bool {
+        guard let c = SecCertificateCreateWithData(nil, cert as CFData) else { return false }
+        let summary = (SecCertificateCopySubjectSummary(c) as? String) ?? ""
+        return summary.contains("Apple Worldwide Developer Relations")
+    }
+
+    /// Build the chain the system trust store assembles for the leaf: drop the
+    /// leaf itself (the caller prepends it) and return the intermediate(s) +
+    /// root. Uses `SecTrust` so the device supplies the WWDR even when the p12
+    /// omits it. The final validity verdict is ignored — only the assembled
+    /// chain matters.
+    private func systemTrustChain() -> [Data] {
+        guard let leaf = signingLeafCert else { return [] }
+        var trust: SecTrust?
+        let status = SecTrustCreateWithCertificates(leaf as CFTypeRef,
+                                                   SecPolicyCreateBasicX509(), &trust)
+        guard status == errSecSuccess, let trust = trust else { return [] }
+        var err: CFError? = nil
+        _ = SecTrustEvaluateWithError(trust, &err)   // build chain; verdict ignored
+        var out: [Data] = []
+        let n = SecTrustGetCertificateCount(trust)
+        for i in 0..<n {
+            if let c = SecTrustGetCertificateAtIndex(trust, i),
+               let d = SecCertificateCopyData(c) as Data? {
+                out.append(d)
+            }
+        }
+        return out
+    }
+
+    /// Scan the certificate store for every Apple WWDR intermediate present on
+    /// the device. A belt-and-suspenders source in case `SecTrust` is
+    /// constrained on some iOS builds. Returns DER blobs.
+    private func systemWWDRCertificates() -> [Data] {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassCertificate,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnRef as String: true
+        ]
+        var res: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &res) == errSecSuccess,
+              let arr = res as? [SecCertificate] else { return [] }
+        var out: [Data] = []
+        for c in arr {
+            let summary = (SecCertificateCopySubjectSummary(c) as? String) ?? ""
+            if summary.contains("Apple Worldwide Developer Relations"),
+               let d = SecCertificateCopyData(c) as Data? {
+                out.append(d)
+            }
+        }
+        return out
+    }
+
     // MARK: - Persistence
 
     /// Persist the raw signing material so it survives a relaunch. The p12 holds
@@ -562,6 +711,8 @@ public final class CertificateStore: ObservableObject {
         decodedCert = nil
         decodedKey = nil
         decodedKeyPKCS8 = nil
+        identityCertChain = nil
+        signingLeafCert = nil
         // The keychain copy of the fallback key must go too: it is tagged, and
         // a re-import replaces the tag's key — but a reset that left it behind
         // would let the NEXT import find the PREVIOUS identity's key.
