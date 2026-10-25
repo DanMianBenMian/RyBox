@@ -44,6 +44,9 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
         // Live log: the container's own start-up trace, so the 日志 app (and the
         // floating ball) show the real boot sequence.
         RyLog.shared.log("RyBox 启动 · bundle=\(Bundle.main.bundleIdentifier ?? "?")", level: .info, tag: "boot")
+        // Developer debug bridge (Settings → Developer). Opens a TCP listener so
+        // a PC can push files / re-sign / launch guests without rebuilding.
+        DevBridge.shared.applyDevMode()
         // NOTE: Sileo is NO LONGER installed here. It now runs from the boot
         // gate / ContentView once a certificate is configured, so it gets
         // signed with the user's identity instead of staying unsigned forever.
