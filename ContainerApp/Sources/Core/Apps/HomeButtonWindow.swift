@@ -6,6 +6,24 @@ import SwiftUI
 /// other touch passes THROUGH to the window(s) beneath. Used by the guest-runtime
 /// chrome window and the floating log ball, which are KEY (so their controls
 /// work) while the app underneath stays live.
+/// Real bottom safe-area inset of the app's main window.
+///
+/// A hand-built `UIWindow` that is not laid out by a scene (like the guest
+/// chrome window) reports `safeAreaInsets` of 0, which made the floating Home
+/// key float ~20pt off from the SpringBoard key. We therefore read the inset
+/// from whichever window in the app actually has a non-zero bottom inset (the
+/// SpringBoard host window) and fall back to 0. Both the SwiftUI desktop key
+/// and the UIKit floating key call this, so they can never drift apart.
+enum DeviceSafeArea {
+    static func bottomInset() -> CGFloat {
+        let windows = UIApplication.shared.windows
+        for w in windows where w.safeAreaInsets.bottom > 0 {
+            return w.safeAreaInsets.bottom
+        }
+        return windows.first?.safeAreaInsets.bottom ?? 0
+    }
+}
+
 final class PassThroughView: UIView {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
@@ -82,12 +100,12 @@ final class GuestChromeWindow {
             hosted.view.widthAnchor.constraint(equalToConstant: 46),
             hosted.view.heightAnchor.constraint(equalToConstant: 46),
             hosted.view.centerXAnchor.constraint(equalTo: vc.view.centerXAnchor),
-            // Match the SpringBoard key EXACTLY: use the device's real safe-area
-            // bottom inset (UIScreen), NOT this hand-built window's
-            // safeAreaLayoutGuide (which reports 0 here and made the key float
-            // ~20pt too HIGH when a guest was open). The desktop uses the same
-            // UIScreen value, so the key can never jump between the two.
-            let bottomInset = UIScreen.main.safeAreaInsets.bottom
+            // Match the SpringBoard key EXACTLY: read the device's real safe-area
+            // bottom inset from the host window (DeviceSafeArea), NOT this
+            // hand-built window's safeAreaLayoutGuide (which reports 0 here and
+            // made the key float off-position when a guest was open). The desktop
+            // key uses the same source, so the key can never jump between the two.
+            let bottomInset = DeviceSafeArea.bottomInset()
             hosted.view.bottomAnchor.constraint(
                 equalTo: vc.view.bottomAnchor, constant: -(bottomInset + 4))
         ])
