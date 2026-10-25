@@ -16,10 +16,13 @@ struct SettingsView: View {
     @ObservedObject private var theme = ThemeEngine.shared
     @ObservedObject private var log = RyLog.shared
     @EnvironmentObject private var env: RuntimeEnvironment
+    /// Which launch model a guest app uses (see GuestLaunchMode).
+    @AppStorage("rybox.guestLaunchMode") private var launchModeRaw = GuestLaunchMode.executeProcess.rawValue
 
     var body: some View {
         Form {
             signingSection
+            launchSection
             entitlementSection
             jbrootSection
             logSection
@@ -103,6 +106,28 @@ struct SettingsView: View {
             Text("签名身份")
         } footer: {
             Text("证书与描述文件在首次启动的「初始设置」中配置，并会自动保存；重新进入 RyBox 无需再次导入。如需更换，请在初始设置中重新导入。")
+        }
+    }
+
+    // MARK: 启动方式（MH_EXECUTE 进程 / 进程内动态库）
+
+    private var launchSection: some View {
+        Section {
+            Picker("方式", selection: $launchModeRaw) {
+                ForEach(GuestLaunchMode.allCases) { mode in
+                    Text(mode.title).tag(mode.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(GuestLaunchMode(rawValue: launchModeRaw)?.detail ?? "")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } header: {
+            Text("启动方式")
+        } footer: {
+            Text("两种方式走的是完全不同的签名校验体系：动态库要过 transmute 和 library validation，可执行文件只按 DR 校验证书链。切换后立即生效，便于对照真机日志。")
         }
     }
 
