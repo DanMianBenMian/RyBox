@@ -94,6 +94,6 @@ struct SileoView: View {
 
     private func launch() {
         guard let app = sileoApp else { return }
-        GuestRuntime.launchInProcess(app)
+        GuestRuntime.launch(app)
     }
 }
