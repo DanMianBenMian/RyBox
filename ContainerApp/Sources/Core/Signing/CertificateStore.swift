@@ -721,9 +721,16 @@ public final class CertificateStore: ObservableObject {
 
     /// Subject Key Identifier (extension 2.5.29.14). The returned bytes ARE the
     /// key identifier (the extension value is an OCTET STRING).
+    // OID string literals — equivalent to kSecOIDSubjectKeyIdentifier /
+    // kSecOIDAuthorityKeyIdentifier but independent of whether the named
+    // CFString constants are exposed by the SDK in scope. 2.5.29.14 = SKID,
+    // 2.5.29.35 = AKID.
+    private static let oidSubjectKeyIdentifier = "2.5.29.14" as CFString
+    private static let oidAuthorityKeyIdentifier = "2.5.29.35" as CFString
+
     private static func subjectKeyIdentifier(_ cert: SecCertificate) -> Data? {
         var err: CFError? = nil
-        guard let v = SecCertificateCopyExtensionValue(cert, kSecOIDSubjectKeyIdentifier, &err) else { return nil }
+        guard let v = SecCertificateCopyExtensionValue(cert, oidSubjectKeyIdentifier, &err) else { return nil }
         return v as Data
     }
 
@@ -732,7 +739,7 @@ public final class CertificateStore: ObservableObject {
     /// matched against a candidate's SKID.
     private static func authorityKeyIdentifier(_ cert: SecCertificate) -> Data? {
         var err: CFError? = nil
-        guard let v = SecCertificateCopyExtensionValue(cert, kSecOIDAuthorityKeyIdentifier, &err) else { return nil }
+        guard let v = SecCertificateCopyExtensionValue(cert, oidAuthorityKeyIdentifier, &err) else { return nil }
         return firstOctetString(in: v as Data)
     }
 
