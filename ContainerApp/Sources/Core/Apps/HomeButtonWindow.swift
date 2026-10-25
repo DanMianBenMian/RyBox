@@ -16,11 +16,57 @@ import SwiftUI
 /// and the UIKit floating key call this, so they can never drift apart.
 enum DeviceSafeArea {
     static func bottomInset() -> CGFloat {
-        let windows = UIApplication.shared.windows
-        for w in windows where w.safeAreaInsets.bottom > 0 {
+        // Prefer the SCENE's windows: `UIApplication.shared.windows` is
+        // deprecated and can come back EMPTY on newer releases, which would
+        // silently report a zero inset and drop the Home key into the
+        // home-indicator strip.
+        var candidates: [UIWindow] = []
+        for scene in UIApplication.shared.connectedScenes {
+            if let ws = scene as? UIWindowScene {
+                candidates.append(contentsOf: ws.windows)
+            }
+        }
+        if candidates.isEmpty {
+            candidates = UIApplication.shared.windows
+        }
+        // The key window first — it is the one actually laying out the shell.
+        if let key = candidates.first(where: { $0.isKeyWindow }), key.safeAreaInsets.bottom > 0 {
+            return key.safeAreaInsets.bottom
+        }
+        for w in candidates where w.safeAreaInsets.bottom > 0 {
             return w.safeAreaInsets.bottom
         }
-        return windows.first?.safeAreaInsets.bottom ?? 0
+        return candidates.first?.safeAreaInsets.bottom ?? 0
+    }
+}
+
+/// THE home-key geometry — one definition, two hosts.
+///
+/// The SpringBoard desktop key (`SpringBoardView.homeKey`) and the floating
+/// guest chrome key (`GuestChromeWindow`) must sit at EXACTLY the same spot,
+/// otherwise opening/closing a guest makes the key jump. Both read their
+/// offset from here.
+///
+/// The offset is measured UP from the bottom of the screen and INCLUDES the
+/// device's real bottom inset (the home-indicator strip), so the key never
+/// lands inside the system gesture area.
+enum HomeKeyLayout {
+    /// Edge length of the key (matches `HomeKeyButton`'s frozen 46pt).
+    static let size: CGFloat = 46
+    /// Gap between the bottom of the screen and the bottom of the key.
+    static let bottomGap: CGFloat = 6
+    /// Distance from the bottom of the screen to the bottom of the key.
+    static func bottomOffset() -> CGFloat {
+        DeviceSafeArea.bottomInset() + bottomGap
+    }
+    /// Distance from the bottom of the screen to the BOTTOM edge of the Dock.
+    ///
+    /// The Dock sits ABOVE the Home key (they are both horizontally centred,
+    /// so they must not share the same band):
+    ///
+    ///     screen bottom → [inset] → [gap] → Home key → [gap] → Dock
+    static func dockBottomOffset() -> CGFloat {
+        bottomOffset() + size + 12
     }
 }
 
@@ -96,18 +142,16 @@ final class GuestChromeWindow {
         hosted.view.translatesAutoresizingMaskIntoConstraints = false
         vc.addChild(hosted)
         vc.view.addSubview(hosted.view)
-        // Match the SpringBoard key EXACTLY: read the device's real safe-area
-        // bottom inset from the host window (DeviceSafeArea), NOT this
-        // hand-built window's safeAreaLayoutGuide (which reports 0 here and
-        // made the key float off-position when a guest was open). The desktop
-        // key uses the same source, so the key can never jump between the two.
-        let bottomInset = DeviceSafeArea.bottomInset()
+        // Match the SpringBoard key EXACTLY: the shared `HomeKeyLayout` offset
+        // (real device bottom inset + gap). The desktop key uses the same
+        // constant, so the key can never jump between the two.
+        let bottomInset = HomeKeyLayout.bottomOffset()
         NSLayoutConstraint.activate([
-            hosted.view.widthAnchor.constraint(equalToConstant: 46),
-            hosted.view.heightAnchor.constraint(equalToConstant: 46),
+            hosted.view.widthAnchor.constraint(equalToConstant: HomeKeyLayout.size),
+            hosted.view.heightAnchor.constraint(equalToConstant: HomeKeyLayout.size),
             hosted.view.centerXAnchor.constraint(equalTo: vc.view.centerXAnchor),
             hosted.view.bottomAnchor.constraint(
-                equalTo: vc.view.bottomAnchor, constant: -(bottomInset + 4))
+                equalTo: vc.view.bottomAnchor, constant: -bottomInset)
         ])
         hosted.didMove(toParent: vc)
 
