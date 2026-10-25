@@ -106,6 +106,17 @@ public final class CodeSigner {
         //    What was stripped is MARKED in EntitlementPolicy (takenOver) and
         //    re-granted at runtime through the entitlement oracle, where the
         //    user can switch each one on/off per app (Settings → 特殊权限分配).
+        //
+        //    2026-10-25 (errno=85 fix): the staged plist is NO LONGER embedded
+        //    into the guest binaries. RyBox patches every guest Mach-O to
+        //    MH_DYLIB before signing (GuestRuntime step 1 patches, step 2
+        //    signs), and LiveContainer/zsign leave the entitlements slot EMPTY
+        //    for dylibs (`IsExecute() ? m_strEntitleData : ""`). An XML-only
+        //    slot 5 with no DER slot 7 sends AMFI down the transmute path,
+        //    which refuses dylibs → `code signature invalid (errno=85)`. The
+        //    signer now nulls the slot for non-MH_EXECUTE files; the staged
+        //    file stays because the policy above still needs `sanitized`, and
+        //    because an MH_EXECUTE path would use it.
         let entsURL = tmp.appendingPathComponent("guest.entitlements.plist")
         let profileEnts = CertificateStore.shared.guestEntitlements() ?? [:]
         EntitlementPolicy.shared.updateProfile(profileEnts)
