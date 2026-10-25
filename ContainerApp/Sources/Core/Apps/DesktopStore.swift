@@ -280,12 +280,25 @@ final class DesktopStore: ObservableObject {
 
     /// Everything shown loose on the desktop: builtins + guests + folders.
     /// The Sileo stub disappears once the REAL preinstalled Sileo is installed.
+    /// Anything living inside a folder is excluded from ALL THREE groups.
+    ///
+    /// The builtin/folder filters are load-bearing (2026-10-25 user report:
+    /// 「放进文件夹里后Desktop上的图标不显示，结果隐藏成dock图标」). Folding an
+    /// item removes its Dock entry AND its grid slot — but every mutation then
+    /// calls `reflow()` → `ensurePlaced()`, which walks `allItems` and hands a
+    /// fresh slot to anything without one. When a folded BUILTIN stayed in
+    /// `allItems` (only guests used to be filtered), it was re-placed onto the
+    /// grid immediately: the Dock icon vanished while the Desktop icon popped
+    /// right back — exactly the reported bug. Folded folders are filtered for
+    /// the same reason (a folder can be dropped into another folder).
     var allItems: [DesktopItem] {
-        let builtins = realSileoInstalled
-            ? builtinItems.filter { $0.id != BuiltinApp.sileo.id }
-            : builtinItems
+        let builtins = builtinItems.filter { item in
+            if realSileoInstalled, item.id == BuiltinApp.sileo.id { return false }
+            return !foldedIDs.contains(item.id)
+        }
         let looseGuests = guestItems.filter { !foldedIDs.contains($0.id) }
-        return builtins + looseGuests + folderItems
+        let looseFolders = folderItems.filter { !foldedIDs.contains($0.id) }
+        return builtins + looseGuests + looseFolders
     }
 
     /// True when the real preinstalled Sileo guest is registered.
