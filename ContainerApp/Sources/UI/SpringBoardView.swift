@@ -79,6 +79,37 @@ struct SpringBoardView: View {
     /// "图标位置会偏移" report. One number, used everywhere.
     private var cellWidth: CGFloat { iconSize + 14 }
     private var cellHeight: CGFloat { iconSize + 22 }
+
+    // MARK: Bottom chrome layout (Home key + Dock) — ONE source of truth
+    //
+    // These used to be placed against TWO DIFFERENT baselines:
+    //   * the Dock  → `geo.safeAreaInsets.bottom + 52`
+    //   * the Home key → `DeviceSafeArea.bottomInset() + 4`
+    // and the whole home screen's GeometryReader is wrapped in
+    // `.ignoresSafeArea()`, so `geo.safeAreaInsets` is ALWAYS ZERO there. The
+    // Dock therefore sat at a hard-coded 52pt from the screen bottom while
+    // the Home key was pushed up by the device's REAL bottom inset — on any
+    // device with a home-indicator strip the key was shoved UP into the Dock
+    // pill (「home键位置偏上与dock冲突」).
+    //
+    // Now everything derives from the real inset and the two controls are
+    // stacked explicitly:
+    //
+    //     screen bottom
+    //       └ home-indicator strip (bottomSafeInset)
+    //          └ gap
+    //             └ Home key  (46pt)
+    //                └ gap
+    //                   └ Dock pill
+    /// Clearance between the top of the Dock and the last grid row.
+    private let gridClearance: CGFloat = 14
+    /// Distance from the bottom of the screen to the BOTTOM edge of the Dock.
+    private var dockBottomOffset: CGFloat { HomeKeyLayout.dockBottomOffset() }
+    /// Height of the strip the icon grid must leave free at the bottom so the
+    /// last row is never hidden under the Dock / Home key.
+    private var bottomChromeHeight: CGFloat {
+        dockBottomOffset + dockHeight + gridClearance
+    }
     /// Distance between two cell centres.
     private var colPitch: CGFloat { cellWidth + (isIPad ? 18 : 12) }
     private var rowPitch: CGFloat { cellHeight + (isIPad ? 16 : 12) }
@@ -203,8 +234,11 @@ struct SpringBoardView: View {
                         .frame(maxHeight: .infinity)
 
                     // Reserve the dock + Home key strip so the last grid row is
-                    // never hidden underneath them.
-                    Spacer(minLength: dockHeight + 40)
+                    // never hidden underneath them. The strip is measured with
+                    // the SAME baseline the Dock and the key use
+                    // (`bottomChromeHeight`), so the grid can never slide
+                    // under the Dock when the bottom inset changes.
+                    Spacer(minLength: bottomChromeHeight)
                 }
 
                 if let app = activeApp {
@@ -219,6 +253,17 @@ struct SpringBoardView: View {
 
                 dock(geo)
                     .zIndex(1)
+
+                // The page dots, anchored to the Dock's real top edge (the
+                // root ZStack spans the FULL screen, so the offset is measured
+                // from the screen bottom and can never drift with the pager's
+                // height).
+                VStack {
+                    Spacer()
+                    pageDots
+                }
+                .padding(.bottom, dockBottomOffset + dockHeight + 10)
+                .zIndex(1)
 
                 homeKey()
                     .zIndex(3)
@@ -317,10 +362,12 @@ struct SpringBoardView: View {
             // ScrollView must keep working. The gesture below ignores any drag
             // that is not clearly horizontal, so the two never fight.
             .simultaneousGesture(pageSwipeGesture(pageWidth: w))
-            .overlay(alignment: .bottom) {
-                pageDots
-                    .padding(.bottom, dockHeight + 22)
-            }
+            // The page dots used to be an overlay HERE, offset by
+            // `dockHeight + 22` from the pager's bottom edge — but the pager
+            // ALREADY ends where the bottom chrome strip begins, so the Dock
+            // height was counted twice and the dots floated far up into the
+            // icon grid. They now live in the root ZStack (see `homeScreen`),
+            // anchored to the Dock's real top edge.
             // The grid's geometry: page-local origin + pitch. The page's own
             // ROOT-space origin is NOT published here — see below.
             .onPreferenceChange(PageFramePreferenceKey.self) { metrics in
@@ -893,7 +940,7 @@ struct SpringBoardView: View {
                 }
             )
             .padding(.horizontal, isIPad ? 28 : 10)
-            .padding(.bottom, geo.safeAreaInsets.bottom + 52)
+            .padding(.bottom, dockBottomOffset)
         }
         .onPreferenceChange(DockFramePreferenceKey.self) { dockFrame = $0 }
     }
@@ -954,10 +1001,10 @@ struct SpringBoardView: View {
                 .onLongPressGesture(minimumDuration: 0.4) { showAppSwitcher = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        // Same source as the guest chrome (DeviceSafeArea's real safe-area
-        // inset, read from the host window) so the key never jumps when a guest
-        // opens or closes.
-        .padding(.bottom, DeviceSafeArea.bottomInset() + 4)
+        // The shared `HomeKeyLayout` offset (real device bottom inset + gap).
+        // The guest chrome uses the SAME constant, so the key never jumps
+        // between the desktop and the guest.
+        .padding(.bottom, HomeKeyLayout.bottomOffset())
     }
 
     private var editHint: some View {
@@ -969,7 +1016,7 @@ struct SpringBoardView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
                 .background(.ultraThinMaterial, in: Capsule())
-                .padding(.bottom, dockHeight + 44)
+                .padding(.bottom, bottomChromeHeight + 22)
             Spacer()
         }
         .allowsHitTesting(false)
@@ -984,7 +1031,7 @@ struct SpringBoardView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 9)
                 .background(.regularMaterial, in: Capsule())
-                .padding(.bottom, dockHeight + 60)
+                .padding(.bottom, bottomChromeHeight + 38)
             Spacer()
         }
         .allowsHitTesting(false)
