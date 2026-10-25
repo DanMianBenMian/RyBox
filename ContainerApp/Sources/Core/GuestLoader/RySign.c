@@ -647,19 +647,23 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     // LiveContainer parity (`ZArchO::BuildCodeSignature`):
     //     SlotBuildEntitlements(IsExecute() ? m_strEntitleData : "")
     //     SlotBuildDerEntitlements(IsExecute() ? … : "")
-    // and zsign.mm drives it with `Sign(asset, force, bundleId, "", "", "")` —
-    // empty Info.plist and empty CodeResources for every Mach-O.
     //
-    // RyBox patches the guest to MH_DYLIB BEFORE signing (GuestRuntime step 1
-    // patches, step 2 signs), so every guest binary — the main executable
-    // included — takes the empty branch. This is not cosmetic: a dylib that
-    // carries an XML-only entitlements blob (slot 5) but no DER entitlements
-    // blob (slot 7) sends AMFI down the "transmute" path, and the transmute
-    // for a dylib being dlopen'd into an arbitrary host process is refused —
-    // dyld then reports exactly the failure Sileo hit:
+    // The `IsExecute()` test is the ORIGINAL filetype. RyBox used to patch
+    // every guest to MH_DYLIB before signing, so the branch was always the
+    // empty one — and that is exactly what broke Sileo: a dylib carrying an
+    // XML-only entitlements blob (slot 5) but no DER entitlements blob
+    // (slot 7) sends AMFI down the "transmute" path, and the transmute for a
+    // dylib being dlopen'd into an arbitrary host process is REFUSED. dyld
+    // then reports exactly the failure Sileo hit:
     //     code signature invalid (errno=85)
-    // The guest's real capability set is NOT lost by emptying the slot:
-    // AppImporter reads the ORIGINAL entitlements before the re-sign
+    //
+    // A real MH_EXECUTE does not have that problem: the kernel reads the
+    // main image's entitlements straight out of slot 5 — no transmute, and no
+    // library validation either. That is why the guest is now signed and run
+    // as the executable it already is (see GuestRuntime.launchAsProcess).
+    //
+    // The guest's real capability set is NOT lost by emptying the slot for a
+    // dylib: AppImporter reads the ORIGINAL entitlements before the re-sign
     // (`readOriginalEntitlements` → `EntitlementPolicy.recordOriginal`) and the
     // RyDyldHooks entitlement oracle answers runtime queries from that policy.
     int is_execute = (hdr->filetype == MH_EXECUTE);
@@ -724,26 +728,44 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         ry_buf_put(&ent_blob, ent, ent_len);
     }
     meta.entitlements_blob = ent_blob.p; meta.entitlements_blob_len = ent_blob.len;
-    // The DER entitlements blob (slot 7) is intentionally omitted for a dylib
-    // guest — matching zsign's `IsExecute() ? … : ""`. An XML-only slot 5 with
-    // no slot 7 is what triggers the AMFI transmute refusal (errno=85).
+    // The DER entitlements blob (slot 7) is not built: we have no DER encoder
+    // yet. For a MH_EXECUTE that is fine — the kernel reads the MAIN image's
+    // entitlements straight out of the XML slot 5, with no transmute involved
+    // (the transmute refusal only ever bit the dylib guests). Slot 7 stays
+    // all-zero and the leading-zero trim drops it together with its reserved
+    // companion -6, which keeps the slot numbering contiguous.
 
-    // CodeDirectories: primary SHA-1 (cd1), alternate SHA-256 (cd2). is_execute
-    // = 0 (guest patched to MH_DYLIB → no -7/-6 pair); with the entitlements,
-    // Info.plist and CodeResources slots all empty for a dylib, zsign's
-    // leading-zero trim leaves exactly the two live slots (-2 requirements,
-    // -1 info.plist) — the same shape LiveContainer produces.
+    // CodeDirectories: primary SHA-1 (cd1), alternate SHA-256 (cd2).
+    //
+    // `is_execute` MUST mirror the file's real filetype (MH_EXECUTE vs
+    // MH_DYLIB) — it decides the special-slot shape. A MH_EXECUTE carries
+    // the DER-entitlements pair (-7/-6) and keeps its XML entitlements
+    // (slot 5) / Info.plist (-1) / CodeResources (-3); a MH_DYLIB has five
+    // slots (-5..-1) with the entitlement blob emptied. Getting this wrong
+    // shifts `hashOffset` by two slots and AMFI rejects the whole signature.
+    //
+    // The exec-segment triple describes the __TEXT segment the main binary
+    // lives in: base = its vmaddr (0 for a dylib, 0x100000000 for a PIE
+    // executable), limit = its vmsize, flags = CS_EXECSEG_MAIN_BINARY for a
+    // real main executable. The kernel uses this pair to decide whether the
+    // pages it is about to execute belong to the signed main binary — a
+    // dylib guest must NOT claim MAIN_BINARY, and an executable that leaves
+    // the flag at 0 is not recognised as a main binary at all.
+    //
     // is_adhoc = 0 (real, in-place signature AMFI requires).
+    uint64_t exec_seg_base  = textseg ? (uint64_t)textseg->vmaddr : 0;
     uint64_t exec_seg_limit = textseg ? (uint64_t)textseg->vmsize : 0;
-    uint64_t exec_seg_flags = 0;
+    uint64_t exec_seg_flags = is_execute ? RY_EXECSEG_MAIN_BINARY : 0;
 
     RyBuf cd1, cd2;
-    if (ry_build_codedirectory(0, buf, code_limit, &meta, 0, 0,
-                               exec_seg_limit, exec_seg_flags, &g_hash, &cd1) != 0) {
+    if (ry_build_codedirectory(0, buf, code_limit, &meta, is_execute, 0,
+                               exec_seg_base, exec_seg_limit, exec_seg_flags,
+                               &g_hash, &cd1) != 0) {
         ry_buf_free(&req); ry_buf_free(&ent_blob); return -4;
     }
-    if (ry_build_codedirectory(1, buf, code_limit, &meta, 0, 0,
-                               exec_seg_limit, exec_seg_flags, &g_hash, &cd2) != 0) {
+    if (ry_build_codedirectory(1, buf, code_limit, &meta, is_execute, 0,
+                               exec_seg_base, exec_seg_limit, exec_seg_flags,
+                               &g_hash, &cd2) != 0) {
         ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1); return -4;
     }
 
@@ -846,10 +868,12 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         // pass produces a blob of exactly the same size (the LC we just
         // wrote is therefore still correct).
         ry_buf_free(&cd1); ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
-        if (ry_build_codedirectory(0, buf, code_limit, &meta, 0, 0,
-                                   exec_seg_limit, exec_seg_flags, &g_hash, &cd1) != 0 ||
-            ry_build_codedirectory(1, buf, code_limit, &meta, 0, 0,
-                                   exec_seg_limit, exec_seg_flags, &g_hash, &cd2) != 0) {
+        if (ry_build_codedirectory(0, buf, code_limit, &meta, is_execute, 0,
+                                   exec_seg_base, exec_seg_limit, exec_seg_flags,
+                                   &g_hash, &cd1) != 0 ||
+            ry_build_codedirectory(1, buf, code_limit, &meta, is_execute, 0,
+                                   exec_seg_base, exec_seg_limit, exec_seg_flags,
+                                   &g_hash, &cd2) != 0) {
             ry_buf_free(&req); ry_buf_free(&ent_blob);
             ry_buf_free(&cd1); ry_buf_free(&cd2);
             return -4;
