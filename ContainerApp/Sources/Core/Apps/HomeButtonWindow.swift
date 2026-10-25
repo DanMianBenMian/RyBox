@@ -96,16 +96,16 @@ final class GuestChromeWindow {
         hosted.view.translatesAutoresizingMaskIntoConstraints = false
         vc.addChild(hosted)
         vc.view.addSubview(hosted.view)
+        // Match the SpringBoard key EXACTLY: read the device's real safe-area
+        // bottom inset from the host window (DeviceSafeArea), NOT this
+        // hand-built window's safeAreaLayoutGuide (which reports 0 here and
+        // made the key float off-position when a guest was open). The desktop
+        // key uses the same source, so the key can never jump between the two.
+        let bottomInset = DeviceSafeArea.bottomInset()
         NSLayoutConstraint.activate([
             hosted.view.widthAnchor.constraint(equalToConstant: 46),
             hosted.view.heightAnchor.constraint(equalToConstant: 46),
             hosted.view.centerXAnchor.constraint(equalTo: vc.view.centerXAnchor),
-            // Match the SpringBoard key EXACTLY: read the device's real safe-area
-            // bottom inset from the host window (DeviceSafeArea), NOT this
-            // hand-built window's safeAreaLayoutGuide (which reports 0 here and
-            // made the key float off-position when a guest was open). The desktop
-            // key uses the same source, so the key can never jump between the two.
-            let bottomInset = DeviceSafeArea.bottomInset()
             hosted.view.bottomAnchor.constraint(
                 equalTo: vc.view.bottomAnchor, constant: -(bottomInset + 4))
         ])
