@@ -42,7 +42,12 @@ struct AppLibraryView: View {
                     }
                 }
                 .padding(.horizontal, 18)
-                .padding(.bottom, 110)
+                // Bottom clearance for the Dock + Home key strip. The Dock's
+                // bottom edge moved up (it now clears the Home key instead of
+                // overlapping it), so the hard-coded 110 left the last bucket
+                // hidden under the Dock pill. Derive it from the same
+                // baseline the desktop uses.
+                .padding(.bottom, HomeKeyLayout.dockBottomOffset() + 100)
             }
             .contentShape(Rectangle())
             // Tapping the background dismisses the keyboard, like iOS.
