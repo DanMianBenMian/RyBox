@@ -487,11 +487,17 @@ enum RyP12 {
         // "parameters rejected" — which is the difference between feeding
         // Security the PKCS#1 inner vs the full PKCS#8.
         let probe = SecKeyCreateWithData(Data(inner) as CFData, attrs as CFDictionary, &error)
-        if let probe {
-            CFRelease(probe)
+        if probe != nil {
+            // Security accepted the inner blob. Swift ARC owns the returned
+            // SecKey — CFRelease is unavailable in Swift (Core Foundation
+            // objects are automatically memory managed).
         } else if let e = error?.takeRetainedValue() {
-            let ns = e as NSError
-            RyLog.shared.log("RyP12 探测 SecKeyCreateWithData 失败：\(ns.localizedDescription)（domain=\(ns.domain) code=\(ns.code)）——仍继续，签名器会尝试完整 PKCS#8 与钥匙串两条路",
+            // CFError is not directly castable to NSError in Swift; read the
+            // domain / code / description through the CF accessors instead.
+            let code = CFErrorGetCode(e)
+            let domain = (CFErrorGetDomain(e) as String?) ?? "(unknown domain)"
+            let desc = (CFErrorCopyDescription(e) as String?) ?? "(no description)"
+            RyLog.shared.log("RyP12 探测 SecKeyCreateWithData 失败：[\(domain)] 错误码 \(code)：\(desc)——仍继续，签名器会尝试完整 PKCS#8 与钥匙串两条路",
                              level: .warn, tag: "sign")
         } else {
             RyLog.shared.log("RyP12 探测 SecKeyCreateWithData 返回 nil 且无 CFError", level: .warn, tag: "sign")
