@@ -343,7 +343,10 @@ final class DevBridge {
 
         var st: Int32 = 0
         waitpid(pid, &st, 0)
-        let exitCode = WIFEXITED(st) ? WEXITSTATUS(st) : -1
+        // Mirror ProcessManager: report the raw wait status. WIFEXITED /
+        // WEXITSTATUS are not reliably imported into Swift on iOS, so leave the
+        // raw status for the caller to interpret.
+        let exitCode = st
 
         var s = "exit=\(exitCode)\n"
         if let o = String(data: data, encoding: .utf8), !o.isEmpty { s += "--- output ---\n\(o)" }
