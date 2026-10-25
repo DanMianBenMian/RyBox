@@ -91,7 +91,16 @@ extern "C" {
 #define RY_REQ_OP_AND                  6u
 #define RY_REQ_OP_CERT_FIELD           11u
 #define RY_REQ_OP_CERT_GENERIC         14u
-#define RY_MATCH_EQUAL                 0u
+// Match ops. MEASURED (not guessed): the golden App Store Sileo signature
+// (org.coolstar.SileoStore, decoded byte-for-byte) and LiveContainer's
+// vendored zsign (pack3/pack4 in SlotBuildRequirements) agree exactly —
+// the `opCertField(leaf, "subject.CN", …)` clause carries match word 1
+// ("equal") between the field name and the value, and the trailing
+// `opCertGeneric(1, wwdrOID)` clause carries match word 0 ("exists")
+// AFTER the OID. Both words are mandatory; omitting the second one
+// truncates the expression and AMFI rejects the signature (dyld reports
+// `code signature invalid (errno=85)`).
+#define RY_MATCH_EQUAL                 1u
 #define RY_MATCH_EXISTS                0u
 #define RY_DESIGNATED_REQUIREMENT_TYPE 3u
 
