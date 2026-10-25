@@ -167,6 +167,7 @@ static unsigned char *read_file(const char *path, size_t *len) {
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     if (sz < 0) { fclose(f); return NULL; }
     unsigned char *buf = (unsigned char *)malloc(sz ? (size_t)sz : 1);
+    if (!buf) { fclose(f); *len = 0; return NULL; }   // fread(NULL,…) would crash
     size_t r = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     *len = r;
@@ -454,10 +455,24 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
     CFDataRef sigData = NULL;
     OSStatus st = errSecSuccess;
     const char *usedName = NULL;
+    int skipped = 0;
     for (int attempt = 0; attempt < 4 && !sigData; attempt++) {
         bool useDigest = (attempt % 2) == 1;
         int idx = attempt / 2;
         SecKeyAlgorithm algo = useDigest ? digA[idx] : msgA[idx];
+        const char *aName = useDigest ? digName[idx] : msgName[idx];
+        // Feeding the key an algorithm it cannot perform (e.g. an ECDSA
+        // constant to an RSA key) is at best an error and at worst a Security
+        // framework assertion on iOS 27 — which is a hard crash, not a clean
+        // failure. Ask first: SecKeyIsAlgorithmSupported answers without
+        // touching the key.
+        if (!SecKeyIsAlgorithmSupported(privKey, kSecKeyOperationTypeSign, algo)) {
+            skipped++;
+            fprintf(stderr, "rysign: key does not support %s — skipped\n", aName);
+            continue;
+        }
+        // Never release a stale/garbage out-parameter: reset it every attempt.
+        sigData = NULL;
         CFDataRef payload;
         if (useDigest) {
             unsigned char hash[CC_SHA256_DIGEST_LENGTH];
@@ -470,7 +485,7 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         CFRelease(payload);
         g_sign_osstatus = (int)s;
         if (s == errSecSuccess && sigData) {
-            usedName = useDigest ? digName[idx] : msgName[idx];
+            usedName = aName;
             break;
         }
         if (sigData) { CFRelease(sigData); sigData = NULL; }
@@ -483,9 +498,9 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         // mismatch, which is exactly the failure that used to surface as a
         // bare "exit code 6". It now reaches the user through RyLog.
         fprintf(stderr, "rysign: SecKeyCreateSignature failed osstatus=%d "
-                "(tried 4 algorithm variants)\n", (int)st);
-        rysign_set_diag("SecKeyCreateSignature 失败 osstatus=%d（已试 %s / %s / %s / %s）",
-                        (int)st, msgName[0], digName[0], msgName[1], digName[1]);
+                "(tried 4 algorithm variants, %d unsupported)\n", (int)st, skipped);
+        rysign_set_diag("SecKeyCreateSignature 失败 osstatus=%d（已试 %s / %s / %s / %s，%d 种算法密钥不支持）",
+                        (int)st, msgName[0], digName[0], msgName[1], digName[1], skipped);
         buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
         return -1;
     }
@@ -686,6 +701,7 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1); ry_buf_free(&cd2);
         return -5;
     }
+    fprintf(stderr, "rysign: CMS built (%zu bytes, %d certs)\n", cms.len, n_certs);
 
     RyBuf sb;
     if (ry_build_superblob(&cd1, &req, ent_blob.len ? &ent_blob : NULL, NULL,
@@ -693,9 +709,23 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
         ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
         ry_buf_free(&cd2); ry_buf_free(&cms); return -6;
     }
+    fprintf(stderr, "rysign: SuperBlob built (%zu bytes), writing at dataoff=%u\n",
+            sb.len, sig_dataoff);
 
     // Write in place at dataoff; grow the file tail only if the new blob is
     // larger than the old signature region (zsign parity).
+    //
+    // A stale or corrupt LC_CODE_SIGNATURE can point PAST EOF (a decrypted or
+    // hand-patched binary). `avail` is a size_t subtraction, so it would wrap
+    // around to a huge value and the memcpy below would write far past the
+    // buffer — a hard crash instead of a clean error. Refuse instead.
+    if (sig_dataoff > *len) {
+        fprintf(stderr, "rysign: LC_CODE_SIGNATURE.dataoff=%u is past EOF (%zu bytes)\n",
+                sig_dataoff, *len);
+        ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+        ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
+        return -11;
+    }
     size_t avail = (*len) - (size_t)sig_dataoff;
     if (sb.len <= avail) {
         memcpy(buf + sig_dataoff, sb.p, sb.len);
@@ -783,21 +813,30 @@ static int sign_macho_file_at(const char *path, const char *bundlePath,
             certs[0] = leaf_copy; cert_lens[0] = leaf_copy_len; nc = 1;
         }
         if (g_extra_certs_n > 0 && certs && cert_lens) {
-            certs = realloc(certs, sizeof(void *) * (size_t)(nc + g_extra_certs_n));
-            cert_lens = realloc(cert_lens, sizeof(size_t) * (size_t)(nc + g_extra_certs_n));
-            for (int i = 0; i < g_extra_certs_n; i++) {
-                // The provisioning profile's DeveloperCertificates array
-                // repeats the leaf; a duplicated leaf in the CMS cert set can
-                // confuse AMFI's trust evaluation, so skip identical DERs.
-                bool dup = false;
-                for (int j = 0; j < nc; j++) {
-                    if (cert_lens[j] == g_extra_certs_lens[i] &&
-                        memcmp(certs[j], g_extra_certs[i], g_extra_certs_lens[i]) == 0) {
-                        dup = true; break;
+            unsigned char **grown_c = realloc(certs, sizeof(void *) * (size_t)(nc + g_extra_certs_n));
+            size_t *grown_l = realloc(cert_lens, sizeof(size_t) * (size_t)(nc + g_extra_certs_n));
+            // Only adopt the new arrays when BOTH grew: a half-migrated pair
+            // would leave certs/cert_lens disagreeing about their length.
+            if (grown_c && grown_l) {
+                certs = grown_c; cert_lens = grown_l;
+                for (int i = 0; i < g_extra_certs_n; i++) {
+                    // A chain entry that could not be read is NULL with a zero
+                    // length; feeding that to memcmp/buf_put is undefined
+                    // behaviour (and a NULL deref on some libc), so skip it.
+                    if (!g_extra_certs[i] || g_extra_certs_lens[i] == 0) continue;
+                    // The provisioning profile's DeveloperCertificates array
+                    // repeats the leaf; a duplicated leaf in the CMS cert set can
+                    // confuse AMFI's trust evaluation, so skip identical DERs.
+                    bool dup = false;
+                    for (int j = 0; j < nc; j++) {
+                        if (certs[j] && cert_lens[j] == g_extra_certs_lens[i] &&
+                            memcmp(certs[j], g_extra_certs[i], g_extra_certs_lens[i]) == 0) {
+                            dup = true; break;
+                        }
                     }
+                    if (dup) continue;
+                    certs[nc] = g_extra_certs[i]; cert_lens[nc] = g_extra_certs_lens[i]; nc++;
                 }
-                if (dup) continue;
-                certs[nc] = g_extra_certs[i]; cert_lens[nc] = g_extra_certs_lens[i]; nc++;
             }
         }
     }
@@ -1117,8 +1156,13 @@ static int sign_bundle_tail(const char *bundlePath,
             for (int i = 0; i < nn; i++) {
                 char p[2048]; snprintf(p, sizeof(p), "%s/%s", certsDir, names[i]);
                 size_t l = 0; unsigned char *b = read_file(p, &l);
-                extra[i] = b; extra_lens[i] = l; free(names[i]);
-                extra_n++;
+                free(names[i]);
+                // A chain entry that could not be read (NULL, zero length)
+                // must NOT enter the CMS: downstream memcmp/buf_put would
+                // dereference it. `extra` has room for nn entries, and
+                // extra_n only grows for entries that actually landed.
+                if (!b || l == 0) { if (b) free(b); continue; }
+                extra[extra_n] = b; extra_lens[extra_n] = l; extra_n++;
             }
             if (names) free(names);
         }
