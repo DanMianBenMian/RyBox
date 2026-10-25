@@ -97,7 +97,7 @@ struct GuestLaunchView: View {
         status = "正在启动…"
         DispatchQueue.main.async {
             if app.isGUI {
-                GuestRuntime.launchInProcess(app)
+                GuestRuntime.launch(app)
                 // The guest UI covers this page via its own window; only show a
                 // status if the launch fell back to the scaffold path.
                 status = ""
