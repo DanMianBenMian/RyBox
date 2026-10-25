@@ -50,6 +50,15 @@ enum RyP12 {
         let keyPKCS8: Data
         /// "rsa" or "ec".
         let keyType: String
+        /// ALL certificates found in the p12's certBags (leaf + every
+        /// intermediate), as DER. The signer needs the FULL chain — not just
+        /// the leaf — so the embedded CMS can place the WWDR intermediate at
+        /// slot 1 (the DR requires `certificate 1[1.2.840.113635.100.6.2.1
+        /// exists]`). A leaf-only CMS fails trust evaluation on a non-jailbroken
+        /// device → `code signature invalid (errno=85)` even though the
+        /// CodeDirectory hashes are fine. `certDER` is the first entry; the
+        /// rest (if any) are intermediates.
+        let certChain: [Data]
     }
 
     // MARK: - Entry point
@@ -81,6 +90,10 @@ enum RyP12 {
         }
 
         var certDER: [UInt8]?
+        /// Every certificate found in the p12 (leaf + intermediates), in bag
+        /// order. Drives `Outcome.certChain` — used to embed the full trust
+        /// chain so the WWDR intermediate lands at CMS slot 1.
+        var certChain: [[UInt8]] = []
         /// Already-decrypted PKCS#8. Decrypted in the loop because the
         /// AlgorithmIdentifier is only meaningful against the array it was
         /// parsed from (each nesting level has its own backing buffer).
@@ -108,8 +121,10 @@ enum RyP12 {
                     if let s = inner.first, s.tag == SEQUENCE {
                         let ck = a3.children(s)
                         if ck.count >= 2, let wrapped = a3.children(ck[1]).first,
-                           wrapped.tag == OCTET_STRING, certDER == nil {
-                            certDER = a3.slice(wrapped)
+                           wrapped.tag == OCTET_STRING {
+                            let c = a3.slice(wrapped)
+                            certChain.append(c)
+                            if certDER == nil { certDER = c }
                         }
                     }
                 case oidShroudedKeyBag:
@@ -159,7 +174,8 @@ enum RyP12 {
                                 certDER: Data(certBytes),
                                 keyDER: Data(keyInfo.inner),
                                 keyPKCS8: Data(key8),
-                                keyType: keyInfo.keyType))
+                                keyType: keyInfo.keyType,
+                                certChain: certChain.map { Data($0) }))
     }
 
     // MARK: - ASN.1
