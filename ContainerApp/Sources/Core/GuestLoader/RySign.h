@@ -98,6 +98,20 @@ int rysign_last_osstatus(void);
 /// signing call — copy it immediately (Swift: `String(cString:)`).
 const char *rysign_last_diag(void);
 
+/// Canary self-check for a SecKey the CALLER holds (e.g. a keychain-backed
+/// key): sign a 4-byte payload and report what happened. Lives in C because
+/// the Swift overlay imports `SecKeyCreateSignature`'s error parameter as
+/// `UnsafeMutablePointer<Unmanaged<CFError>?>`, which is easy to get wrong —
+/// and the wrong shape inverts success and failure.
+///
+/// Returns a pointer to a static UTF-8 buffer (valid until the next call —
+/// copy immediately, Swift: `String(cString:)`):
+///   "ok <RSA|ECDSA> <sigBytes> <blockBits>"  signed fine
+///   "fail <code> <description>"              a supported algorithm refused
+///   "skip"                                   no known algorithm supported
+///   "null"                                   NULL key handed in
+const char *rysign_canary(SecKeyRef key);
+
 /// Override the CodeDirectory identifier used for every Mach-O signed by this
 /// module.
 ///
