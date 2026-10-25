@@ -471,8 +471,8 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
             fprintf(stderr, "rysign: key does not support %s — skipped\n", aName);
             continue;
         }
-        // Never release a stale/garbage out-parameter: reset it every attempt.
-        sigData = NULL;
+        // Never leave a stale error object lying around between attempts.
+        CFErrorRef cferr = NULL;
         CFDataRef payload;
         if (useDigest) {
             unsigned char hash[CC_SHA256_DIGEST_LENGTH];
@@ -481,22 +481,41 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         } else {
             payload = CFDataCreate(NULL, saSet.p, (CFIndex)saSet.len);
         }
-        OSStatus s = SecKeyCreateSignature(privKey, algo, payload, &sigData);
+        // REAL API (confirmed in the CI build log 2026-10-25): the signature
+        // is the RETURN VALUE (CFDataRef, NULL on failure) and the error comes
+        // back through a CFErrorRef* out-parameter. The previous code assumed
+        // an OSStatus return + CFDataRef* out-param — an API that does not
+        // exist — which INVERTED every result: a real success returned a heap
+        // pointer that truncated to a non-zero OSStatus (looked like failure,
+        // and sigData was never set because the real out-param is the error),
+        // while a real failure returned NULL (== errSecSuccess!) and the
+        // CFError object landed in the sigData slot to be used as the
+        // signature bytes. Both directions are now handled correctly.
+        CFDataRef sig = SecKeyCreateSignature(privKey, algo, payload, &cferr);
         CFRelease(payload);
-        g_sign_osstatus = (int)s;
-        if (s == errSecSuccess && sigData) {
+        if (sig) {
+            sigData = sig; // ownership transferred to the CMS builder
             usedName = aName;
+            g_sign_osstatus = errSecSuccess;
             break;
         }
-        if (sigData) { CFRelease(sigData); sigData = NULL; }
-        st = s;
+        if (cferr) {
+            st = (OSStatus)CFErrorGetCode(cferr);
+            CFRelease(cferr);
+        } else {
+            st = errSecInternalComponent; // no error object: shouldn't happen
+        }
+        g_sign_osstatus = (int)st;
+        fprintf(stderr, "rysign: SecKeyCreateSignature(%s) failed: osstatus=%d\n",
+                aName, (int)st);
     }
-    if (st != errSecSuccess && !sigData) st = (OSStatus)g_sign_osstatus;
     if (!sigData) {
         // The OSStatus is the ONLY clue the device gives us here: -25338
         // (errSecUnsupportedAlgorithm?) style codes point at a key/algorithm
         // mismatch, which is exactly the failure that used to surface as a
         // bare "exit code 6". It now reaches the user through RyLog.
+        if (st == errSecSuccess) st = errSecUnsupportedAlgorithm; // all 4 skipped
+        g_sign_osstatus = (int)st;
         fprintf(stderr, "rysign: SecKeyCreateSignature failed osstatus=%d "
                 "(tried 4 algorithm variants, %d unsupported)\n", (int)st, skipped);
         rysign_set_diag("SecKeyCreateSignature 失败 osstatus=%d（已试 %s / %s / %s / %s，%d 种算法密钥不支持）",
@@ -1125,13 +1144,79 @@ static bool key_can_sign(SecKeyRef k, int *out_os) {
         CFRelease(kat);
     }
     CFDataRef d = CFDataCreate(NULL, msg, (CFIndex)sizeof(msg));
-    CFDataRef sig = NULL;
-    OSStatus s = SecKeyCreateSignature(k, algo, d, &sig);
+    // REAL API: signature is the return value, error via CFErrorRef*. (The
+    // old OSStatus/CFDataRef* form here silently rejected every working key.)
+    CFErrorRef cferr = NULL;
+    CFDataRef sig = SecKeyCreateSignature(k, algo, d, &cferr);
     CFRelease(d);
-    if (s == errSecSuccess && sig) { CFRelease(sig); return true; }
-    if (sig) CFRelease(sig);
-    if (out_os) *out_os = (int)s;
+    if (sig) { CFRelease(sig); return true; }
+    if (cferr) {
+        if (out_os) *out_os = (int)CFErrorGetCode(cferr);
+        CFRelease(cferr);
+    } else if (out_os) {
+        *out_os = errSecInternalComponent;
+    }
     return false;
+}
+
+/// Canary self-check for a SecKey the CALLER holds (e.g. a keychain-backed
+/// key from `fallbackSecKey`): sign a 4-byte payload and report.
+///
+/// Deliberately lives in C: the Swift overlay imports
+/// `SecKeyCreateSignature`'s error parameter as
+/// `UnsafeMutablePointer<Unmanaged<CFError>?>`, which is easy to get wrong —
+/// and getting it wrong here inverts success and failure exactly the way the
+/// CMS builder used to. In C the real API (CFDataRef return + CFErrorRef*)
+/// is unambiguous.
+///
+/// Writes a short UTF-8 report into a static buffer (valid until the next
+/// call — copy it immediately; Swift: String(cString:)):
+///   "ok <RSA|ECDSA> <sigBytes> <blockBits>"   signed fine
+///   "fail <code> <description>"               a supported algorithm refused
+///   "skip"                                    no known algorithm supported
+///   "null"                                    NULL key handed in
+const char *rysign_canary(SecKeyRef key) {
+    static char buf[256];
+    if (!key) { snprintf(buf, sizeof(buf), "null"); return buf; }
+    SecKeyAlgorithm algs[2];
+    const char *names[2];
+    algs[0] = kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256; names[0] = "RSA";
+    algs[1] = kSecKeyAlgorithmECDSASignatureMessageX962SHA256;  names[1] = "ECDSA";
+    static const unsigned char msg[4] = { 'R', 'y', 'B', '!' };
+    CFDataRef d = CFDataCreate(NULL, msg, (CFIndex)sizeof(msg));
+    if (!d) { snprintf(buf, sizeof(buf), "fail cfdata-create"); return buf; }
+    for (int i = 0; i < 2; i++) {
+        // Ask before feeding: a mismatched algorithm is at best an error and
+        // at worst a Security assertion (hard crash) on iOS 27.
+        if (!SecKeyIsAlgorithmSupported(key, kSecKeyOperationTypeSign, algs[i])) continue;
+        CFErrorRef cferr = NULL;
+        CFDataRef sig = SecKeyCreateSignature(key, algs[i], d, &cferr);
+        if (sig) {
+            snprintf(buf, sizeof(buf), "ok %s %ld %d", names[i],
+                     (long)CFDataGetLength(sig), (int)(SecKeyGetBlockSize(key) * 8));
+            CFRelease(sig);
+            CFRelease(d);
+            return buf;
+        }
+        if (cferr) {
+            char desc[160] = {0};
+            CFStringRef ds = CFErrorCopyDescription(cferr);
+            if (ds) {
+                CFStringGetCString(ds, desc, sizeof(desc), kCFStringEncodingUTF8);
+                CFRelease(ds);
+            }
+            snprintf(buf, sizeof(buf), "fail %ld %s",
+                     (long)CFErrorGetCode(cferr), desc[0] ? desc : "(no description)");
+            CFRelease(cferr);
+        } else {
+            snprintf(buf, sizeof(buf), "fail %d (no error object)", errSecInternalComponent);
+        }
+        CFRelease(d);
+        return buf;
+    }
+    CFRelease(d);
+    snprintf(buf, sizeof(buf), "skip");
+    return buf;
 }
 
 /// Try every plausible reading of the key bytes and return one that WORKS.
