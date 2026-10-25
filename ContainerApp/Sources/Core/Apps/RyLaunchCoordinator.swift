@@ -27,9 +27,10 @@ public final class RyLaunchCoordinator: ObservableObject {
         AppImporter.shared.importedApps.first(where: { $0.bundleIdentifier == bundleID })
     }
 
-    /// User confirmed running a GUI app: launch it IN-PROCESS (no relaunch).
+    /// User confirmed running a GUI app: launch it with the currently selected
+    /// launch mode (MH_EXECUTE process, or the in-process dylib model).
     public func requestRun(_ app: ImportedApp) {
-        GuestRuntime.launchInProcess(app)
+        GuestRuntime.launch(app)
     }
 
     /// "弹出 App": tear down the in-process guest window and return to container.
