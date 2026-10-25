@@ -28,7 +28,9 @@ public final class ProcessManager: ObservableObject {
                       arguments: [String] = [],
                       environment: [String: String] = [:],
                       workingDirectory: String? = nil,
-                      captureOutput: Bool = true) -> NKProcess? {
+                      captureOutput: Bool = true,
+                      onOutput: ((String) -> Void)? = nil,
+                      onExit: ((Int32) -> Void)? = nil) -> NKProcess? {
         guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
 
         let proc = NKProcess(id: NKProcessID(value: nextID()),
@@ -36,6 +38,8 @@ public final class ProcessManager: ObservableObject {
                              executablePath: path,
                              arguments: arguments,
                              environment: environment)
+        proc.onOutput = onOutput
+        proc.onExit = onExit
 
         var pid: pid_t = 0
         var fileActions: posix_spawn_file_actions_t?
