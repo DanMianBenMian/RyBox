@@ -358,38 +358,30 @@ public final class CertificateStore: ObservableObject {
     /// Canary self-check for a keychain-backed key: sign 4 bytes and log the
     /// outcome. A key that imports fine but cannot sign (locked keychain,
     /// wrong key class, …) is otherwise invisible until the CMS step fails
-    /// deep inside the C signer — on the device that surfaced as a bare
-    /// "rc=8". Diagnostic only: a failed canary does NOT discard the key.
+    /// deep inside the signer — on the device that surfaced as a bare "rc=8".
+    /// Diagnostic only: a failed canary does NOT discard the key.
+    ///
+    /// Implemented in C (`rysign_canary`) on purpose: the Swift overlay
+    /// imports `SecKeyCreateSignature`'s error parameter as
+    /// `UnsafeMutablePointer<Unmanaged<CFError>?>`, and that shape is exactly
+    /// what inverted success/failure in the C signer before.
     private static func logKeySanity(_ key: SecKey) {
-        let canary = Data("RyB!".utf8)
-        if SecKeyIsAlgorithmSupported(key, .sign, .rsaSignatureMessagePKCS1SHA256) {
-            logCanaryResult(key: key, alg: .rsaSignatureMessagePKCS1SHA256,
-                            name: "RSA", data: canary)
-        } else if SecKeyIsAlgorithmSupported(key, .sign, .ecdsaSignatureMessageSHA256) {
-            logCanaryResult(key: key, alg: .ecdsaSignatureMessageSHA256,
-                            name: "ECDSA", data: canary)
-        } else {
+        guard let p = rysign_canary(key) else {
+            RyLog.shared.log("sign  canary 自检：C 层未返回报告", level: .warn, tag: "sign")
+            return
+        }
+        let report = String(cString: p)
+        let parts = report.split(separator: " ")
+        if parts.first == "ok" && parts.count >= 4 {
+            RyLog.shared.log("sign  canary 自检通过：\(parts[1]) 签名 \(parts[2]) 字节，块长 \(parts[3]) 位",
+                             level: .info, tag: "sign")
+        } else if report == "skip" {
             RyLog.shared.log("sign  canary 自检跳过：取回的 SecKey 不支持已知签名算法",
                              level: .warn, tag: "sign")
-        }
-    }
-
-    private static func logCanaryResult(key: SecKey, alg: SecKeyAlgorithm,
-                                        name: String, data: Data) {
-        var err: CFError?
-        if let sigCF = SecKeyCreateSignature(key, alg, data as CFData, &err) {
-            // CFData has no Swift `count` — bridge to Data first (same pattern
-            // as SecCertificateCopyData usage elsewhere in this file).
-            let sig = sigCF as Data
-            RyLog.shared.log("sign  canary 自检通过：\(name) 签名 \(sig.count) 字节，块长 \(SecKeyGetBlockSize(key) * 8) 位",
-                             level: .info, tag: "sign")
-        } else if let e = err {
-            let desc = (CFErrorCopyDescription(e) as String?) ?? ""
-            RyLog.shared.log("sign  canary 自检失败（仍继续）：错误码 \(CFErrorGetCode(e))：\(desc)",
-                             level: .warn, tag: "sign")
+        } else if report == "null" {
+            RyLog.shared.log("sign  canary 自检：密钥引用为空", level: .warn, tag: "sign")
         } else {
-            RyLog.shared.log("sign  canary 自检失败（仍继续）：无错误信息",
-                             level: .warn, tag: "sign")
+            RyLog.shared.log("sign  canary 自检失败（仍继续）：\(report)", level: .warn, tag: "sign")
         }
     }
 
