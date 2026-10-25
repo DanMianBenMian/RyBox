@@ -22,6 +22,11 @@ final class PassThroughView: UIView {
 /// out (it tears down the in-process guest and returns to SpringBoard), so a
 /// second eject control was redundant and confused the UI.
 ///
+/// Placement (2026-10-25, user requirement): the key sits at the BOTTOM CENTER
+/// as a SQUARE (~48pt, rounded-rect) key — NOT the old bottom-right capsule.
+/// This matches the SpringBoard's own home key shape and position, so the
+/// control stays in the same spot when a guest app opens and closes.
+///
 /// This window is intentionally NEVER installed at cold start. The container's
 /// Home key is a SwiftUI liquid-glass pill rendered INSIDE the SpringBoard
 /// window; this chrome exists only while a guest owns the screen, where it is
@@ -57,16 +62,19 @@ final class GuestChromeWindow {
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let home = chromeButton(title: "主屏", systemImage: "house.fill")
+        // Icon-only square key, bottom-center — same look and spot as the
+        // SpringBoard home key, so opening/closing a guest doesn't move it.
+        let home = chromeButton(title: nil, systemImage: "house.fill")
         home.addTarget(self, action: #selector(homeTapped), for: .touchUpInside)
 
         stack.addArrangedSubview(home)
         vc.view.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.trailingAnchor.constraint(equalTo: vc.view.safeAreaLayoutGuide.trailingAnchor,
-                                            constant: -16),
+            home.widthAnchor.constraint(equalToConstant: 48),
+            home.heightAnchor.constraint(equalToConstant: 48),
+            stack.centerXAnchor.constraint(equalTo: vc.view.centerXAnchor),
             stack.bottomAnchor.constraint(equalTo: vc.view.safeAreaLayoutGuide.bottomAnchor,
-                                          constant: -16)
+                                          constant: -14)
         ])
 
         win.rootViewController = vc
@@ -82,13 +90,15 @@ final class GuestChromeWindow {
         window = nil
     }
 
-    private func chromeButton(title: String, systemImage: String) -> UIButton {
+    private func chromeButton(title: String?, systemImage: String) -> UIButton {
         let btn = UIButton(type: .system)
         var config = UIButton.Configuration.filled()
+        // nil title → icon-only SQUARE key (bottom-center home key);
+        // a titled call keeps the old capsule pill shape.
         config.title = title
         config.image = UIImage(systemName: systemImage)
-        config.imagePadding = 6
-        config.cornerStyle = .capsule
+        config.imagePadding = title == nil ? 0 : 6
+        config.cornerStyle = title == nil ? .medium : .capsule
         config.baseBackgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.92)
         config.baseForegroundColor = .label
         btn.configuration = config
