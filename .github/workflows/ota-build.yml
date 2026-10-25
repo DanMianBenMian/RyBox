@@ -18,6 +18,12 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full fetch: the rapid Contents-API pushes + cancel-in-progress left a
+          # shallow clone's origin/main remote-tracking ref lagging, so a build
+          # once signed an EMPTY <dict/> entitlements (errno=85 on device). A full
+          # fetch keeps the checked-out tree in sync with the real tip of main.
+          fetch-depth: 0
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -121,15 +127,35 @@ jobs:
         run: |
           set -eo pipefail
           APP="${{ steps.locate.outputs.app_path }}"
-          ENT="ContainerApp/ContainerApp.entitlements"
-          echo "=== entitlements file ($ENT) contents ==="
+          # Write the entitlements inline. We previously relied on the checked-out
+          # ContainerApp/ContainerApp.entitlements, but rapid successive Contents-API
+          # pushes + cancel-in-progress left the runner's origin/main remote-tracking
+          # ref stale, so the checkout handed codesign an EMPTY <dict/> and the
+          # entitlement fix (disable-library-validation / network.server) never
+          # landed in the IPA — which is exactly what produced errno=85 on-device.
+          # Embedding them here makes the build hermetic.
+          ENT="/tmp/rybox_entitlements.plist"
+          cat > "$ENT" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>get-task-allow</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+          echo "=== entitlements we will embed ==="
           cat "$ENT"
           echo "=== signing ==="
           # Sign nested components FIRST. `codesign --deep` has a known bug where
           # it drops the --entitlements file for the MAIN executable and embeds an
-          # empty <dict/> (we hit exactly this: errno=85 fix never landed). Sign
-          # the dylib on its own, then sign the app WITHOUT --deep so the
-          # entitlements file is actually honoured.
+          # empty <dict/>. Sign the dylib on its own, then sign the app WITHOUT
+          # --deep so the entitlements file is actually honoured.
           find "$APP" -type f \( -name '*.dylib' -o -name '*.framework' -o -name '*.appex' \) -exec codesign --force --sign - {} \;
           codesign --force --sign - --entitlements "$ENT" "$APP"
           echo "=== embedded entitlements after sign ==="
