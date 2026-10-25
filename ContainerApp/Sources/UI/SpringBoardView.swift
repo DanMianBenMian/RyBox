@@ -220,7 +220,7 @@ struct SpringBoardView: View {
                 dock(geo)
                     .zIndex(1)
 
-                homeKey(geo)
+                homeKey()
                     .zIndex(3)
 
                 if store.editMode { editHint.zIndex(4) }
@@ -945,7 +945,7 @@ struct SpringBoardView: View {
 
     // MARK: Home key
 
-    private func homeKey(_ geo: GeometryProxy) -> some View {
+    private func homeKey() -> some View {
         VStack {
             Spacer()
             // The ONE home-key design (shared with the guest chrome — see
@@ -954,7 +954,9 @@ struct SpringBoardView: View {
                 .onLongPressGesture(minimumDuration: 0.4) { showAppSwitcher = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        .padding(.bottom, geo.safeAreaInsets.bottom + 4)
+        // Same source as the guest chrome (UIScreen's real safe-area inset) so
+        // the key never jumps when a guest opens or closes.
+        .padding(.bottom, UIScreen.main.safeAreaInsets.bottom + 4)
     }
 
     private var editHint: some View {
