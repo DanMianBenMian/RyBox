@@ -234,14 +234,24 @@ public final class CodeSigner {
             guard (try? staged.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
         }
 
-        // 4b) team + full cert chain (intermediate + root) from the profile
+        // 4b) team + full cert chain (intermediate + root) — ordered so the
+        //     WWDR intermediate lands at CMS slot 1 (the DR requires
+        //     `certificate 1[1.2.840.113635.100.6.2.1 exists]`). The leaf is
+        //     written separately (cert.der) and prepended as slot 0 by the
+        //     signer, so this set holds only the intermediates/root.
         let team = CertificateStore.shared.teamIdentifier ?? ""
         let certsDir = tmp.appendingPathComponent("chain")
         try? fm.createDirectory(at: certsDir, withIntermediateDirectories: true)
-        if let chain = CertificateStore.shared.provisioningCertificates() {
-            for (i, c) in chain.enumerated() {
-                try? c.write(to: certsDir.appendingPathComponent("\(i).der"))
-            }
+        let chain = CertificateStore.shared.signingIntermediateCertificates()
+        for (i, c) in chain.enumerated() {
+            try? c.write(to: certsDir.appendingPathComponent("\(i).der"))
+        }
+        if !chain.isEmpty {
+            RyLog.shared.log("sign  证书链：\(chain.count) 张中间/根证书（含 WWDR 中间证书，置于 slot 1）",
+                             level: .info, tag: "sign")
+        } else {
+            RyLog.shared.log("sign  ⚠ 证书链为空：CMS 将只有叶子证书，DR 的 slot 1(WWDR) 校验会失败 → errno=85。请确认 p12 含完整链或由系统信任库提供。",
+                             level: .warn, tag: "sign")
         }
 
         // 4c) delegate Mach-O signing to the robust in-process signer. All profile
