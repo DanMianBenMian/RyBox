@@ -69,6 +69,13 @@ public final class CodeSigner {
     public func sign(bundleAt path: String) -> Result<Void, SignError> {
         guard CertificateStore.shared.isConfigured else { return .failure(.notConfigured) }
 
+        // What are we signing WITH? (subject · key type/bits · scheme). This
+        // one line is what turns "rc=8 私钥无法创建" from a mystery into a
+        // checkable fact — e.g. "RSA 2048 · PBES2 · AES-256-CBC".
+        if let info = CertificateStore.shared.certificateInfo {
+            RyLog.shared.log("sign  身份：\(info)", level: .info, tag: "sign")
+        }
+
         // LiveContainer parity: the CodeDirectory identifier of every guest
         // binary is the HOST app's bundle id, because that is the identity the
         // provisioning profile authorises. (ZSign is called with
@@ -161,6 +168,16 @@ public final class CodeSigner {
                 RyLog.shared.log("sign  使用内置 PKCS#12 解码器（OpenSSL 3 p12）",
                                  level: .info, tag: "sign")
                 certDER = c; keyDER = k; keyIsEC = CertificateStore.shared.fallbackKeyIsEC()
+                // The DER → SecKey round-trip INSIDE the signer is the weakest
+                // link in the whole chain: on the device (iPadOS 27 beta,
+                // rc=8) every reading of the decoded key bytes was refused by
+                // SecKeyCreateWithData. The keychain route produces a REAL
+                // SecKey through a different Security code path, which lets us
+                // skip that reconstruction entirely and use the proven
+                // `rysign_sign_bundle_with_key` entry.
+                if let kc = CertificateStore.shared.fallbackSecKey() {
+                    liveKey = kc
+                }
             } else if let identity = CertificateStore.shared.identityRef() {
                 // Second chance: no live SecKey could be extracted, so fall back
                 // to the historical external-representation round-trip. Less
@@ -196,7 +213,14 @@ public final class CodeSigner {
         guard (try? certDER.write(to: certURL)) != nil else { return .failure(.stageFailed) }
         let keyURL = tmp.appendingPathComponent("key.der")
         if let k = keyDER {
-            guard (try? k.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
+            // Hand the signer the FULL PKCS#8 when we have it. Its
+            // `create_signing_key` tries the whole blob AND the PKCS#1/SEC1
+            // inner (`pkcs8_inner`), so both Security readings get a turn —
+            // but only if the wrapper is actually there. We used to stage the
+            // inner alone, which is how a PKCS#8-friendly Security build would
+            // still end up with rc=8 "私钥无法创建".
+            let staged = CertificateStore.shared.fallbackKeyPKCS8DER() ?? k
+            guard (try? staged.write(to: keyURL)) != nil else { return .failure(.stageFailed) }
         }
 
         // 4b) team + full cert chain (intermediate + root) from the profile
