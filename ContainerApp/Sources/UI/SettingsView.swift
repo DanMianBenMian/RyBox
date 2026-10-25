@@ -18,6 +18,10 @@ struct SettingsView: View {
     @EnvironmentObject private var env: RuntimeEnvironment
     /// Which launch model a guest app uses (see GuestLaunchMode).
     @AppStorage("rybox.guestLaunchMode") private var launchModeRaw = GuestLaunchMode.inProcessDylib.rawValue
+    /// Developer debug bridge: a PC can connect over TCP to push files,
+    /// re-sign, and launch guests without rebuilding the IPA.
+    @AppStorage("rybox.devmode") private var devMode = false
+    @AppStorage("rybox.devport") private var devPort = 2222
 
     var body: some View {
         Form {
@@ -28,9 +32,13 @@ struct SettingsView: View {
             logSection
             desktopSection
             themeSection
+            developerSection
             aboutSection
         }
         .navigationTitle("设置")
+        .onChange(of: devMode) { _ in
+            DevBridge.shared.applyDevMode()
+        }
         .onChange(of: floatBallOn) { on in
             if on {
                 FloatingLogBall.shared.show()
@@ -388,6 +396,42 @@ struct SettingsView: View {
             Text("主题与资源库")
         } footer: {
             Text("主题格式与 WinterBoard / SnowBoard 一致：IconBundles/<bundle id>.png、Bundles/<bundle id>/、UIImages/（DockBackground、FolderBackground…）、HomeWallpaper.png、LockWallpaper.png。多个主题可叠加，越靠后优先级越高。「注销资源库」重新扫描并清空图标缓存，「注销 SpringBoard」则会像真机注销一样重建外壳并回到锁屏。")
+        }
+    }
+
+    // MARK: 开发者调试（TCP 桥，免重构建）
+
+    private var developerSection: some View {
+        Section {
+            Toggle("开发者调试模式", isOn: $devMode)
+
+            Stepper("端口 \(devPort)", value: $devPort, in: 1024...65535)
+
+            if devMode {
+                let ip = DevBridge.shared.localIP()
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("连接地址")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if ip != "unknown" {
+                        Text("\(ip):\(devPort)")
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                        Text("电脑端：python3 tools/devbridge_client.py \(ip) \(devPort)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                    } else {
+                        Text("未能获取 LAN IP（请连接 Wi-Fi 后再试）")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
+            }
+        } header: {
+            Text("开发者调试")
+        } footer: {
+            Text("开启后 RyBox 会在本机监听 TCP，电脑用配套脚本连接，可以实时推送 guest 二进制 / entitlements、重新签名、启动 / 弹出 guest、流式查看日志、执行沙箱命令——绝大多数调整无需重新构建 IPA。仅限 trusted 网络使用。")
         }
     }
 
