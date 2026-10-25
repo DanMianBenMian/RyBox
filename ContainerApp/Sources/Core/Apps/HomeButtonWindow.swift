@@ -82,10 +82,14 @@ final class GuestChromeWindow {
             hosted.view.widthAnchor.constraint(equalToConstant: 46),
             hosted.view.heightAnchor.constraint(equalToConstant: 46),
             hosted.view.centerXAnchor.constraint(equalTo: vc.view.centerXAnchor),
-            // Same offset as the SpringBoard key (safe area + 4): the control
-            // must NOT move when a guest opens or closes.
+            // Match the SpringBoard key EXACTLY: use the device's real safe-area
+            // bottom inset (UIScreen), NOT this hand-built window's
+            // safeAreaLayoutGuide (which reports 0 here and made the key float
+            // ~20pt too HIGH when a guest was open). The desktop uses the same
+            // UIScreen value, so the key can never jump between the two.
+            let bottomInset = UIScreen.main.safeAreaInsets.bottom
             hosted.view.bottomAnchor.constraint(
-                equalTo: vc.view.safeAreaLayoutGuide.bottomAnchor, constant: -4)
+                equalTo: vc.view.bottomAnchor, constant: -(bottomInset + 4))
         ])
         hosted.didMove(toParent: vc)
 
