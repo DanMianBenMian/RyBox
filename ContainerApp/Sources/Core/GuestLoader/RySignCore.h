@@ -184,16 +184,18 @@ int ry_build_requirements(const RySignMeta *meta, RyBuf *out);
 ///
 /// `is_adhoc` sets `CS_SEC_CODESIGNATURE_ADHOC` in the flags field.
 ///
-/// `exec_seg_limit` / `exec_seg_flags` come from the Mach-O's `__TEXT`
-/// segment: the limit is that segment's `vmsize`, and the flags carry
-/// `CS_EXECSEG_MAIN_BINARY` for a main executable (plus
-/// `CS_EXECSEG_ALLOW_UNSIGNED` only when the entitlements really contain
-/// `get-task-allow = true`).
+/// `exec_seg_base` / `exec_seg_limit` / `exec_seg_flags` come from the Mach-O's
+/// `__TEXT` segment: the base is that segment's `vmaddr` (0 for a dylib whose
+/// __TEXT sits at 0, 0x100000000 for a PIE executable), the limit is its
+/// `vmsize`, and the flags carry `CS_EXECSEG_MAIN_BINARY` for a main
+/// executable (plus `CS_EXECSEG_ALLOW_UNSIGNED` only when the entitlements
+/// really contain `get-task-allow = true`).
 int ry_build_codedirectory(int alternate,
                            const unsigned char *code, size_t code_len,
                            const RySignMeta *meta,
                            int is_execute, int is_adhoc,
-                           uint64_t exec_seg_limit, uint64_t exec_seg_flags,
+                           uint64_t exec_seg_base, uint64_t exec_seg_limit,
+                           uint64_t exec_seg_flags,
                            const RySignHash *hash,
                            RyBuf *out);
 
