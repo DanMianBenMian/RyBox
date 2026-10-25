@@ -317,8 +317,11 @@ final class DesktopStore: ObservableObject {
            let guest = guestItems.first(where: { $0.id == "guest.\(PreinstalledStore.sileoBundleID)" }) {
             return guest
         }
-        // Anything living inside a folder is not shown loose on desktop/dock.
-        guard !foldedIDs.contains(id) else { return nil }
+        // A folded member is still shown in the DOCK (its Dock icon is kept when
+        // it is put into a folder); it is hidden from the DESKTOP grid by the
+        // `foldedIDs` filter inside `allItems`. Only `allItems` — not this
+        // resolver — decides desktop visibility, so a folded Dock member resolves
+        // normally here and keeps its Dock slot.
         return resolve(id: id)
     }
 
@@ -394,7 +397,12 @@ final class DesktopStore: ObservableObject {
         let folder = RyFolder(name: name ?? "文件夹", memberIDs: members)
         folders.append(folder)
         for m in members {
-            removeFromDock(m)
+            // Folding hides the member from the DESKTOP grid (it now lives
+            // inside the folder) but must NOT evict it from the Dock — the user
+            // keeps the Dock icon. The fold filter in `item(id:)` already hides
+            // a folded member from the grid; removing only its slot here is what
+            // makes "Desktop removed (correct) / Dock removed (wrong)" resolve to
+            // "Desktop removed, Dock kept".
             slots.removeValue(forKey: m)
         }
         reflow()
@@ -408,7 +416,8 @@ final class DesktopStore: ObservableObject {
               !f.memberIDs.contains(itemID), item(id: itemID) != nil else { return }
         f.memberIDs.append(itemID)
         folders = folders.map { $0.id == folderID ? f : $0 }
-        removeFromDock(itemID)
+        // Keep Dock membership (the member stays docked; it is only removed from
+        // the desktop grid because it now lives inside the folder).
         slots.removeValue(forKey: itemID)
         reflow()
     }
