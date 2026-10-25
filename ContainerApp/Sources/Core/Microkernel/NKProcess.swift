@@ -40,9 +40,18 @@ public final class NKProcess: ObservableObject {
     internal func markExited(status: Int32) {
         self.exitStatus = status
         self.state = .exited
+        onExit?(status)
     }
 
     internal func appendOutput(_ s: String) {
         output += s
+        onOutput?(s)
     }
+
+    /// Live hooks the launcher can use to mirror the child's stdout/stderr
+    /// into RyBox's own log. A guest that dies during startup says WHY on
+    /// stderr (an AMFI refusal, a missing symbol, a bad profile) — without
+    /// this the container would only see "the process went away".
+    internal var onOutput: ((String) -> Void)?
+    internal var onExit: ((Int32) -> Void)?
 }
