@@ -867,26 +867,40 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
 
     // ---- write back (LiveContainer / zsign parity — the errno=85 fix) -----
     //
-    // HARD RULE, paid for on the device (2026-10-25): the CodeDirectory
-    // hashes page 0, and page 0 CONTAINS the load commands. Any write to
-    // LC_CODE_SIGNATURE.datasize — or to __LINKEDIT.filesize/vmsize — AFTER
-    // the hashes were computed silently invalidates them, and the kernel
-    // then refuses dlopen with
-    //     code signature invalid … (errno=85) … codeBlobOffset=…, codeBlobSize=…
-    // even though the SuperBlob itself is perfectly well-formed. That is
-    // exactly what happened with Sileo: the original datasize is 64848, our
-    // blob is 61312, and the old code "helpfully" shrank the field
-    // post-hash. The kernel FOUND the blob (it printed offset+size) and
-    // rejected it — the page-0 hash no longer matched.
+    // TWO RULES, both paid for on the device (2026-10-25/26):
     //
-    // zsign's ZArchO::Sign() therefore does a BARE memcpy when the reserved
-    // region fits: it never touches the load commands, and the stale,
-    // LARGER datasize is fine (the kernel parses the SuperBlob by its own
-    // header length). When the region does not fit,
-    // ZArchO::ReallocCodeSignSpace() FIRST finalises __LINKEDIT and the
-    // LC_CODE_SIGNATURE command — i.e. every hashed byte — grows the file,
-    // and only THEN builds the signature. Same order here: mutate the
-    // hashed bytes, then re-hash and rebuild.
+    // (1) The CodeDirectory hashes page 0, and page 0 CONTAINS the load
+    //     commands. So a write to `LC_CODE_SIGNATURE.datasize` — or to
+    //     __LINKEDIT.filesize/vmsize — AFTER the hashes were computed
+    //     silently invalidates them, and the kernel refuses the image with
+    //     `code signature invalid … (errno=85)`. The order is therefore
+    //     fixed: mutate the hashed bytes FIRST, then compute the hashes, then
+    //     build the blob. (This was the original bug: the code shrank
+    //     `datasize` post-hash.)
+    //
+    // (2) The load command must advertise the blob's EXACT length. zsign
+    //     writes `pcslc->datasize = uNewLength - m_uCodeLength` — the precise
+    //     value — and Apple codesign does the same. Leaving a STALE, LARGER
+    //     `datasize` behind (the "bare memcpy, don't touch the load
+    //     commands" shortcut) is NOT safe: the kernel reads a code-signature
+    //     region of the advertised size, whose SuperBlob header claims a
+    //     different length, and rejects the whole image. That is exactly
+    //     what the device reported:
+    //
+    //         code signature invalid in <F9EEDC94-…> (errno=85)
+    //         sliceOffset=0x00000000, codeBlobOffset=0x00444890, codeBlobSize=0x0000FD50
+    //
+    //     0x0000FD50 = 64848 = the ORIGINAL Sileo `datasize`, while our
+    //     SuperBlob was 61312 bytes. (The UUID in the message was OURS — so
+    //     the signature was parsed, and the hashes inside were fine; what was
+    //     wrong was the LENGTH the load command advertised.)
+    //
+    // Both rules together mean: whenever the blob's length differs from what
+    // the load command says, we MUST touch page 0 and therefore MUST re-hash.
+    // The re-hash produces a blob of the same length (the CodeDirectory
+    // layout depends on `code_limit`, which does not change), so the
+    // `datasize` we wrote stays correct — and the code below verifies that
+    // explicitly instead of assuming it.
     //
     // A stale or corrupt LC_CODE_SIGNATURE can also point PAST EOF (a
     // decrypted or hand-patched binary). `avail` is a size_t subtraction,
@@ -902,10 +916,34 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     }
     size_t avail = (*len) - (size_t)sig_dataoff;
     int need_grow = (sb.len > avail);                          // blob doesn't fit
-    int need_ds   = (sig_lc->datasize < (uint32_t)sb.len);     // LC claims too small a region
+    // The LC's datasize MUST equal the blob's real length — exactly, in both
+    // directions. Apple codesign always writes the precise value, and zsign
+    // does too (it rebuilds the load command as part of the sign).
+    //
+    // Leaving a STALE, LARGER datasize behind (the "bare memcpy, don't touch
+    // the load commands" shortcut) is what produced the device failure we
+    // chased for days:
+    //
+    //     code signature invalid in <F9EEDC94-…> (errno=85)
+    //     sliceOffset=0x00000000, codeBlobOffset=0x00444890, codeBlobSize=0x0000FD50
+    //
+    // 0x0000FD50 = 64848 — the ORIGINAL Sileo `LC_CODE_SIGNATURE.datasize`.
+    // Our SuperBlob was 61312 bytes. The kernel therefore read a 64848-byte
+    // "code signature" whose SuperBlob header claims 61312 → the sizes
+    // disagree → the whole image is rejected, even though every hash inside
+    // is perfectly correct. (The UUID in the message was OURS, which is why
+    // it looked like "our signature is broken" — the signature was fine; the
+    // LENGTH the load command advertised was not.)
+    //
+    // Fixing it means touching `datasize`, which lives in page 0, which the
+    // CodeDirectory hashes. So the mutation MUST happen BEFORE the hashes are
+    // computed — which is exactly what the branch below does: mutate, then
+    // re-hash, then rebuild. The rebuilt blob has the same length (the CD
+    // layout does not change), so the datasize we just wrote stays correct.
+    int need_ds   = (sig_lc->datasize != (uint32_t)sb.len);    // LC length != blob length
 
     if (!need_grow && !need_ds) {
-        // Fits, and the LC already claims a region >= the blob: a bare
+        // Fits, and the LC already claims EXACTLY the blob's length: a bare
         // memcpy, ZERO load-command mutation (zsign ZArchO::Sign parity).
         memcpy(buf + sig_dataoff, sb.p, sb.len);
         // Hygiene only: blank the tail of the OLD signature region, and
@@ -981,7 +1019,33 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
             ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
             return -6;
         }
+        // The rebuilt blob must be EXACTLY as long as the datasize we wrote
+        // above. In practice it is (the CodeDirectory layout depends on
+        // `code_limit`, which did not change), but if it ever were not, the
+        // load command would advertise a length the blob does not have — the
+        // very failure this whole branch exists to prevent. Detect it here
+        // rather than on the device.
+        //
+        // NOTE: `!need_grow` is checked FIRST — after a realloc the `sig_lc`
+        // pointer dangles and must not be dereferenced.
+        if (!need_grow && sb.len != (size_t)sig_lc->datasize) {
+            fprintf(stderr, "rysign: rebuilt blob length %zu != advertised datasize %u\n",
+                    sb.len, sig_lc->datasize);
+            ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);
+            ry_buf_free(&cd2); ry_buf_free(&cms); ry_buf_free(&sb);
+            return -6;
+        }
         memcpy(buf + sig_dataoff, sb.p, sb.len);
+        // Blank the bytes the OLD (larger) signature left behind in the
+        // region we no longer claim. They sit outside the advertised
+        // datasize, so the kernel never looks at them — but a stale blob
+        // fragment there is exactly the kind of thing that makes the next
+        // inspection of this binary confusing.
+        if (sig_datasize > sb.len) {
+            size_t tail = (size_t)sig_datasize - sb.len;
+            if ((size_t)sig_dataoff + sb.len + tail <= *len)
+                memset(buf + sig_dataoff + sb.len, 0, tail);
+        }
     }
 
     ry_buf_free(&req); ry_buf_free(&ent_blob); ry_buf_free(&cd1);

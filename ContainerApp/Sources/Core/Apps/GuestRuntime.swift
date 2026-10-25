@@ -38,26 +38,38 @@ enum GuestLaunchMode: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .executeProcess:
-            return "guest 保持 MH_EXECUTE，用 posix_spawn 起成独立进程：不转动态库、不走 dlopen。可执行文件只按 DR 校验证书链，动态库还要过 transmute 和 library validation —— 那正是 Sileo 反复 errno=85 的原因。"
+            return "guest 保持 MH_EXECUTE，用 posix_spawn 起成独立进程：可执行文件只按指定要求校验证书链，不涉及库验证。缺点是容器界面无法与 guest 共存，guest 也不能访问容器的虚拟根。"
         case .inProcessDylib:
-            return "LiveContainer 模式：把 guest 改成 MH_DYLIB 后 dlopen 进 RyBox 进程，界面能和容器共存，但签名校验更严。"
+            return "LiveContainer 模式：把 guest 改成 MH_DYLIB 后 dlopen 进 RyBox 进程，界面能和容器共存。要求宿主用开发证书签名（get-task-allow），否则库验证会拒绝（errno=85）。"
         }
     }
 
     /// The mode in force right now (persisted across relaunches).
     ///
-    /// Default is `.executeProcess`: the `inProcessDylib` (LiveContainer-style
-    /// `dlopen` of a patched `MH_DYLIB`) path is fundamentally broken for Sileo
-    /// — AMFI's "transmute" rule refuses a dylib that only carries the XML
-    /// entitlements blob (slot 5), no DER one (slot 7), with
-    /// `code signature invalid (errno=85)` regardless of the signing team. The
-    /// `executeProcess` path keeps the guest an `MH_EXECUTE` and spawns it as its
-    /// own process, so no transmute / library-validation is involved. The toggle
-    /// in Settings (启动方式) still lets you experiment with the in-process path.
+    /// Default is `.inProcessDylib` — the LiveContainer model. That is the
+    /// mode the container is BUILT for (guest UI lives inside RyBox's process,
+    /// the container never exits), and it is the mode LiveContainer itself
+    /// uses.
+    ///
+    /// The in-process path has ONE hard requirement that is easy to miss:
+    /// the HOST must be signed with a **development** profile
+    /// (`get-task-allow = true`). A debuggable host is exempt from AMFI's
+    /// library validation, so it may load a guest dylib signed by any team.
+    /// A host signed with a **distribution** profile is not debuggable, AMFI
+    /// enforces library validation, and any guest dylib whose team differs
+    /// from the host's is refused with `code signature invalid (errno=85)`.
+    ///
+    /// LiveContainer's FAQ says the same thing in so many words:
+    /// *"you are using a distribution certificate profile to sign LiveContainer,
+    /// which is not supported and LiveContainer won't work at all."*
+    ///
+    /// `HostIdentity.inspect()` reads the host's own signature at launch and
+    /// logs whether that exemption is present, so the failure mode is
+    /// self-explaining instead of being a mystery.
     static var current: GuestLaunchMode {
         get {
             let raw = UserDefaults.standard.string(forKey: "rybox.guestLaunchMode") ?? ""
-            return GuestLaunchMode(rawValue: raw) ?? .executeProcess
+            return GuestLaunchMode(rawValue: raw) ?? .inProcessDylib
         }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: "rybox.guestLaunchMode")
@@ -202,6 +214,28 @@ enum GuestRuntime {
         let bundleURL = URL(fileURLWithPath: exePath).deletingLastPathComponent()
 
         RyLog.shared.log("准备启动 \(app.name)（\(app.bundleIdentifier)）", level: .info, tag: "guest")
+
+        // Pre-flight: the in-process path's ONE hard requirement is that the
+        // HOST may load a foreign-team dylib. A host signed with a
+        // distribution profile is not debuggable, so AMFI enforces library
+        // validation and refuses the guest with the opaque
+        // `code signature invalid (errno=85)`.
+        //
+        // Check it BEFORE spending 30 seconds on Mach-O patching and signing,
+        // and turn the failure into an actionable sentence instead of a raw
+        // errno. LiveContainer's FAQ states the requirement outright:
+        // "you are using a distribution certificate profile to sign
+        //  LiveContainer, which is not supported and LiveContainer won't work
+        //  at all."
+        let preflight = HostIdentity.preflightWarning()
+        if let preflight {
+            RyLog.shared.log("启动前检查失败：\(preflight)", level: .error, tag: "guest")
+            DispatchQueue.main.async {
+                GuestWindowHost.shared.presentScaffold(bundleURL, reason: preflight)
+            }
+            return
+        }
+        HostIdentity.logSummary()
 
         // Heavy, potentially slow work (Mach-O patch + re-sign of the whole
         // bundle) runs OFF the main thread so the UI never freezes while a guest

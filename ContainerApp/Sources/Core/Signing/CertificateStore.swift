@@ -436,6 +436,24 @@ public final class CertificateStore: ObservableObject {
         SecItemDelete(q as CFDictionary)
     }
 
+    /// Decode an arbitrary `.mobileprovision` blob into its plist.
+    ///
+    /// Exposed as a STATIC helper so the container can inspect its OWN
+    /// embedded provisioning profile (see `HostIdentity`) with exactly the same
+    /// CMS-unwrapping code that parses the user's imported one. Two parsers
+    /// would inevitably disagree about what a profile says.
+    public static func decodeProvisioningPlist(_ data: Data) -> [String: Any]? {
+        guard !data.isEmpty else { return nil }
+        let plistData: Data
+        if data.first == 0x30 {
+            plistData = Self.unwrapCMS(data) ?? data
+        } else {
+            plistData = data
+        }
+        return (try? PropertyListSerialization.propertyList(from: plistData,
+                options: [], format: nil)) as? [String: Any]
+    }
+
     /// Decode the provisioning profile into its outer dict.
     ///
     /// A real `.mobileprovision` is a CMS `SignedData` whose *content* is a

@@ -44,6 +44,20 @@ final class RyBoxAppDelegate: UIResponder, UIApplicationDelegate {
         // Live log: the container's own start-up trace, so the 日志 app (and the
         // floating ball) show the real boot sequence.
         RyLog.shared.log("RyBox 启动 · bundle=\(Bundle.main.bundleIdentifier ?? "?")", level: .info, tag: "boot")
+        // Read our OWN signature: team id, get-task-allow, embedded profile.
+        //
+        // This is the single most important piece of context for the
+        // `code signature invalid (errno=85)` failure mode: a host signed
+        // with a DISTRIBUTION profile is not debuggable, so AMFI enforces
+        // library validation and refuses any guest dylib that is not signed by
+        // the host's own team. A host signed with a DEVELOPMENT profile
+        // (get-task-allow = true) is debuggable and therefore exempt — which
+        // is exactly why LiveContainer's FAQ says a distribution profile
+        // "is not supported and LiveContainer won't work at all".
+        //
+        // Read it at launch so the log answers the question once, instead of
+        // every launch attempt ending in the same unexplained errno.
+        HostIdentity.inspect()
         // Developer debug bridge (Settings → Developer). Opens a TCP listener so
         // a PC can push files / re-sign / launch guests without rebuilding.
         DevBridge.shared.applyDevMode()

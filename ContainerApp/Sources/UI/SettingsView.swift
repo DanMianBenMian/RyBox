@@ -26,6 +26,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             signingSection
+            hostIdentitySection
             launchSection
             entitlementSection
             jbrootSection
@@ -117,6 +118,76 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: 宿主签名自检（RyBox.app 自身的证书状态）
+
+    private var hostIdentitySection: some View {
+        Section {
+            HStack {
+                Text("库验证")
+                Spacer()
+                switch HostIdentity.libraryValidation {
+                case .exempt:
+                    Label("已豁免", systemImage: "checkmark.shield.fill")
+                        .foregroundColor(.green)
+                case .sameTeamOnly:
+                    Label("仅限同 team", systemImage: "exclamationmark.shield.fill")
+                        .foregroundColor(.orange)
+                case .unknown:
+                    Label("无法读取", systemImage: "questionmark.circle")
+                        .foregroundColor(.secondary)
+                }
+            }
+            HStack {
+                Text("开发证书")
+                Spacer()
+                Text(HostIdentity.hostGetTaskAllow ? "是" : "否")
+                    .foregroundColor(HostIdentity.hostGetTaskAllow ? .green : .orange)
+            }
+            if let team = HostIdentity.hostTeamID {
+                HStack {
+                    Text("宿主 Team ID")
+                    Spacer()
+                    Text(team).foregroundColor(.secondary)
+                }
+            }
+            if let name = HostIdentity.hostProfileName {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("宿主描述文件").font(.caption).foregroundColor(.secondary)
+                    Text(name).font(.caption2).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("诊断").font(.caption).foregroundColor(.secondary)
+                Text(HostIdentity.diagnose())
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let warn = HostIdentity.preflightWarning() {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("当前配置无法加载 guest 动态库", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Text(warn)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Button {
+                HostIdentity.inspect()
+            } label: {
+                Label("重新检测宿主签名", systemImage: "arrow.clockwise")
+            }
+            .font(.caption)
+        } header: {
+            Text("宿主签名自检")
+        } footer: {
+            Text("LiveContainer 要求宿主自带 get-task-allow（开发证书），否则 AMFI 会拒绝加载 guest 动态库并报 errno=85。这里读取的是 RyBox.app 自身的签名，与「签名身份」里的 guest 证书是两回事。")
+        }
+    }
+
     // MARK: 启动方式（MH_EXECUTE 进程 / 进程内动态库）
 
     private var launchSection: some View {
@@ -135,7 +206,7 @@ struct SettingsView: View {
         } header: {
             Text("启动方式")
         } footer: {
-            Text("两种方式走的是完全不同的签名校验体系：动态库要过 transmute 和 library validation，可执行文件只按 DR 校验证书链。切换后立即生效，便于对照真机日志。")
+            Text("两种方式走的是完全不同的签名校验体系：进程内动态库要过 AMFI 的 library validation（宿主需开发证书豁免），可执行文件只按 DR 校验证书链。切换后立即生效，便于对照真机日志。")
         }
     }
 

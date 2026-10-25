@@ -401,6 +401,7 @@ final class DevBridge {
         defer { freeifaddrs(ifaddrs) }
 
         var candidates: [String: String] = [:]   // interface name -> IPv4
+        var all: [String] = []
         var p = first
         while true {
             if let addr = p.pointee.ifa_addr,
@@ -411,18 +412,23 @@ final class DevBridge {
                     || name.hasPrefix("awdl")
                     || name.hasPrefix("llw")
                     || name.hasPrefix("utun")
-                if !skip {
-                    var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-                    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                    if let c = inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) {
-                        let ip = String(cString: c)
-                        if ip != "127.0.0.1" { candidates[name] = ip }
-                    }
+                var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if let c = inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) {
+                    let ip = String(cString: c)
+                    all.append("\(name)=\(ip)\(skip ? "(skip)" : "")")
+                    if !skip && ip != "127.0.0.1" { candidates[name] = ip }
                 }
             }
             if p.pointee.ifa_next == nil { break }
             p = p.pointee.ifa_next
         }
+
+        // Log EVERY interface, so the next device log answers "why is the
+        // address incomplete / unknown" in one line instead of another round
+        // of guessing. Cheap, and it only runs when the Settings screen asks.
+        RyLog.shared.log("网络接口枚举：\(all.isEmpty ? "(无 AF_INET 接口)" : all.joined(separator: ", "))",
+                         level: .debug, tag: "dev")
 
         // Preference order: Wi-Fi, then any wired/en*, then cellular, then bridge,
         // then whatever else we found.
