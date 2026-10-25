@@ -48,7 +48,7 @@ enum GuestLaunchMode: String, CaseIterable, Identifiable {
     static var current: GuestLaunchMode {
         get {
             let raw = UserDefaults.standard.string(forKey: "rybox.guestLaunchMode") ?? ""
-            return GuestLaunchMode(rawValue: raw) ?? .executeProcess
+            return GuestLaunchMode(rawValue: raw) ?? .inProcessDylib
         }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: "rybox.guestLaunchMode")
