@@ -668,8 +668,23 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     // RyDyldHooks entitlement oracle answers runtime queries from that policy.
     int is_execute = (hdr->filetype == MH_EXECUTE);
     if (!is_execute) {
+        // LiveContainer parity (`ZArchO::BuildCodeSignature`):
+        //     SlotBuildEntitlements(IsExecute() ? m_strEntitleData : "")
+        //     SlotBuildDerEntitlements(IsExecute() ? … : "")
+        //
+        // A MH_DYLIB therefore carries NO entitlements slot at all — not an
+        // empty one, none. That matters: an XML-only entitlements blob
+        // without a DER one sends AMFI down the "transmute" path, and the
+        // transmute for a dylib being dlopen'd into an arbitrary host process
+        // is REFUSED (dyld then reports `code signature invalid (errno=85)`).
+        //
+        // The CodeResources slot is likewise empty for a dylib: zsign is
+        // handed an empty CodeResources blob and turns that into 20/32 zero
+        // bytes, which the leading-zero trim then drops from the special
+        // slot array entirely. The Info.plist slot (-1) IS kept — zsign
+        // hashes the Info.plist it is given, and dropping it would shift
+        // every slot index.
         ent = NULL; ent_len = 0;
-        infoplist = NULL; info_len = 0;
         code_resources = NULL; cr_len = 0;
     }
 
@@ -705,6 +720,52 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
 
     // CodeDirectory hashes everything before the signature — zsign's m_uCodeLength.
     uint64_t code_limit = (uint64_t)sig_dataoff;
+
+    // Info.plist slot (-1) source, zsign semantics — DYLIB PATH ONLY.
+    //
+    // zsign hashes the Info.plist that is EMBEDDED IN THE MACH-O itself
+    // (`__TEXT,__info_plist` section — `ZArchO::Init` collects it into
+    // `m_strInfoPlist`, and `ZMachO::Sign` hashes it when the caller passes
+    // no Info.plist SHA). Only if the binary has no such section does it fall
+    // back to 20/32 zero bytes.
+    //
+    // This is applied ONLY for a MH_DYLIB. For a MH_EXECUTE the slot must
+    // stay the bundle's Info.plist FILE bytes: that is what Apple's own
+    // signing does, and the kernel compares the slot against the file on
+    // disk for a main executable. LiveContainer only ever signs dylibs, so
+    // zsign's shortcut is safe there and only there.
+    if (!is_execute) {
+        const unsigned char *embedded = NULL;
+        size_t embedded_len = 0;
+        uint32_t nc = hdr->ncmds;
+        struct load_command *lc2 = (struct load_command *)(buf + sizeof(struct mach_header_64));
+        for (uint32_t i = 0; i < nc; i++) {
+            if (lc2->cmd == LC_SEGMENT_64) {
+                struct segment_command_64 *seg = (struct segment_command_64 *)lc2;
+                if (strcmp(seg->segname, "__TEXT") == 0) {
+                    struct section_64 *secs = (struct section_64 *)((unsigned char *)seg + sizeof(struct segment_command_64));
+                    for (uint32_t j = 0; j < seg->nsects; j++) {
+                        if (strcmp(secs[j].sectname, "__info_plist") == 0) {
+                            if (secs[j].size && secs[j].offset < *len) {
+                                embedded = buf + secs[j].offset;
+                                embedded_len = secs[j].size;
+                                if (embedded_len > *len - secs[j].offset) embedded_len = *len - secs[j].offset;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            lc2 = (struct load_command *)((unsigned char *)lc2 + lc2->cmdsize);
+        }
+        if (embedded && embedded_len) {
+            infoplist = embedded; info_len = embedded_len;
+        } else {
+            // No embedded section — zsign uses 20/32 zero bytes here, which
+            // means the -1 slot is absent after the leading-zero trim.
+            infoplist = NULL; info_len = 0;
+        }
+    }
 
     RySignMeta meta; memset(&meta, 0, sizeof(meta));
     meta.bundle_id = ident;
@@ -744,18 +805,35 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     // slots (-5..-1) with the entitlement blob emptied. Getting this wrong
     // shifts `hashOffset` by two slots and AMFI rejects the whole signature.
     //
-    // The exec-segment triple describes the __TEXT segment the main binary
-    // lives in: base = its vmaddr (0 for a dylib, 0x100000000 for a PIE
-    // executable), limit = its vmsize, flags = CS_EXECSEG_MAIN_BINARY for a
-    // real main executable. The kernel uses this pair to decide whether the
-    // pages it is about to execute belong to the signed main binary — a
-    // dylib guest must NOT claim MAIN_BINARY, and an executable that leaves
-    // the flag at 0 is not recognised as a main binary at all.
+    // The exec-segment triple, per zsign (`SlotBuildCodeDirectory` +
+    // `ZArchO::BuildCodeSignature`):
+    //
+    //   execSegBase  = 0   — zsign HARDCODES this to zero for every file it
+    //                        signs, executables included. It is NOT the
+    //                        __TEXT vmaddr: AltStore signs real app
+    //                        executables with exactly this zsign code and
+    //                        they run on device, so Apple's kernel clearly
+    //                        does not require the vmaddr here.
+    //   execSegLimit = __TEXT.vmsize  (zsign's `m_uExecSegLimit`, taken from
+    //                        the __TEXT segment's vmsize).
+    //   execSegFlags = 0 normally; zsign ORs in
+    //                        CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED
+    //                        when the entitlements blob contains
+    //                        "<key>get-task-allow</key>" (i.e. a development
+    //                        certificate). For a MH_DYLIB the entitlements
+    //                        slot is empty, so the flag stays 0 — a dylib
+    //                        must never claim to be a main binary.
     //
     // is_adhoc = 0 (real, in-place signature AMFI requires).
-    uint64_t exec_seg_base  = textseg ? (uint64_t)textseg->vmaddr : 0;
+    uint64_t exec_seg_base  = 0;
     uint64_t exec_seg_limit = textseg ? (uint64_t)textseg->vmsize : 0;
-    uint64_t exec_seg_flags = is_execute ? RY_EXECSEG_MAIN_BINARY : 0;
+    uint64_t exec_seg_flags = 0;
+    if (is_execute && ent && ent_len) {
+        static const char kGetTaskAllow[] = "<key>get-task-allow</key>";
+        if (memmem(ent, ent_len, kGetTaskAllow, sizeof(kGetTaskAllow) - 1) != NULL) {
+            exec_seg_flags = RY_EXECSEG_MAIN_BINARY | RY_EXECSEG_ALLOW_UNSIGNED;
+        }
+    }
 
     RyBuf cd1, cd2;
     if (ry_build_codedirectory(0, buf, code_limit, &meta, is_execute, 0,
