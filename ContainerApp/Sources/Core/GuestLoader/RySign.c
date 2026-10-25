@@ -1053,13 +1053,25 @@ static int rsa_modulus_bits(const unsigned char *d, size_t l) {
     return bits;
 }
 
+/// Try to build a SecKey from `d`/`l` read as key type `type`.
+///
+/// `bitsHint` is the RSA modulus size measured on the PKCS#1 inner (0 when
+/// unknown): the whole-PKCS#8 candidate cannot see the modulus directly, but
+/// Security is happier when kSecAttrKeySizeInBits is present for RSA.
+///
+/// The CFError is NEVER dropped: on the device (iPadOS 27 beta, rc=8) this
+/// constructor refused every reading of a well-formed key and the log said
+/// only "osstatus=-1" — a placeholder this function itself wrote, because the
+/// real reason lived in the CFError that was being released unread. Now both
+/// the stderr log and the diag buffer carry domain + code + description.
 static SecKeyRef try_create_key(const unsigned char *d, size_t l,
-                                CFStringRef type, int *out_os) {
+                                CFStringRef type, int bitsHint, int *out_os) {
     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
     CFDictionarySetValue(attrs, kSecAttrKeyType, type);
     if (CFEqual(type, kSecAttrKeyTypeRSA)) {
         int bits = rsa_modulus_bits(d, l);
+        if (bits <= 0) bits = bitsHint;
         if (bits > 0) {
             CFNumberRef num = CFNumberCreate(NULL, kCFNumberIntType, &bits);
             CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, num);
@@ -1070,8 +1082,33 @@ static SecKeyRef try_create_key(const unsigned char *d, size_t l,
     CFErrorRef err = NULL;
     SecKeyRef k = SecKeyCreateWithData(kd, attrs, &err);
     CFRelease(kd); CFRelease(attrs);
+    if (!k) {
+        if (out_os) *out_os = (int)-1;
+        char dom[128]; dom[0] = '\0';
+        char desc[256]; desc[0] = '\0';
+        long code = 0;
+        if (err) {
+            // CFErrorGetDomain is Get semantics (not owned) — do NOT release it.
+            CFStringRef ds = CFErrorGetDomain(err);
+            if (ds) {
+                CFStringGetCString(ds, dom, sizeof(dom), kCFStringEncodingUTF8);
+            }
+            code = (long)CFErrorGetCode(err);
+            CFStringRef dd = CFErrorCopyDescription(err);
+            if (dd) {
+                CFStringGetCString(dd, desc, sizeof(desc), kCFStringEncodingUTF8);
+                CFRelease(dd);
+            }
+        }
+        fprintf(stderr, "rysign: SecKeyCreateWithData(%s, %zu bytes) failed: [%s] code %ld: %s\n",
+                CFEqual(type, kSecAttrKeyTypeRSA) ? "RSA" : "EC", l, dom, code, desc);
+        // First failure wins: it is the most likely candidate (whole blob,
+        // preferred type), so later attempts do not overwrite it.
+        if (!g_sign_diag[0]) {
+            rysign_set_diag("SecKeyCreateWithData 失败 [%s] 错误码 %ld：%s", dom, code, desc);
+        }
+    }
     if (err) CFRelease(err);
-    if (!k && out_os) *out_os = (int)-1;
     return k;
 }
 
@@ -1098,6 +1135,12 @@ static bool key_can_sign(SecKeyRef k, int *out_os) {
 }
 
 /// Try every plausible reading of the key bytes and return one that WORKS.
+///
+/// Candidates: the input as-is (a PKCS#1/SEC1 inner when that is what the
+/// caller staged, or a whole PKCS#8) and — when the input IS a PKCS#8 — its
+/// inner key. Each candidate is tried with the caller's preferred key type and
+/// then the other one, because "key says RSA but is really EC" (and the
+/// reverse) is exactly what a mis-detected p12 produces.
 static SecKeyRef create_signing_key(const unsigned char *kd, size_t klen,
                                     bool preferEC, int *out_os) {
     const unsigned char *cands[2]; size_t clens[2]; int nc = 1;
@@ -1106,6 +1149,9 @@ static SecKeyRef create_signing_key(const unsigned char *kd, size_t klen,
     if (pkcs8_inner(kd, klen, &ip, &il) && il > 0 && il < klen) {
         cands[1] = kd + ip; clens[1] = il; nc = 2;
     }
+    // The RSA modulus is only visible in the PKCS#1 inner; carry its size over
+    // so the whole-PKCS#8 attempt gets kSecAttrKeySizeInBits too.
+    int innerBits = (nc == 2) ? rsa_modulus_bits(cands[1], clens[1]) : 0;
     CFStringRef pref = preferEC ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA;
     CFStringRef alt  = preferEC ? kSecAttrKeyTypeRSA : kSecAttrKeyTypeECSECPrimeRandom;
     CFStringRef types[2] = { pref, alt };
@@ -1113,13 +1159,14 @@ static SecKeyRef create_signing_key(const unsigned char *kd, size_t klen,
     SecKeyRef result = NULL;
     for (int c = 0; c < nc && !result; c++) {
         for (int t = 0; t < 2 && !result; t++) {
-            SecKeyRef k = try_create_key(cands[c], clens[c], types[t], out_os);
+            SecKeyRef k = try_create_key(cands[c], clens[c], types[t], innerBits, out_os);
             if (!k) continue;
             if (key_can_sign(k, out_os)) {
                 result = k;
                 if (c > 0 || t > 0)
                     fprintf(stderr, "rysign: usable key found via candidate %d type %d\n", c, t);
             } else {
+                fprintf(stderr, "rysign: key from candidate %d type %d exists but cannot sign\n", c, t);
                 CFRelease(k);
             }
         }
