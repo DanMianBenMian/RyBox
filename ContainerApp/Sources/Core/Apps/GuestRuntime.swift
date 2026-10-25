@@ -45,10 +45,19 @@ enum GuestLaunchMode: String, CaseIterable, Identifiable {
     }
 
     /// The mode in force right now (persisted across relaunches).
+    ///
+    /// Default is `.executeProcess`: the `inProcessDylib` (LiveContainer-style
+    /// `dlopen` of a patched `MH_DYLIB`) path is fundamentally broken for Sileo
+    /// — AMFI's "transmute" rule refuses a dylib that only carries the XML
+    /// entitlements blob (slot 5), no DER one (slot 7), with
+    /// `code signature invalid (errno=85)` regardless of the signing team. The
+    /// `executeProcess` path keeps the guest an `MH_EXECUTE` and spawns it as its
+    /// own process, so no transmute / library-validation is involved. The toggle
+    /// in Settings (启动方式) still lets you experiment with the in-process path.
     static var current: GuestLaunchMode {
         get {
             let raw = UserDefaults.standard.string(forKey: "rybox.guestLaunchMode") ?? ""
-            return GuestLaunchMode(rawValue: raw) ?? .inProcessDylib
+            return GuestLaunchMode(rawValue: raw) ?? .executeProcess
         }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: "rybox.guestLaunchMode")
