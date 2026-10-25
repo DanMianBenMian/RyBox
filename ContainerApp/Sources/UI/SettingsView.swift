@@ -17,7 +17,7 @@ struct SettingsView: View {
     @ObservedObject private var log = RyLog.shared
     @EnvironmentObject private var env: RuntimeEnvironment
     /// Which launch model a guest app uses (see GuestLaunchMode).
-    @AppStorage("rybox.guestLaunchMode") private var launchModeRaw = GuestLaunchMode.executeProcess.rawValue
+    @AppStorage("rybox.guestLaunchMode") private var launchModeRaw = GuestLaunchMode.inProcessDylib.rawValue
 
     var body: some View {
         Form {
