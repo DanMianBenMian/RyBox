@@ -690,8 +690,8 @@ public final class CertificateStore: ObservableObject {
     private static let appleWWDRG3Base64 = "MIIEUTCCAzmgAwIBAgIQfK9pCiW3Of57m0R6wXjF7jANBgkqhkiG9w0BAQsFADBiMQswCQYDVQQGEwJVUzETMBEGA1UEChMKQXBwbGUgSW5jLjEmMCQGA1UECxMdQXBwbGUgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxFjAUBgNVBAMTDUFwcGxlIFJvb3QgQ0EwHhcNMjAwMjE5MTgxMzQ3WhcNMzAwMjIwMDAwMDAwWjB1MUQwQgYDVQQDDDtBcHBsZSBXb3JsZHdpZGUgRGV2ZWxvcGVyIFJlbGF0aW9ucyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTELMAkGA1UECwwCRzMxEzARBgNVBAoMCkFwcGxlIEluYy4xCzAJBgNVBAYTAlVTMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2PWJ/KhZC4fHTJEuLVaQ03gdpDDppUjvC0O/LYT7JF1FG+XrWTYSXFRknmxiLbTGl8rMPPbWBpH85QKmHGq0edVny6zpPwcR4YS8Rx1mjjmi6LRJ7TrS4RBgeo6TjMrA2gzAg9Dj+ZHWp4zIwXPirkbRYp2SqJBgN31ols2N4Pyb+ni743uvLRfdW/6AWSN1F7gSwe0b5TTO/iK1nkmw5VW/j4SiPKi6xYaVFuQAyZ8D0MyzOhZ71gVcnetHrg21LYwOaU1A0EtMOwSejSGxrC5DVDDOwYqGlJhL32oNP/77HK6XF8J4CjDgXx9UO0m3JQAaN4LSVpelUkl8YDib7wIDAQABo4HvMIHsMBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAUK9BpR5R2Cf70a40uQKb3R01/CF4wRAYIKwYBBQUHAQEEODA2MDQGCCsGAQUFBzABhihodHRwOi8vb2NzcC5hcHBsZS5jb20vb2NzcDAzLWFwcGxlcm9vdGNhMC4GA1UdHwQnMCUwI6AhoB+GHWh0dHA6Ly9jcmwuYXBwbGUuY29tL3Jvb3QuY3JsMB0GA1UdDgQWBBQJ/sAVkPmvZAqSErkmKGMMl+ynsjAOBgNVHQ8BAf8EBAMCAQYwEAYKKoZIhvdjZAYCAQQCBQAwDQYJKoZIhvcNAQELBQADggEBAK1lE+j24IF3RAJHQr5fpTkg6mKp/cWQyXMT1Z6b0KoPjY3L7QHPbChAW8dVJEH4/M/BtSPp3Ozxb8qAHXfCxGFJJWevD8o5Ja3T43rMMygNDi6hV0Bz+uZcrgZRKe3jhQxPYdwyFot30ETKXXIDMUacrptAGvr04NM++i+MZp+XxFRZ79JI9AeZSWBZGcfdlNHAwWx/eCHvDOs7bJmCS1JgOLU5gm3sUjFTvg+RTElJdI+mUcuER04ddSduvfnSXPN/wmwLCTbiZOTCNwMUGdXqapSqqdv+9poIZ4vvK7iqF0mDr8/LvOnP6pVxsLRFoszlh6oKw0E6eVzaUDSdlTs="
 
     /// The legacy G1 intermediate (expired 2023-02-07). Kept as a slot so an
-    /// older imported cert can still chain; nil until a G1 blob is added. The
-    /// AKID match below selects whichever intermediate the leaf actually needs.
+    /// older imported cert can still chain; nil until a G1 blob is added. Today
+    /// only G3 is embedded and is always used (see preferredEmbeddedWWDR).
     private static let appleWWDRG1Base64: String? = nil
 
     private static func embeddedWWDRCerts() -> [(der: Data, cert: SecCertificate)] {
@@ -704,79 +704,14 @@ public final class CertificateStore: ObservableObject {
         return out
     }
 
-    /// The embedded WWDR that must sit at CMS slot 1. Picks the intermediate
-    /// that actually SIGNED the leaf (leaf's AuthorityKeyIdentifier → the cert's
-    /// SubjectKeyIdentifier); falls back to the first embedded cert (G3) when
-    /// the leaf has no AKID or no match. G3 is correct for every currently-valid
-    /// signing certificate.
+    /// The embedded WWDR that must sit at CMS slot 1. Only G3 is embedded today
+    /// (G1 is a nil placeholder), and G3 is the correct intermediate for every
+    /// currently-valid signing certificate, so we always return it. No AKID/SKID
+    /// chain walking is needed — keeping this simple also avoids depending on
+    /// SecCertificateCopyExtensionValue / the kSecOID* constants, which are not
+    /// uniformly exposed across SDK versions.
     private static func preferredEmbeddedWWDR(for leaf: SecCertificate?) -> Data? {
-        guard let leaf = leaf else { return embeddedWWDRCerts().first?.der }
-        if let akid = authorityKeyIdentifier(leaf) {
-            for (der, cert) in embeddedWWDRCerts() {
-                if let skid = subjectKeyIdentifier(cert), skid == akid { return der }
-            }
-        }
-        return embeddedWWDRCerts().first?.der
-    }
-
-    /// Subject Key Identifier (extension 2.5.29.14). The returned bytes ARE the
-    /// key identifier (the extension value is an OCTET STRING).
-    private static func subjectKeyIdentifier(_ cert: SecCertificate) -> Data? {
-        var err: CFError? = nil
-        // Pass the OID as a plain String — Swift implicitly bridges String →
-        // CFString for the CFString parameter. This avoids depending on the
-        // named kSecOID* constants, some of which are not exposed by every SDK.
-        guard let v = SecCertificateCopyExtensionValue(cert, "2.5.29.14", &err) else { return nil }
-        return v as Data
-    }
-
-    /// Authority Key Identifier (extension 2.5.29.35): a SEQUENCE whose first
-    /// OCTET STRING is the keyIdentifier. Returns that identifier so it can be
-    /// matched against a candidate's SKID.
-    private static func authorityKeyIdentifier(_ cert: SecCertificate) -> Data? {
-        var err: CFError? = nil
-        guard let v = SecCertificateCopyExtensionValue(cert, "2.5.29.35", &err) else { return nil }
-        return firstOctetString(in: v as Data)
-    }
-
-    /// Pull the keyIdentifier out of an AuthorityKeyIdentifier extension value.
-    ///
-    /// The AKID extension value is a SEQUENCE whose first component is the
-    /// keyIdentifier — tagged `0x80` (IMPLICIT `[0] OCTET STRING`) in the common
-    /// form, or `0xA0` wrapping a `0x04` OCTET STRING (EXPLICIT). We descend the
-    /// SEQUENCE and return the first OCTET-STRING-like payload we meet.
-    private static func firstOctetString(in data: Data) -> Data? {
-        var i = 0
-        while i < data.count {
-            let tag = data[i]
-            let (len, adv) = readDERLength(data, at: i + 1)
-            guard adv > 0, len >= 0, i + 1 + adv + len <= data.count else { return nil }
-            // keyIdentifier: [0] IMPLICIT OCTET STRING (0x80) or an OCTET STRING (0x04).
-            if tag == 0x04 || tag == 0x80 {
-                return data.subdata(in: (i + 1 + adv)..<(i + 1 + adv + len))
-            }
-            if tag == 0x30 || (tag & 0x20) != 0 {
-                // constructed (SEQUENCE / [0] EXPLICIT) — descend into it.
-                i = i + 1 + adv
-            } else {
-                // primitive, not the keyIdentifier — skip it.
-                i = i + 1 + adv + len
-            }
-        }
-        return nil
-    }
-
-    private static func readDERLength(_ data: Data, at idx: Int) -> (length: Int, advance: Int) {
-        guard idx < data.count else { return (0, 0) }
-        let first = data[idx]
-        if first < 0x80 {
-            return (Int(first), 1)
-        }
-        let numBytes = Int(first & 0x7F)
-        guard idx + 1 + numBytes <= data.count else { return (0, 0) }
-        var len = 0
-        for k in 1...numBytes { len = (len << 8) | Int(data[idx + k]) }
-        return (len, 1 + numBytes)
+        embeddedWWDRCerts().first?.der
     }
 
     // MARK: - Persistence
