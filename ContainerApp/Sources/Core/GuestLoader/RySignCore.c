@@ -202,7 +202,8 @@ int ry_build_codedirectory(int alternate,
                            const unsigned char *code, size_t code_len,
                            const RySignMeta *meta,
                            int is_execute, int is_adhoc,
-                           uint64_t exec_seg_limit, uint64_t exec_seg_flags,
+                           uint64_t exec_seg_base, uint64_t exec_seg_limit,
+                           uint64_t exec_seg_flags,
                            const RySignHash *hash,
                            RyBuf *out) {
     if (!meta || !hash || !out || !code) return -1;
@@ -344,7 +345,7 @@ int ry_build_codedirectory(int alternate,
     RY_PUT_BE32(p + 48, team_len ? (uint32_t)off_team : 0);  // teamOffset
     RY_PUT_BE32(p + 52, 0);                             // spare3
     RY_PUT_BE64(p + 56, 0);                             // codeLimit64
-    RY_PUT_BE64(p + 64, 0);                             // execSegBase
+    RY_PUT_BE64(p + 64, exec_seg_base);                // execSegBase (__TEXT vmaddr)
     RY_PUT_BE64(p + 72, exec_seg_limit);                // execSegLimit
     RY_PUT_BE64(p + 80, exec_seg_flags);                // execSegFlags
     #undef RY_PUT_BE32
