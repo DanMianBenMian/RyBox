@@ -122,7 +122,13 @@ jobs:
           set -eo pipefail
           APP="${{ steps.locate.outputs.app_path }}"
           ENT="ContainerApp/ContainerApp.entitlements"
-          codesign --force --deep --sign - --entitlements "$ENT" "$APP"
+          # Sign nested components FIRST. `codesign --deep` has a known bug where
+          # it drops the --entitlements file for the MAIN executable and embeds an
+          # empty <dict/> (we hit exactly this: errno=85 fix never landed). Sign
+          # the dylib on its own, then sign the app WITHOUT --deep so the
+          # entitlements file is actually honoured.
+          find "$APP" -type f \( -name '*.dylib' -o -name '*.framework' -o -name '*.appex' \) -exec codesign --force --sign - {} \;
+          codesign --force --sign - --entitlements "$ENT" "$APP"
           rm -rf Payload
           mkdir -p Payload
           cp -r "$APP" Payload/RyBox.app
