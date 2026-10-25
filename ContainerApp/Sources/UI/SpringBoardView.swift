@@ -948,21 +948,10 @@ struct SpringBoardView: View {
     private func homeKey(_ geo: GeometryProxy) -> some View {
         VStack {
             Spacer()
-            Button(action: goHome) {
-                Image(systemName: store.editMode ? "checkmark" : "house.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .frame(width: 46, height: 46)
-                    .background(.ultraThinMaterial,
-                                in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 13, style: .continuous)
-                            .strokeBorder(.white.opacity(0.30), lineWidth: 0.6)
-                    )
-                    .shadow(color: .black.opacity(0.28), radius: 9, y: 3)
-            }
-            .buttonStyle(.plain)
-            .onLongPressGesture(minimumDuration: 0.4) { showAppSwitcher = true }
+            // The ONE home-key design (shared with the guest chrome — see
+            // HomeKeyButton). Long press opens the app switcher.
+            HomeKeyButton(action: goHome, showsCheckmark: store.editMode)
+                .onLongPressGesture(minimumDuration: 0.4) { showAppSwitcher = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .padding(.bottom, geo.safeAreaInsets.bottom + 4)
