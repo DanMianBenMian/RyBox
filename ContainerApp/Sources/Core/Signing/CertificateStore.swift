@@ -273,7 +273,8 @@ public final class CertificateStore: ObservableObject {
         guard p12VerifiedByFallback else { return nil }
 
         // (1) Already imported?
-        if let existing = Self.copyFallbackKeychainRef(type: fallbackKeyTypeCF) {
+        if let existing = Self.copyFallbackKeychainRef() {
+            Self.logKeySanity(existing)
             return existing
         }
         // (2)+(3) Import. PKCS#8 first: it is the form Apple's own import
@@ -290,33 +291,106 @@ public final class CertificateStore: ObservableObject {
                 kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
                 kSecValueData as String: blob
             ]
-            let st = SecItemAdd(add as CFDictionary, nil)
+            var st = SecItemAdd(add as CFDictionary, nil)
+            if st == errSecDuplicateItem {
+                // Our tag is already taken (previous launch, or the sibling
+                // blob). Drop the stale item and re-add so the keychain always
+                // holds the CURRENT p12's key — a stale key from an older
+                // certificate would silently sign with the wrong identity.
+                RyLog.shared.log("sign  钥匙串已有同 tag 私钥，清除旧项后重新导入（\(blob.count) 字节）",
+                                 level: .info, tag: "sign")
+                Self.deleteFallbackKeychainItem()
+                st = SecItemAdd(add as CFDictionary, nil)
+            }
             RyLog.shared.log("sign  钥匙串导入私钥（\(blob.count) 字节）→ osstatus=\(st)",
                              level: st == errSecSuccess ? .info : .warn, tag: "sign")
             if st == errSecSuccess {
-                if let k = Self.copyFallbackKeychainRef(type: fallbackKeyTypeCF) {
+                if let k = Self.copyFallbackKeychainRef() {
                     RyLog.shared.log("sign  私钥已进入系统钥匙串，改用活 SecKey 签名路径", level: .info, tag: "sign")
+                    Self.logKeySanity(k)
                     return k
                 }
+                // Import succeeded but the lookup returned nothing. This is
+                // exactly how rc=8 looked on the device: osstatus=0 on add,
+                // nil on copy, signer silently back on the DER path that
+                // SecKeyCreateWithData refuses. Say it out loud now.
+                RyLog.shared.log("sign  ⚠ 钥匙串导入成功但取回失败——签名器将退回 DER 路径",
+                                 level: .warn, tag: "sign")
             }
         }
         return nil
     }
 
-    private static func copyFallbackKeychainRef(type: CFString) -> SecKey? {
+    /// Look up the fallback key by tag ONLY.
+    ///
+    /// The query deliberately omits `kSecAttrKeyType`: Apple's documented
+    /// "find a key" query is class + application tag (+ kSecReturnRef), and
+    /// carrying the key-type attribute makes `SecItemCopyMatching` fail even
+    /// when the item exists — which is exactly how the rc=8 signing failure
+    /// happened (import osstatus=0, lookup silently nil, DER fallback refused).
+    private static func copyFallbackKeychainRef() -> SecKey? {
         let q: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: fallbackKeyTag,
-            kSecAttrKeyType as String: type,
             kSecReturnRef as String: true
         ]
         var ref: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &ref) == errSecSuccess,
-              let ref = ref else { return nil }
+        let st = SecItemCopyMatching(q as CFDictionary, &ref)
+        if st == errSecItemNotFound { return nil } // not imported yet — caller adds next
+        guard st == errSecSuccess else {
+            RyLog.shared.log("sign  钥匙串取回私钥失败：osstatus=\(st)", level: .warn, tag: "sign")
+            return nil
+        }
+        guard let ref = ref else {
+            RyLog.shared.log("sign  钥匙串取回私钥：查询成功但返回 nil", level: .warn, tag: "sign")
+            return nil
+        }
         // Same CoreFoundation downcast rule as SecIdentity: verify the type ID
         // before bridging, or a wrong-typed item becomes a crash later.
-        guard CFGetTypeID(ref) == SecKeyGetTypeID() else { return nil }
+        guard CFGetTypeID(ref) == SecKeyGetTypeID() else {
+            RyLog.shared.log("sign  钥匙串取回私钥：返回对象不是 SecKey（type ID 不符）",
+                             level: .warn, tag: "sign")
+            return nil
+        }
         return (ref as! SecKey)
+    }
+
+    /// Canary self-check for a keychain-backed key: sign 4 bytes and log the
+    /// outcome. A key that imports fine but cannot sign (locked keychain,
+    /// wrong key class, …) is otherwise invisible until the CMS step fails
+    /// deep inside the C signer — on the device that surfaced as a bare
+    /// "rc=8". Diagnostic only: a failed canary does NOT discard the key.
+    private static func logKeySanity(_ key: SecKey) {
+        let canary = Data("RyB!".utf8)
+        if SecKeyIsAlgorithmSupported(key, .sign, .rsaSignatureMessagePKCS1SHA256) {
+            logCanaryResult(key: key, alg: .rsaSignatureMessagePKCS1SHA256,
+                            name: "RSA", data: canary)
+        } else if SecKeyIsAlgorithmSupported(key, .sign, .ecdsaSignatureMessageSHA256) {
+            logCanaryResult(key: key, alg: .ecdsaSignatureMessageSHA256,
+                            name: "ECDSA", data: canary)
+        } else {
+            RyLog.shared.log("sign  canary 自检跳过：取回的 SecKey 不支持已知签名算法",
+                             level: .warn, tag: "sign")
+        }
+    }
+
+    private static func logCanaryResult(key: SecKey, alg: SecKeyAlgorithm,
+                                        name: String, data: Data) {
+        var err: CFError?
+        if let sigCF = SecKeyCreateSignature(key, alg, data as CFData, &err) {
+            // CFData has no Swift `count` — bridge to Data first (same pattern
+            // as SecCertificateCopyData usage elsewhere in this file).
+            let sig = sigCF as Data
+            RyLog.shared.log("sign  canary 自检通过：\(name) 签名 \(sig.count) 字节，块长 \(SecKeyGetBlockSize(key) * 8) 位",
+                             level: .info, tag: "sign")
+        } else if let e = err {
+            let desc = (CFErrorCopyDescription(e) as String?) ?? ""
+            RyLog.shared.log("sign  canary 自检失败（仍继续）：错误码 \(CFErrorGetCode(e))：\(desc)",
+                             level: .warn, tag: "sign")
+        } else {
+            RyLog.shared.log("sign  canary 自检失败（仍继续）：无错误信息",
+                             level: .warn, tag: "sign")
+        }
     }
 
     private static func deleteFallbackKeychainItem() {
