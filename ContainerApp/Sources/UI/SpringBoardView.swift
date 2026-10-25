@@ -539,13 +539,14 @@ struct SpringBoardView: View {
 
     // MARK: Icon cell
 
+    @ViewBuilder
     private func iconCell(_ item: DesktopItem, page: Int, row: Int, col: Int) -> some View {
         let slot = IconSlot(page: page, row: row, col: col)
         let seed = row * columns + col
         let isDragging = draggingID == item.id
         let isTarget = (target.map { $0 == slot } ?? false) && !isDragging
         let badge = store.badge(for: item.id)
-        return VStack(spacing: 5) {
+        let cell = VStack(spacing: 5) {
             ZStack(alignment: .topTrailing) {
                 IconArtwork(item: item,
                             size: iconSize,
@@ -629,7 +630,17 @@ struct SpringBoardView: View {
         // NATIVE menu (UIKit UIContextMenuInteraction). A drag CANCELS it (any
         // movement dismisses the press), and a tap opens the app, so there is no
         // ambiguity left between the three interactions.
-        .contextMenu { nativeMenuActions(for: item) }
+        //
+        // …except in EDIT mode, where the menu is NOT attached at all: there
+        // the icon must be draggable the instant the finger moves 4 pt, exactly
+        // like the real SpringBoard (jiggle mode has no long-press menu — you
+        // drag). Leaving UIContextMenuInteraction's own long-press recogniser
+        // on the view in edit mode lets it delay or steal the DragGesture.
+        if store.editMode {
+            cell
+        } else {
+            cell.contextMenu { nativeMenuActions(for: item) }
+        }
     }
 
     /// The icon's long-press menu, rendered by the SYSTEM rather than by RyBox.
@@ -736,34 +747,57 @@ struct SpringBoardView: View {
     /// `gridOrigin` is the grid's top-left in the shared "root" space, which is
     /// the same space `dockFrame` uses — so the Dock hit test below is
     /// consistent with the grid hit test.
+    ///
+    /// GEOMETRY NOTE — why the pitch is now the LOCAL constant, not the
+    /// preference-published `gridPitch`:
+    ///
+    ///     point        = gridOrigin + slot.col * pitch + pitch/2 + translation
+    ///     point - gridOrigin = slot.col * pitch + pitch/2 + translation
+    ///
+    /// `gridOrigin` CANCELS out of the cell index, so the hit only needs the
+    /// pitch — and the pitch is the pure function `colPitch` / `rowPitch` below
+    /// (exactly the numbers `pageView` lays out with). Gating this computation
+    /// on the published `gridPitch` was a trap: it starts at `.zero`, so until
+    /// the preference arrived the guard bailed with `target = nil`, EVERY drop
+    /// silently sprang back and no folder could ever be created ("无法建立
+    /// 文件夹，拖动到空区域仍然被返回原位置"). `gridOrigin` is still consulted,
+    /// but only for the Dock hit test, where a stale value degrades to
+    /// "miss the Dock" — never to "swallow the drop".
     private func updateTarget(for item: DesktopItem, slot: IconSlot, translation: CGSize) {
-        // GUARD: `gridPitch` starts at .zero and only becomes real once the grid
-        // publishes its metrics. Dividing by a zero pitch yields ±inf/NaN, and
-        // `Int(NaN)` TRAPS — an instant, silent crash the first time a drag is
-        // started while the layout has not been measured yet (which includes a
-        // drag right after entering edit mode). Bail out instead: there is no
-        // meaningful target before we know the grid geometry.
-        guard gridPitch.width > 1, gridPitch.height > 1, columns > 0, rows > 0 else {
+        // `colPitch`/`rowPitch` are pure functions of the icon scale, so this
+        // guard is provably true today; it stays as defence in depth (a zero
+        // pitch would make the divisions below produce inf/NaN, and `Int(NaN)`
+        // TRAPS).
+        guard columns > 0, rows > 0, colPitch > 1, rowPitch > 1 else {
             target = nil
             store.dockHighlighted = false
             return
         }
 
         // The dragged icon's centre in root coordinates.
-        let cellCenterX = gridOrigin.x + CGFloat(slot.col) * gridPitch.width + gridPitch.width / 2
-        let cellCenterY = gridOrigin.y + CGFloat(slot.row) * gridPitch.height + gridPitch.height / 2
+        let cellCenterX = gridOrigin.x + CGFloat(slot.col) * colPitch + colPitch / 2
+        let cellCenterY = gridOrigin.y + CGFloat(slot.row) * rowPitch + rowPitch / 2
         let point = CGPoint(x: cellCenterX + translation.width,
                             y: cellCenterY + translation.height)
 
         // Which cell is under it? (clamped to the grid, so it can never index
         // outside the renderable range)
-        var col = Int(((point.x - gridOrigin.x) / gridPitch.width).rounded(.down))
-        var row = Int(((point.y - gridOrigin.y) / gridPitch.height).rounded(.down))
+        var col = Int(((point.x - gridOrigin.x) / colPitch).rounded(.down))
+        var row = Int(((point.y - gridOrigin.y) / rowPitch).rounded(.down))
         col = max(0, min(columns - 1, col))
         row = max(0, min(rows - 1, row))
 
         // The Dock strip sits below the grid — dragging there means "pin to Dock".
-        if dockFrame.contains(CGPoint(x: point.x, y: point.y)) {
+        //
+        // `dockFrame` is only trusted while it still looks like the pill. The
+        // dock's OUTER VStack used to be measured instead of the pill (its
+        // Spacer is inflated to the whole screen by the ZStack), which made
+        // this hit test true for EVERY point — `target` was pinned to nil and
+        // no icon could ever move or fold into a folder. The publisher now
+        // measures the pill itself; this height check is the belt to that pair
+        // of braces.
+        let dockIsSane = dockFrame.height > 0 && dockFrame.height <= dockHeight * 2
+        if dockIsSane && dockFrame.contains(CGPoint(x: point.x, y: point.y)) {
             target = nil
             store.dockHighlighted = true
         } else {
@@ -843,14 +877,24 @@ struct SpringBoardView: View {
                     radius: store.dockHighlighted ? 16 : 10, y: 4)
             .scaleEffect(store.dockHighlighted ? 1.04 : 1.0)
             .animation(.spring(response: 0.25, dampingFraction: 0.7), value: store.dockHighlighted)
+            // Publish the PILL's frame — NOT the outer VStack's. The ZStack
+            // proposes the whole screen to that VStack, and its Spacer then
+            // expands to fill everything above the HStack, so a GeometryReader
+            // attached down there reported a FULL-SCREEN rect. `dockFrame`
+            // therefore contained every point in the drag hit test, `target`
+            // was pinned to nil, and every drop silently sprang back with no
+            // folder ever being created ("无法建立文件夹，拖动到空区域仍然被返回
+            // 原位置"). Attaching the reader to the pill — after the visual
+            // modifiers but BEFORE the outer margins — measures exactly the
+            // region the user perceives as "the Dock".
+            .background(
+                GeometryReader { g in
+                    Color.clear.preference(key: DockFramePreferenceKey.self, value: g.frame(in: .named("root")))
+                }
+            )
             .padding(.horizontal, isIPad ? 28 : 10)
             .padding(.bottom, geo.safeAreaInsets.bottom + 52)
         }
-        .background(
-            GeometryReader { g in
-                Color.clear.preference(key: DockFramePreferenceKey.self, value: g.frame(in: .named("root")))
-            }
-        )
         .onPreferenceChange(DockFramePreferenceKey.self) { dockFrame = $0 }
     }
 
