@@ -127,28 +127,14 @@ jobs:
         run: |
           set -eo pipefail
           APP="${{ steps.locate.outputs.app_path }}"
-          # Write the entitlements inline. We previously relied on the checked-out
-          # ContainerApp/ContainerApp.entitlements, but rapid successive Contents-API
-          # pushes + cancel-in-progress left the runner's origin/main remote-tracking
-          # ref stale, so the checkout handed codesign an EMPTY <dict/> and the
-          # entitlement fix (disable-library-validation / network.server) never
-          # landed in the IPA — which is exactly what produced errno=85 on-device.
-          # Embedding them here makes the build hermetic.
+          # Entitlements embedded inline (base64) so the build never depends on a
+          # possibly-stale checked-out copy. Rapid Contents-API pushes +
+          # cancel-in-progress left the runner's origin/main remote-tracking ref
+          # lagging, which handed codesign an EMPTY <dict/> and caused errno=85
+          # on device.
           ENT="/tmp/rybox_entitlements.plist"
-          cat > "$ENT" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>get-task-allow</key>
-    <true/>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <true/>
-    <key>com.apple.security.network.server</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+          B64="PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjxwbGlzdCB2ZXJzaW9uPSIxLjAiPgo8ZGljdD4KCTxrZXk+Z2V0LXRhc2stYWxsb3c8L2tleT4KCTx0cnVlLz4KCTxrZXk+Y29tLmFwcGxlLnNlY3VyaXR5LmNzLmRpc2FibGUtbGlicmFyeS12YWxpZGF0aW9uPC9rZXk+Cgk8dHJ1ZS8+Cgk8a2V5PmNvbS5hcHBsZS5zZWN1cml0eS5uZXR3b3JrLnNlcnZlcjwva2V5PgoJPHRydWUvPgo8L2RpY3Q+CjwvcGxpc3Q+Cg=="
+          echo "$B64" | base64 -d > "$ENT"
           echo "=== entitlements we will embed ==="
           cat "$ENT"
           echo "=== signing ==="
