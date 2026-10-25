@@ -644,6 +644,31 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     struct mach_header_64 *hdr = (struct mach_header_64 *)buf;
     if (hdr->magic != MH_MAGIC_64) { return -1; }
 
+    // LiveContainer parity (`ZArchO::BuildCodeSignature`):
+    //     SlotBuildEntitlements(IsExecute() ? m_strEntitleData : "")
+    //     SlotBuildDerEntitlements(IsExecute() ? … : "")
+    // and zsign.mm drives it with `Sign(asset, force, bundleId, "", "", "")` —
+    // empty Info.plist and empty CodeResources for every Mach-O.
+    //
+    // RyBox patches the guest to MH_DYLIB BEFORE signing (GuestRuntime step 1
+    // patches, step 2 signs), so every guest binary — the main executable
+    // included — takes the empty branch. This is not cosmetic: a dylib that
+    // carries an XML-only entitlements blob (slot 5) but no DER entitlements
+    // blob (slot 7) sends AMFI down the "transmute" path, and the transmute
+    // for a dylib being dlopen'd into an arbitrary host process is refused —
+    // dyld then reports exactly the failure Sileo hit:
+    //     code signature invalid (errno=85)
+    // The guest's real capability set is NOT lost by emptying the slot:
+    // AppImporter reads the ORIGINAL entitlements before the re-sign
+    // (`readOriginalEntitlements` → `EntitlementPolicy.recordOriginal`) and the
+    // RyDyldHooks entitlement oracle answers runtime queries from that policy.
+    int is_execute = (hdr->filetype == MH_EXECUTE);
+    if (!is_execute) {
+        ent = NULL; ent_len = 0;
+        infoplist = NULL; info_len = 0;
+        code_resources = NULL; cr_len = 0;
+    }
+
     uint32_t ncmds = hdr->ncmds;
     struct load_command *lc = (struct load_command *)(buf + sizeof(struct mach_header_64));
     uint32_t sig_dataoff = 0, sig_datasize = 0;
@@ -689,7 +714,9 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     meta.requirements_blob = req.p; meta.requirements_blob_len = req.len;
 
     // Entitlements blob (XML) WITH its native 8-byte header — what the special
-    // slot -5 hashes, and what the SuperBlob slot 5 wraps.
+    // slot -5 hashes, and what the SuperBlob slot 5 wraps. For a dylib guest
+    // `ent` is NULL here (see the IsExecute() parity block above), so the slot
+    // is omitted from the SuperBlob entirely — exactly like zsign/LC.
     RyBuf ent_blob; ry_buf_init(&ent_blob);
     if (ent && ent_len) {
         ry_buf_be32(&ent_blob, RY_CSMAGIC_EMBEDDED_ENTITLEMENTS);
@@ -698,11 +725,14 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
     }
     meta.entitlements_blob = ent_blob.p; meta.entitlements_blob_len = ent_blob.len;
     // The DER entitlements blob (slot 7) is intentionally omitted for a dylib
-    // guest — matching zsign's `IsExecute() ? … : ""`. AMFI falls back to slot
-    // 5 (XML), which we DO populate with the real profile entitlements.
+    // guest — matching zsign's `IsExecute() ? … : ""`. An XML-only slot 5 with
+    // no slot 7 is what triggers the AMFI transmute refusal (errno=85).
 
     // CodeDirectories: primary SHA-1 (cd1), alternate SHA-256 (cd2). is_execute
-    // = 0 (guest patched to MH_DYLIB → five special slots, no -7/-6);
+    // = 0 (guest patched to MH_DYLIB → no -7/-6 pair); with the entitlements,
+    // Info.plist and CodeResources slots all empty for a dylib, zsign's
+    // leading-zero trim leaves exactly the two live slots (-2 requirements,
+    // -1 info.plist) — the same shape LiveContainer produces.
     // is_adhoc = 0 (real, in-place signature AMFI requires).
     uint64_t exec_seg_limit = textseg ? (uint64_t)textseg->vmsize : 0;
     uint64_t exec_seg_flags = 0;
