@@ -5,5 +5,15 @@
     <!-- Unsigned / ad-hoc build: get-task-allow lets a free Apple ID sideload + debug. -->
     <key>get-task-allow</key>
     <true/>
+    <!-- Let the host dlopen a guest dylib signed by a DIFFERENT team (the user's
+         imported p12) without library validation rejecting it (errno=85).
+         LiveContainer relies on same-team signing for this; we add the
+         entitlement so guest and host certs never have to match. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- Allow the developer debug bridge (Settings → Developer) to accept
+         inbound TCP connections from a PC on the LAN. -->
+    <key>com.apple.security.network.server</key>
+    <true/>
 </dict>
 </plist>
