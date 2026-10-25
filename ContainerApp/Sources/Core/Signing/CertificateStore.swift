@@ -292,7 +292,7 @@ public final class CertificateStore: ObservableObject {
             ]
             let st = SecItemAdd(add as CFDictionary, nil)
             RyLog.shared.log("sign  钥匙串导入私钥（\(blob.count) 字节）→ osstatus=\(st)",
-                             st == errSecSuccess ? .info : .warn, tag: "sign")
+                             level: st == errSecSuccess ? .info : .warn, tag: "sign")
             if st == errSecSuccess {
                 if let k = Self.copyFallbackKeychainRef(type: fallbackKeyTypeCF) {
                     RyLog.shared.log("sign  私钥已进入系统钥匙串，改用活 SecKey 签名路径", level: .info, tag: "sign")
