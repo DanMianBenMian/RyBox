@@ -63,6 +63,17 @@ static const char *gWhite[24] = {
 };
 static char *gBundlePath = NULL;
 static char *gHomeDir = NULL;
+/// Whether spawned children get DYLD_INSERT_LIBRARIES=RyFsRedirect.dylib.
+///
+/// The bundled dylib is part of an UNSIGNED RyBox build, so a child that
+/// loads it is immediately subject to library validation — the injected
+/// library must be signed by the same team as the process that loads it, and
+/// a guest we just re-signed with the user's certificate usually does NOT
+/// match RyBox's own signature. The child would die before reaching its
+/// main(). The guest process path therefore turns the injection OFF (the
+/// guest's own paths already live under the virtual root, so it does not
+/// need the redirection shim).
+static int gInjectDylib = 1;
 
 // Returns the whitelist prefix that matches `p`, or NULL.
 static const char *ry_fs_whitelisted(const char *p) {
@@ -205,7 +216,7 @@ static int ry_posix_spawn(pid_t *restrict pid, const char *restrict path,
     injected[nInjected++] = rootEnv;
     injected[nInjected++] = fsEnv;
     char dylibEnv[PATH_MAX + 32];
-    if (gBundlePath) {
+    if (gInjectDylib && gBundlePath) {
         snprintf(dylibEnv, sizeof(dylibEnv), "%s/RyFsRedirect.dylib", gBundlePath);
         struct stat dst;
         if (orig_stat(dylibEnv, &dst) == 0) {
@@ -265,6 +276,10 @@ void ry_fs_set_root(const char *root) {
 
 void ry_fs_set_enabled(int enabled) {
     gEnabled = enabled ? 1 : 0;
+}
+
+void ry_fs_set_inject_dylib(int enabled) {
+    gInjectDylib = enabled ? 1 : 0;
 }
 
 void ry_fs_install_hooks(void) {
