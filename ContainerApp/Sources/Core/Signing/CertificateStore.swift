@@ -51,6 +51,10 @@ public final class CertificateStore: ObservableObject {
     /// sharing a name — hence the different spelling here.
     private var decodedCert: Data?
     private var decodedKey: Data?
+    /// The FULL PKCS#8 `PrivateKeyInfo` (wrapper included) — the form the
+    /// keychain importer and the signer's whole-blob attempt both want. See
+    /// `RyP12.Outcome.keyPKCS8`.
+    private var decodedKeyPKCS8: Data?
     private var fallbackKeyType: String = "rsa"
     private var provisioningData: Data?
     /// Raw p12 bytes (kept so CodeSigner can stage them for the bundled helper).
@@ -111,6 +115,7 @@ public final class CertificateStore: ObservableObject {
             self.p12VerifiedByFallback = false
             self.decodedCert = nil
             self.decodedKey = nil
+            self.decodedKeyPKCS8 = nil
             self.p12Data = data
             self.p12Password = pw
             self.certificateInfo = Self.describe(identity: self.identity)
@@ -131,7 +136,17 @@ public final class CertificateStore: ObservableObject {
                 self.p12VerifiedByFallback = true
                 self.decodedCert = o.certDER
                 self.decodedKey = o.keyDER
+                self.decodedKeyPKCS8 = o.keyPKCS8
                 self.fallbackKeyType = o.keyType
+                // A DIFFERENT p12 means a DIFFERENT key: drop the keychain item
+                // left by the previous import, or the SecItemAdd later (same
+                // application tag) would fail with a duplicate-item error and
+                // the new key could never be imported. Replaying the SAME bytes
+                // (every launch does, via load()) keeps the item — it is still
+                // the same key.
+                if self.p12Data != data {
+                    Self.deleteFallbackKeychainItem()
+                }
                 self.p12Data = data
                 self.p12Password = o.password
                 self.certificateInfo = "\(o.subject) · \(o.keyDescription) · \(o.scheme)"
@@ -221,7 +236,96 @@ public final class CertificateStore: ObservableObject {
     public var usesFallbackIdentity: Bool { p12VerifiedByFallback }
     public func fallbackCertDER() -> Data? { decodedCert }
     public func fallbackKeyDER() -> Data? { decodedKey }
+    public func fallbackKeyPKCS8DER() -> Data? { decodedKeyPKCS8 }
     public func fallbackKeyIsEC() -> Bool { fallbackKeyType == "ec" }
+
+    // MARK: - Fallback identity → a REAL SecKey (keychain route)
+
+    /// Stable keychain tag for the fallback private key. Kept across launches so
+    /// the key is imported once and simply looked up afterwards.
+    ///
+    /// Stored as CFData (UTF-8 bytes), not CFString: the keychain normalises
+    /// string attributes in ways that differ between the add and the query side,
+    /// which silently breaks the match-up. Bytes are bytes.
+    private static let fallbackKeyTag = "rybox.signing.fallback.key.v1".data(using: .utf8)!
+
+    private var fallbackKeyTypeCF: CFString {
+        fallbackKeyType == "ec" ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA
+    }
+
+    /// A usable `SecKeyRef` for the fallback-decoded key — WITHOUT ever calling
+    /// `SecKeyCreateWithData`.
+    ///
+    /// Why this exists: on the device (iPadOS 27 beta, rc=8) every reading of
+    /// the decoded key bytes — PKCS#1 inner, full PKCS#8, RSA type, EC type —
+    /// was refused by `SecKeyCreateWithData`, and the CFError that would have
+    /// explained why was discarded at two separate call sites. The keychain
+    /// import route (`SecItemAdd` with `kSecClassKey`) is a different Security
+    /// code path that historically accepts private-key blobs the direct
+    /// constructor rejects, and the resulting key is a REAL, keychain-backed
+    /// key that can sign CMS directly — the same shape `rysign_sign_bundle_with_key`
+    /// wants.
+    ///
+    /// Order: (1) an item already in the keychain under our tag, (2) import the
+    /// full PKCS#8, (3) import the inner PKCS#1/SEC1 key. Returns nil when all
+    /// three fail (the caller then falls back to raw DER for the C signer).
+    public func fallbackSecKey() -> SecKey? {
+        guard p12VerifiedByFallback else { return nil }
+
+        // (1) Already imported?
+        if let existing = Self.copyFallbackKeychainRef(type: fallbackKeyTypeCF) {
+            return existing
+        }
+        // (2)+(3) Import. PKCS#8 first: it is the form Apple's own import
+        // samples use, and the p12 key bag stored exactly that.
+        let blobs: [Data] = [decodedKeyPKCS8, decodedKey].compactMap { $0 }
+        for blob in blobs {
+            let add: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+                kSecAttrKeyType as String: fallbackKeyTypeCF,
+                kSecAttrApplicationTag as String: Self.fallbackKeyTag,
+                // The key must be readable when RyBox signs a guest, which
+                // happens after the device has been unlocked at least once.
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+                kSecValueData as String: blob
+            ]
+            let st = SecItemAdd(add as CFDictionary, nil)
+            RyLog.shared.log("sign  钥匙串导入私钥（\(blob.count) 字节）→ osstatus=\(st)",
+                             st == errSecSuccess ? .info : .warn, tag: "sign")
+            if st == errSecSuccess {
+                if let k = Self.copyFallbackKeychainRef(type: fallbackKeyTypeCF) {
+                    RyLog.shared.log("sign  私钥已进入系统钥匙串，改用活 SecKey 签名路径", level: .info, tag: "sign")
+                    return k
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func copyFallbackKeychainRef(type: CFString) -> SecKey? {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: fallbackKeyTag,
+            kSecAttrKeyType as String: type,
+            kSecReturnRef as String: true
+        ]
+        var ref: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &ref) == errSecSuccess,
+              let ref = ref else { return nil }
+        // Same CoreFoundation downcast rule as SecIdentity: verify the type ID
+        // before bridging, or a wrong-typed item becomes a crash later.
+        guard CFGetTypeID(ref) == SecKeyGetTypeID() else { return nil }
+        return (ref as! SecKey)
+    }
+
+    private static func deleteFallbackKeychainItem() {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: fallbackKeyTag
+        ]
+        SecItemDelete(q as CFDictionary)
+    }
 
     /// Decode the provisioning profile into its outer dict.
     ///
@@ -391,6 +495,11 @@ public final class CertificateStore: ObservableObject {
         p12VerifiedByFallback = false
         decodedCert = nil
         decodedKey = nil
+        decodedKeyPKCS8 = nil
+        // The keychain copy of the fallback key must go too: it is tagged, and
+        // a re-import replaces the tag's key — but a reset that left it behind
+        // would let the NEXT import find the PREVIOUS identity's key.
+        Self.deleteFallbackKeychainItem()
         fallbackKeyType = "rsa"
         p12Data = nil
         p12Password = nil
