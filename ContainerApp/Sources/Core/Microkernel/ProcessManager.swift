@@ -76,7 +76,15 @@ public final class ProcessManager: ObservableObject {
         envC.forEach { free($0) }
         posix_spawn_file_actions_destroy(&fileActions)
 
-        guard rc == 0 else { return nil }
+        guard rc == 0 else {
+            // posix_spawn returns the errno as its return value (it does NOT
+            // set errno). Without this the caller only sees "spawn failed",
+            // which hides the real reason (e.g. 85 EBADEXEC = "code signature
+            // invalid", 8 ENOEXEC = not a valid executable).
+            RyLog.shared.log("posix_spawn 失败 errno=\(rc) (\(String(cString: strerror(rc)))) path=\(path)",
+                             level: .error, tag: "proc")
+            return nil
+        }
 
         proc.markRunning(pid: pid)
 
