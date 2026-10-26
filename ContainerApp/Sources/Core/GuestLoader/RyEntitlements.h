@@ -24,6 +24,19 @@ extern "C" {
 ///   Mach-O, carries no code signature, or has no entitlements blob.
 int ry_macho_entitlements(const char *path, char **out, size_t *outLen);
 
+/// Read the TEAM ID out of a Mach-O's code signature.
+///
+/// The team id is stored in the CodeDirectory and is written by whoever signed
+/// the binary. It is the most reliable source for "which team signed this
+/// image" because it needs no provisioning profile — it works for ad-hoc
+/// builds, for side-loaders that do not embed a profile, and for App Store
+/// builds alike.
+///
+/// - Returns 0 on success and fills `*out` with a malloc'd NUL-terminated
+///   buffer the caller must `free()`. Returns non-zero when the image has no
+///   code signature, no CodeDirectory, or no team id (ad-hoc signature).
+int ry_macho_team_id(const char *path, char **out);
+
 #ifdef __cplusplus
 }
 #endif

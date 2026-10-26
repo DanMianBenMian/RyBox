@@ -46,9 +46,16 @@ public enum HostIdentity {
 
     /// Team identifier of the HOST's own signature.
     ///
-    /// Read from the host's embedded provisioning profile (`TeamIdentifier`),
-    /// which is what the platform itself binds the app to.
+    /// Read from the host's own CodeDirectory (`teamOffset` in the embedded
+    /// code signature) — that is written by whoever signed the app, and it
+    /// exists for every real (non-ad-hoc) signature, with or without an
+    /// embedded provisioning profile. The profile's `TeamIdentifier` is used
+    /// as a fallback.
     public private(set) static var hostTeamID: String? = nil
+
+    /// Where `hostTeamID` came from — shown in the diagnosis so the user can
+    /// tell "read from the signature" apart from "read from the profile".
+    public private(set) static var hostTeamSource: String? = nil
 
     /// The host's `get-task-allow` entitlement — the library-validation
     /// exemption. `true` means the host may load dylibs signed by other teams.
@@ -101,12 +108,35 @@ public enum HostIdentity {
             }
         }
 
-        // 2) Team id + profile name out of our embedded provisioning profile.
+        // 2) Team id out of our own CodeDirectory — the authoritative source.
+        //
+        //    The team id is written into the CodeDirectory by whoever signed
+        //    the binary, so it is present for every real signature even when
+        //    the side-loading tool did not embed a provisioning profile (very
+        //    common: ad-hoc / CI-built IPAs re-signed by the tool carry no
+        //    `embedded.mobileprovision` at all). Reading the profile alone
+        //    would leave `hostTeamID` nil exactly in the case we need to
+        //    diagnose.
+        if let exe = Bundle.main.executablePath {
+            var teamBuf: UnsafeMutablePointer<CChar>?
+            if ry_macho_team_id(exe, &teamBuf) == 0, let teamBuf = teamBuf {
+                defer { free(teamBuf) }
+                let t = String(cString: teamBuf)
+                if !t.isEmpty {
+                    hostTeamID = t
+                    hostTeamSource = "Mach-O CodeDirectory"
+                }
+            }
+        }
+
+        // 3) Team id + profile name out of our embedded provisioning profile.
         if let provURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
            let data = try? Data(contentsOf: provURL),
            let plist = CertificateStore.decodeProvisioningPlist(data) {
-            if let teams = plist["TeamIdentifier"] as? [String], let t = teams.first {
+            if hostTeamID == nil,
+               let teams = plist["TeamIdentifier"] as? [String], let t = teams.first {
                 hostTeamID = t
+                hostTeamSource = "描述文件"
             }
             hostProfileName = plist["Name"] as? String
             // The profile's own entitlements are the authoritative source for
@@ -171,6 +201,7 @@ public enum HostIdentity {
     public static func diagnose() -> String {
         var lines: [String] = []
         lines.append("宿主 team=\(hostTeamID ?? "未知")"
+                     + (hostTeamSource.map { "（来源：\($0)）" } ?? "")
                      + " · 描述文件=\(hostProfileName ?? "无")")
         lines.append("宿主 get-task-allow=\(hostGetTaskAllow)"
                      + " · disable-library-validation=\(hostDisableLibraryValidation)")
@@ -205,19 +236,17 @@ public enum HostIdentity {
         // Same team → library validation passes anyway.
         if sameTeam() == true { return nil }
 
-        // No exemption and we cannot prove same-team → refuse with a message
-        // that names the fix.
+        // No exemption and we cannot PROVE the mismatch → do not block.
         //
-        // Only refuse when we can actually PROVE the mismatch. If the host's
-        // own profile is unreadable we do not block the launch (some
-        // side-loading tools do not embed a profile at all) — we only warn,
-        // because a false refusal would be worse than the errno we are trying
-        // to explain.
-        if hostTeamID == nil {
-            return nil
-        }
+        // Only refuse when we actually know the two teams differ. If either
+        // side could not be read (no profile embedded, ad-hoc signature, the
+        // imported p12 not parsed yet) we stay out of the way: a false refusal
+        // is worse than the errno we are trying to explain. The diagnosis
+        // panel and the log line carry the uncertainty instead.
+        guard let host = hostTeamID, let guest = guestTeamID() else { return nil }
+
         return "宿主用分发证书签名（get-task-allow=false），不豁免库验证；"
-             + "而 guest 将以 team=\(guestTeamID() ?? "未配置") 签名，与宿主 team=\(hostTeamID!) 不同。"
+             + "而 guest 将以 team=\(guest) 签名，与宿主 team=\(host) 不同。"
              + "AMFI 会拒绝这个 guest 动态库（errno=85）。\n"
              + "解决办法：用「开发证书 + 开发描述文件（含本机 UDID）」重新侧载 RyBox.ipa，"
              + "并把同一张 p12 导入 RyBox —— 开发证书自带 get-task-allow，宿主即豁免库验证。"
