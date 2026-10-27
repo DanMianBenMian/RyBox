@@ -240,6 +240,22 @@ public final class CodeSigner {
         //     written separately (cert.der) and prepended as slot 0 by the
         //     signer, so this set holds only the intermediates/root.
         let team = CertificateStore.shared.teamIdentifier ?? ""
+        if team.isEmpty {
+            // The team id ends up in the guest's CodeDirectory (teamOffset),
+            // and it is the ONLY thing library validation compares against
+            // the host's. An empty team ⇒ no team id in the CodeDirectory ⇒
+            // the "same team" route can never match, so the guest is refused
+            // with errno=85 no matter how perfect the signature is.
+            //
+            // The team normally comes from the imported certificate's Subject
+            // OU (see CertificateStore.captureTeamFromCertificate); it is
+            // empty only when the p12 could not be parsed far enough to read
+            // its leaf certificate. Say so loudly — this is invisible in the
+            // errno otherwise.
+            RyLog.shared.log("sign  ⚠ 签名身份里没有 team id —— guest 的 CodeDirectory 将不包含 team，"
+                             + "AMFI 的库验证一定不通过（errno=85）。请确认 p12 导入成功且叶子证书可读。",
+                             level: .error, tag: "sign")
+        }
         let certsDir = tmp.appendingPathComponent("chain")
         try? fm.createDirectory(at: certsDir, withIntermediateDirectories: true)
         let chain = CertificateStore.shared.signingIntermediateCertificates()
