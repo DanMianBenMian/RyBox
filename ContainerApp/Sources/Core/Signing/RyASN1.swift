@@ -88,4 +88,73 @@ enum RyASN1 {
         }
         return parts.joined(separator: ".")
     }
+
+    // MARK: - X.509 subject
+
+    /// The `organizationalUnitName` OID (2.5.4.11).
+    ///
+    /// In every Apple-issued signing certificate this attribute holds the
+    /// **Team ID** — the 10-character string Apple binds to a developer
+    /// account. Verified against a real certificate:
+    ///
+    ///     OID 2.5.4.11 = "PQQC56VX22"
+    ///     OID 2.5.4.3  = "iPhone Developer: ... (XWS2FBQXYM)"
+    ///
+    /// (The parenthesised token in the CN is a *legacy* identifier and is NOT
+    /// the team — the OU is.)
+    static let oidOrganizationalUnit = "2.5.4.11"
+
+    /// Extract the Team ID from a DER-encoded X.509 certificate.
+    ///
+    /// This is the **only** source of the team that does not need a
+    /// provisioning profile. That matters because:
+    ///
+    ///   * A `.mobileprovision` is a *profile* artefact — it says which team
+    ///     may sign an app, not which team the private key belongs to.
+    ///   * CI builds and most side-loading tools produce an app with **no
+    ///     embedded profile at all**, so a profile-only lookup returns nil
+    ///     exactly in the case where the team is needed.
+    ///
+    /// The certificate itself always carries it.
+    ///
+    /// - Returns the team id (e.g. "PQQC56VX22") or nil.
+    static func teamID(inCertificateDER data: Data) -> String? {
+        let r = Reader(data)
+
+        // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+        guard let cert = r.at(0), cert.tag == SEQUENCE else { return nil }
+        let certParts = r.children(cert)
+        guard let tbs = certParts.first else { return nil }
+
+        // TBSCertificate ::= SEQUENCE {
+        //   version [0] EXPLICIT OPTIONAL, serialNumber, signature,
+        //   issuer, validity, subject, ... }
+        let tb = r.children(tbs)
+        var idx = 0
+        if tb.first?.tag == 0xA0 { idx = 1 }        // skip the explicit [0] version
+        // serialNumber, signature, issuer, validity → subject is next
+        guard tb.count > idx + 4 else { return nil }
+        let subject = tb[idx + 4]
+        guard subject.tag == SEQUENCE else { return nil }
+
+        // Subject ::= RDNSequence OF RelativeDistinguishedName
+        // RDN ::= SET OF AttributeTypeAndValue
+        // ATV ::= SEQUENCE { type OID, value ANY }
+        for rdn in r.children(subject) {
+            for atv in r.children(rdn) {
+                let fields = r.children(atv)
+                guard fields.count >= 2 else { continue }
+                guard oidString(fields[0], r) == oidOrganizationalUnit else { continue }
+
+                // The value is a DirectoryString; UTF8String / PrintableString
+                // / IA5String all carry the text as raw bytes here.
+                let raw = r.slice(fields[1])
+                if let s = String(bytes: raw, encoding: .utf8),
+                   s.rangeOfCharacter(from: .alphanumerics) != nil {
+                    return s.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+        return nil
+    }
 }

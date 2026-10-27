@@ -216,17 +216,22 @@ enum GuestRuntime {
         RyLog.shared.log("准备启动 \(app.name)（\(app.bundleIdentifier)）", level: .info, tag: "guest")
 
         // Pre-flight: the in-process path's ONE hard requirement is that the
-        // HOST may load a foreign-team dylib. A host signed with a
-        // distribution profile is not debuggable, so AMFI enforces library
-        // validation and refuses the guest with the opaque
-        // `code signature invalid (errno=85)`.
+        // guest dylib passes AMFI's library validation. Apple only compares
+        // the guest's team id against the host's, so EITHER of these works:
+        //
+        //   * channel A — the guest is signed by the SAME team as the host
+        //     (a distribution certificate is fine here; the team id belongs to
+        //     the Apple developer account, not to the certificate type),
+        //   * channel B — the host carries get-task-allow and is therefore
+        //     exempt from the check.
+        //
+        // When neither holds, AMFI refuses the guest with the opaque
+        // `code signature invalid (errno=85)` — and that error names the
+        // GUEST's CodeDirectory, so it looks like "our signature is broken".
         //
         // Check it BEFORE spending 30 seconds on Mach-O patching and signing,
         // and turn the failure into an actionable sentence instead of a raw
-        // errno. LiveContainer's FAQ states the requirement outright:
-        // "you are using a distribution certificate profile to sign
-        //  LiveContainer, which is not supported and LiveContainer won't work
-        //  at all."
+        // errno.
         let preflight = HostIdentity.preflightWarning()
         if let preflight {
             RyLog.shared.log("启动前检查失败：\(preflight)", level: .error, tag: "guest")

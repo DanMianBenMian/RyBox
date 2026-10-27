@@ -73,8 +73,24 @@ public final class CertificateStore: ObservableObject {
     private var p12Password: String?
 
     @Published public private(set) var isConfigured: Bool = false
-    /// Team id extracted from the provisioning profile (e.g. "ABCDE12345").
+    /// Team id of the SIGNING identity (e.g. "ABCDE12345").
+    ///
+    /// Sourced from the p12's leaf certificate (Subject OU), with the
+    /// provisioning profile's `TeamIdentifier` as a cross-check / fallback.
+    ///
+    /// It has to come from the certificate: the profile says which team may
+    /// sign an *app*, the certificate says which team the *private key* belongs
+    /// to. Library validation compares the latter, and a CI-built or
+    /// side-loaded app frequently has no embedded profile at all — so a
+    /// profile-only lookup returns nil exactly when the team is needed.
     @Published public private(set) var teamIdentifier: String?
+    /// Where `teamIdentifier` came from — "证书" / "描述文件" / "证书（与描述文件不一致）" /
+    /// "证书与描述文件一致".
+    @Published public private(set) var teamSource: String?
+    /// The team the PROVISIONING PROFILE claims. Kept separately so the
+    /// certificate's own team can be cross-checked against it regardless of
+    /// the order the two files were imported in.
+    private var profileTeamIdentifier: String?
     /// Human readable "what we actually imported" line, shown in the UI.
     @Published public private(set) var certificateInfo: String?
 
@@ -154,6 +170,7 @@ public final class CertificateStore: ObservableObject {
                 self.signingLeafCert = leaf
             }
             self.certificateInfo = Self.describe(identity: self.identity)
+            self.captureTeamFromCertificate()
             refresh()
             save()
             return .success(())
@@ -193,6 +210,7 @@ public final class CertificateStore: ObservableObject {
                 self.p12Data = data
                 self.p12Password = o.password
                 self.certificateInfo = "\(o.subject) · \(o.keyDescription) · \(o.scheme)"
+                self.captureTeamFromCertificate()
                 refresh()
                 save()
                 return .success(())
@@ -228,11 +246,70 @@ public final class CertificateStore: ObservableObject {
             return .failure("不是有效的描述文件：里面没有找到 plist。请确认选的是 .mobileprovision（不是 .cer/.p12）。")
         }
         if let teams = plist["TeamIdentifier"] as? [String], let t = teams.first {
-            teamIdentifier = t
+            // Cross-check against the certificate's own team. A mismatch means
+            // the p12 and the profile belong to DIFFERENT Apple accounts — the
+            // guest would then be signed by a key whose team is not the one the
+            // profile claims, which AMFI rejects. Report it instead of
+            // silently picking one.
+            //
+            // The certificate wins, because it is the private key's team and
+            // that is what library validation compares.
+            profileTeamIdentifier = t
+            if let certTeam = teamIdentifier, certTeam != t {
+                RyLog.shared.log("⚠ p12 证书的 team=\(certTeam) 与描述文件的 team=\(t) 不一致 —— "
+                                 + "两者必须来自同一个 Apple 开发者账号，否则重签后 AMFI 会拒绝。",
+                                 level: .error, tag: "sign")
+                teamIdentifier = certTeam
+                teamSource = "证书（与描述文件不一致）"
+            } else if let certTeam = teamIdentifier {
+                teamIdentifier = certTeam
+                teamSource = "证书与描述文件一致"
+            } else {
+                // No certificate imported yet — the profile is all we have.
+                teamIdentifier = t
+                teamSource = "描述文件"
+            }
+        } else {
+            captureTeamFromCertificate()
         }
         refresh()
         save()
         return .success(())
+    }
+
+    /// Read the Team ID out of the signing certificate and record it.
+    ///
+    /// The certificate is the authority here: it is the private key's team,
+    /// and library validation compares exactly that. A provisioning profile
+    /// only says which team may sign an *app*, and a CI-built or side-loaded
+    /// app often carries no profile at all.
+    private func captureTeamFromCertificate() {
+        var der: Data? = nil
+        if let leaf = signingLeafCert {
+            der = SecCertificateCopyData(leaf) as Data
+        } else if let d = decodedCert {
+            der = d
+        }
+        guard let der = der,
+              let t = RyASN1.teamID(inCertificateDER: der) else { return }
+        if let existing = teamIdentifier, existing != t {
+            RyLog.shared.log("⚠ 证书里的 team=\(t) 与已记录的 team=\(existing) 不一致，以证书为准。",
+                             level: .warn, tag: "sign")
+        }
+        teamIdentifier = t
+        // The certificate is the authority. If a profile is already known and
+        // disagrees, say so — the mismatch is fatal for library validation and
+        // must not be silently swallowed.
+        if let pt = profileTeamIdentifier, pt != t {
+            RyLog.shared.log("⚠ p12 证书的 team=\(t) 与描述文件的 team=\(pt) 不一致 —— "
+                             + "两者必须来自同一个 Apple 开发者账号，否则重签后 AMFI 会拒绝。",
+                             level: .error, tag: "sign")
+            teamSource = "证书（与描述文件不一致）"
+        } else if profileTeamIdentifier != nil {
+            teamSource = "证书与描述文件一致"
+        } else {
+            teamSource = "证书"
+        }
     }
 
     // MARK: - Diagnostics
@@ -791,6 +868,8 @@ public final class CertificateStore: ObservableObject {
         p12Password = nil
         provisioningData = nil
         teamIdentifier = nil
+        teamSource = nil
+        profileTeamIdentifier = nil
         certificateInfo = nil
         refresh()
         try? fileManager.removeItem(at: keysDir)

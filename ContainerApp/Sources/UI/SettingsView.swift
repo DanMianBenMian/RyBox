@@ -129,6 +129,9 @@ struct SettingsView: View {
                 case .exempt:
                     Label("已豁免", systemImage: "checkmark.shield.fill")
                         .foregroundColor(.green)
+                case .sameTeam:
+                    Label("同 team（通过）", systemImage: "checkmark.shield.fill")
+                        .foregroundColor(.green)
                 case .sameTeamOnly:
                     Label("仅限同 team", systemImage: "exclamationmark.shield.fill")
                         .foregroundColor(.orange)
@@ -149,6 +152,18 @@ struct SettingsView: View {
                     Spacer()
                     Text(team).foregroundColor(.secondary)
                 }
+            }
+            HStack {
+                Text("guest Team ID")
+                Spacer()
+                Text(HostIdentity.guestTeamID() ?? "未配置")
+                    .foregroundColor(HostIdentity.guestTeamID() == nil ? .secondary : .secondary)
+            }
+            HStack {
+                Text("可用通路")
+                Spacer()
+                Text(HostIdentity.loadRoute().title)
+                    .foregroundColor(HostIdentity.loadRoute().works ? .green : .orange)
             }
             if let name = HostIdentity.hostProfileName {
                 VStack(alignment: .leading, spacing: 2) {
@@ -175,6 +190,17 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("两条通路").font(.caption).foregroundColor(.secondary)
+                Text("A · 同 team（分发证书即可）：用**同一个 Apple 开发者账号**的证书侧载 RyBox.ipa，"
+                     + "并把**同一张 p12** 导入 RyBox。宿主与 guest 同 team → 库验证直接通过。"
+                     + "Apple 的规则只比对 team id，而开发证书与分发证书的 team id 相同。\n"
+                     + "B · 开发证书：宿主用带 get-task-allow 的开发描述文件侧载 → 宿主豁免库验证，"
+                     + "可加载任意 team 的 guest。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Button {
                 HostIdentity.inspect()
             } label: {
@@ -184,7 +210,7 @@ struct SettingsView: View {
         } header: {
             Text("宿主签名自检")
         } footer: {
-            Text("LiveContainer 要求宿主自带 get-task-allow（开发证书），否则 AMFI 会拒绝加载 guest 动态库并报 errno=85。这里读取的是 RyBox.app 自身的签名，与「签名身份」里的 guest 证书是两回事。")
+            Text("AMFI 的库验证只比对 team id：宿主与 guest 同 team 就能加载（分发证书也行），宿主带 get-task-allow（开发证书）则直接豁免。这里读取的是 RyBox.app 自身的签名，与「签名身份」里的 guest 证书是两回事。")
         }
     }
 
