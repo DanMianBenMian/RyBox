@@ -691,9 +691,25 @@ public final class CertificateStore: ObservableObject {
     /// slot 1.
     public func signingIntermediateCertificates() -> [Data] {
         let leafDER = (signingLeafCert.flatMap { SecCertificateCopyData($0) as Data? })
+        // Leaf issuer (canonical DER) — used to accept ONLY the WWDR that
+        // actually signed this leaf, so a WRONG intermediate (e.g. a
+        // system-cached G3) is never embedded alongside the correct one.
+        let leafIssuer = (signingLeafCert.flatMap {
+            SecCertificateCopyNormalizedIssuerSequence($0) as Data?
+        })
         var seen = Set<Data>()
         var wwdr: [Data] = []
         var others: [Data] = []
+
+        // A WWDR is only useful if its SUBJECT == the leaf's ISSUER (it truly
+        // issued the leaf). When we don't know the leaf, accept any WWDR.
+        func wwdrCanChain(_ c: Data) -> Bool {
+            guard let leafIssuer = leafIssuer else { return true }
+            guard let cert = SecCertificateCreateWithData(nil, c as CFData),
+                  let subj = SecCertificateCopyNormalizedSubjectSequence(cert) as Data?
+            else { return false }
+            return subj == leafIssuer
+        }
 
         func take(_ c: Data, wwdrFirst: Bool) {
             guard c.count > 0 else { return }
@@ -701,6 +717,8 @@ public final class CertificateStore: ObservableObject {
             if seen.contains(c) { return }
             seen.insert(c)
             if isWWDR(c) {
+                // Only keep a WWDR that can actually chain to this leaf.
+                guard wwdrCanChain(c) else { return }
                 if wwdrFirst { wwdr.append(c) } else { others.append(c) }
             } else {
                 others.append(c)
@@ -712,7 +730,7 @@ public final class CertificateStore: ObservableObject {
         //    `certificate 1[1.2.840.113635.100.6.2.1 exists]`). Many devices
         //    ship WITHOUT a WWDR in SecTrust / the keychain (the user's iPad:
         //    empty chain → `code signature invalid`, errno=85), so we carry the
-        //    cert in-code — exactly what LiveContainer does
+        //    certs in-code — exactly what LiveContainer does
         //    (`ZSignAsset::s_szAppleDevCACert` / `...G3`).
         if let embedded = Self.preferredEmbeddedWWDR(for: signingLeafCert) {
             take(embedded, wwdrFirst: true)
@@ -728,7 +746,7 @@ public final class CertificateStore: ObservableObject {
         for c in systemWWDRCertificates() { take(c, wwdrFirst: true) }
 
         // WWDR first, then any remaining intermediates/roots. This guarantees
-        // the FIRST extra cert (→ CMS slot 1) is the WWDR intermediate.
+        // the FIRST extra cert (→ CMS slot 1) is the matched WWDR intermediate.
         return wwdr + others
     }
 
@@ -787,29 +805,48 @@ public final class CertificateStore: ObservableObject {
         return out
     }
 
-    // MARK: - Embedded Apple WWDR intermediate
+    // MARK: - Embedded Apple WWDR intermediates
 
     /// Apple Worldwide Developer Relations Certification Authority (G3) — the
-    /// intermediate EVERY modern code-signing certificate chains through (all
-    /// iPhone Distribution / Development certs issued since 2021 are signed by
-    /// G3). Hardcoded on purpose: the device's trust store / keychain may not
-    /// supply a WWDR, and without it the guest CMS has no slot-1 intermediate,
-    /// so AMFI rejects the signature (errno=85) even with perfect hashes.
+    /// intermediate most signing certificates chained through until ~2023.
+    /// Hardcoded on purpose: the device's trust store / keychain may not supply
+    /// a WWDR (the user's iPad returned an EMPTY chain → `code signature
+    /// invalid`, errno=85 without this). We therefore carry the Apple
+    /// intermediates in-code — exactly what LiveContainer does
+    /// (`ZSignAsset::s_szAppleDevCACert` / `...G3`).
+    ///
+    /// IMPORTANT (errno=1 root cause): Apple did NOT stick with G3. Certificates
+    /// issued from 2023 onward chain through G5 / G6 (G6 is signed by the
+    /// separate "Apple Root CA - G3" anchor; G5/G7/G8 by the original
+    /// "Apple Root CA"). Hardcoding ONLY G3 made the guest CMS embed a WRONG
+    /// intermediate when the leaf is signed by G6 → the trust chain
+    /// `leaf → G3 → root` cannot be built → errno=1. We now embed
+    /// G3/G5/G6/G7/G8 and pick the one whose SUBJECT matches the leaf's ISSUER
+    /// (see `preferredEmbeddedWWDR`).
     ///
     /// The DR (Designated Requirement) requires CMS slot 1 to carry a cert with
-    /// the Apple OID `1.2.840.113635.100.6.2.1` — this is that cert.
-    /// LiveContainer does the same thing (`ZSignAsset::s_szAppleDevCACert` /
-    /// `s_szAppleDevCACertG3`).
+    /// the Apple OID `1.2.840.113635.100.6.2.1` — every WWDR below satisfies it.
     private static let appleWWDRG3Base64 = "MIIEUTCCAzmgAwIBAgIQfK9pCiW3Of57m0R6wXjF7jANBgkqhkiG9w0BAQsFADBiMQswCQYDVQQGEwJVUzETMBEGA1UEChMKQXBwbGUgSW5jLjEmMCQGA1UECxMdQXBwbGUgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxFjAUBgNVBAMTDUFwcGxlIFJvb3QgQ0EwHhcNMjAwMjE5MTgxMzQ3WhcNMzAwMjIwMDAwMDAwWjB1MUQwQgYDVQQDDDtBcHBsZSBXb3JsZHdpZGUgRGV2ZWxvcGVyIFJlbGF0aW9ucyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTELMAkGA1UECwwCRzMxEzARBgNVBAoMCkFwcGxlIEluYy4xCzAJBgNVBAYTAlVTMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2PWJ/KhZC4fHTJEuLVaQ03gdpDDppUjvC0O/LYT7JF1FG+XrWTYSXFRknmxiLbTGl8rMPPbWBpH85QKmHGq0edVny6zpPwcR4YS8Rx1mjjmi6LRJ7TrS4RBgeo6TjMrA2gzAg9Dj+ZHWp4zIwXPirkbRYp2SqJBgN31ols2N4Pyb+ni743uvLRfdW/6AWSN1F7gSwe0b5TTO/iK1nkmw5VW/j4SiPKi6xYaVFuQAyZ8D0MyzOhZ71gVcnetHrg21LYwOaU1A0EtMOwSejSGxrC5DVDDOwYqGlJhL32oNP/77HK6XF8J4CjDgXx9UO0m3JQAaN4LSVpelUkl8YDib7wIDAQABo4HvMIHsMBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAUK9BpR5R2Cf70a40uQKb3R01/CF4wRAYIKwYBBQUHAQEEODA2MDQGCCsGAQUFBzABhihodHRwOi8vb2NzcC5hcHBsZS5jb20vb2NzcDAzLWFwcGxlcm9vdGNhMC4GA1UdHwQnMCUwI6AhoB+GHWh0dHA6Ly9jcmwuYXBwbGUuY29tL3Jvb3QuY3JsMB0GA1UdDgQWBBQJ/sAVkPmvZAqSErkmKGMMl+ynsjAOBgNVHQ8BAf8EBAMCAQYwEAYKKoZIhvdjZAYCAQQCBQAwDQYJKoZIhvcNAQELBQADggEBAK1lE+j24IF3RAJHQr5fpTkg6mKp/cWQyXMT1Z6b0KoPjY3L7QHPbChAW8dVJEH4/M/BtSPp3Ozxb8qAHXfCxGFJJWevD8o5Ja3T43rMMygNDi6hV0Bz+uZcrgZRKe3jhQxPYdwyFot30ETKXXIDMUacrptAGvr04NM++i+MZp+XxFRZ79JI9AeZSWBZGcfdlNHAwWx/eCHvDOs7bJmCS1JgOLU5gm3sUjFTvg+RTElJdI+mUcuER04ddSduvfnSXPN/wmwLCTbiZOTCNwMUGdXqapSqqdv+9poIZ4vvK7iqF0mDr8/LvOnP6pVxsLRFoszlh6oKw0E6eVzaUDSdlTs="
 
-    /// The legacy G1 intermediate (expired 2023-02-07). Kept as a slot so an
-    /// older imported cert can still chain; nil until a G1 blob is added. Today
-    /// only G3 is embedded and is always used (see preferredEmbeddedWWDR).
-    private static let appleWWDRG1Base64: String? = nil
+    /// G5 (RSA, signed by the original Apple Root CA).
+    private static let appleWWDRG5Base64 = "MIIEVTCCAz2gAwIBAgIUO36ACu7TAqHm7NuX2cqsKJzxaZQwDQYJKoZIhvcNAQELBQAwYjELMAkGA1UEBhMCVVMxEzARBgNVBAoTCkFwcGxlIEluYy4xJjAkBgNVBAsTHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MRYwFAYDVQQDEw1BcHBsZSBSb290IENBMB4XDTIwMTIxNjE5Mzg1NloXDTMwMTIxMDAwMDAwMFowdTFEMEIGA1UEAww7QXBwbGUgV29ybGR3aWRlIERldmVsb3BlciBSZWxhdGlvbnMgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxCzAJBgNVBAsMAkc1MRMwEQYDVQQKDApBcHBsZSBJbmMuMQswCQYDVQQGEwJVUzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJ9d2h/7+rzQSyI8x9Ym+hf39J8ePmQRZprvXr6rNL2qLCFu1h6UIYUsdMEOEGGqPGNKfkrjyHXWz8KcCEh7arkpsclm/ciKFtGyBDyCuoBs4v8Kcuus/jtvSL6eixFNlX2ye5AvAhxO/Em+12+1T754xtress3J2WYRO1rpCUVziVDUTuJoBX7adZxLAa7a489tdE3eU9DVGjiCOtCd410pe7GB6iknC/tgfIYS+/BiTwbnTNEf2W2e7XPaeCENnXDZRleQX2eEwXN3CqhiYraucIa7dSOJrXn25qTU/YMmMgo7JJJbIKGc0S+AGJvdPAvntf3sgFcPF54/K4cnu/cCAwEAAaOB7zCB7DASBgNVHRMBAf8ECDAGAQH/AgEAMB8GA1UdIwQYMBaAFCvQaUeUdgn+9GuNLkCm90dNfwheMEQGCCsGAQUFBwEBBDgwNjA0BggrBgEFBQcwAYYoaHR0cDovL29jc3AuYXBwbGUuY29tL29jc3AwMy1hcHBsZXJvb3RjYTAuBgNVHR8EJzAlMCOgIaAfhh1odHRwOi8vY3JsLmFwcGxlLmNvbS9yb290LmNybDAdBgNVHQ4EFgQUGYuXjUpbYXhX9KVcNRKKOQjjsHUwDgYDVR0PAQH/BAQDAgEGMBAGCiqGSIb3Y2QGAgEEAgUAMA0GCSqGSIb3DQEBCwUAA4IBAQBaxDWi2eYKnlKiAIIid81yL5D5Iq8UJcyqCkJgksK9dR3rTMoV5X5rQBBe+1tFdA3wen2Ikc7eY4tCidIY30GzWJ4GCIdI3UCvI9Xt6yxg5eukfxzpnIPWlF9MYjmKTq4TjX1DuNxerL4YQPLmDyxdE5Pxe2WowmhI3v+0lpsM+zI2np4NlV84CouW0hJst4sLjtc+7G8Bqs5NRWDbhHFmYuUZZTDNiv9FU/tu+4h3Q8NIY/n3UbNyXnniVs+8u4S5OFp4rhFIUrsNNYuU3sx0mmj1SWCUrPKosxWGkNDMMEOG0+VwAlG0gcCol9Tq6rCMCUDvOJOyzSID62dDZchF"
+
+    /// G6 (ECDSA, signed by the separate "Apple Root CA - G3" anchor). This is
+    /// the intermediate the user's "iPhone Distribution: … (A6MS28G6T8)" cert
+    /// actually chains through — embedding G3 alone caused errno=1.
+    private static let appleWWDRG6Base64 = "MIIDFjCCApygAwIBAgIUIsGhRwp0c2nvU4YSycafPTjzbNcwCgYIKoZIzj0EAwMwZzEbMBkGA1UEAwwSQXBwbGUgUm9vdCBDQSAtIEczMSYwJAYDVQQLDB1BcHBsZSBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTETMBEGA1UECgwKQXBwbGUgSW5jLjELMAkGA1UEBhMCVVMwHhcNMjEwMzE3MjAzNzEwWhcNMzYwMzE5MDAwMDAwWjB1MUQwQgYDVQQDDDtBcHBsZSBXb3JsZHdpZGUgRGV2ZWxvcGVyIFJlbGF0aW9ucyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTELMAkGA1UECwwCRzYxEzARBgNVBAoMCkFwcGxlIEluYy4xCzAJBgNVBAYTAlVTMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEbsQKC94PrlWmZXnXgtxzdVJL8T0SGYngDRGpngn3N6PT8JMEb7FDi4bBmPhCnZ3/sq6PF/cGcKXWsL5vOteRhyJ45x3ASP7cOB+aao90fcpxSv/EZFbniAbNgZGhIhpIo4H6MIH3MBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAUu7DeoVgziJqkipnevr3rr9rLJKswRgYIKwYBBQUHAQEEOjA4MDYGCCsGAQUFBzABhipodHRwOi8vb2NzcC5hcHBsZS5jb20vb2NzcDAzLWFwcGxlcm9vdGNhZzMwNwYDVR0fBDAwLjAsoCqgKIYmaHR0cDovL2NybC5hcHBsZS5jb20vYXBwbGVyb290Y2FnMy5jcmwwHQYDVR0OBBYEFD8vlCNR01DJmig97bB85c+lkGKZMA4GA1UdDwEB/wQEAwIBBjAQBgoqhkiG92NkBgIBBAIFADAKBggqhkjOPQQDAwNoADBlAjBAXhSq5IyKogMCPtw490BaB677CaEGJXufQB/EqZGd6CSjiCtOnuMTbXVXmxxcxfkCMQDTSPxarZXvNrkxU3TkUMI33yzvFVVRT4wxWJC994OsdcZ4+RGNsYDyR5gmdr0nDGg="
+
+    /// G7 (RSA, signed by the original Apple Root CA).
+    private static let appleWWDRG7Base64 = "MIIEVTCCAz2gAwIBAgIUNBhY/wH+Bj+O8Z8f6TwBtMFG/8kwDQYJKoZIhvcNAQEFBQAwYjELMAkGA1UEBhMCVVMxEzARBgNVBAoTCkFwcGxlIEluYy4xJjAkBgNVBAsTHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MRYwFAYDVQQDEw1BcHBsZSBSb290IENBMB4XDTIyMTExNzIwNDA1M1oXDTIzMTExNzIwNDA1MlowdTELMAkGA1UEBhMCVVMxEzARBgNVBAoMCkFwcGxlIEluYy4xCzAJBgNVBAsMAkc3MUQwQgYDVQQDDDtBcHBsZSBXb3JsZHdpZGUgRGV2ZWxvcGVyIFJlbGF0aW9ucyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKyu0dO2irEbKJWt3lFRTD8z4U5cr7P8AtJlTyrUdGiMdRdlzyjkSAmYcVIyLBZOeI6SVmSp3YvN4tTHO6ISRTcCGWJkL39hxtNZIr+r+RSj7baembov8bHcMEJPtrayxnSqYla77UQ2D9HlIHSTVzpdntwB/HhvaRY1w24Bwp5y1HE2sXYJer4NKpfxsF4LGxKtK6sH32Mt9YjpMhKiVVhDdjw9F4AfKduxqZ+rlgWdFdzd204P5xN8WisuAkH27npqtnNg95cZFIuVMziT2gAlNq5VWnyf+fRiBAd06R2nlVcjrCsk2mRPKHLplrAIPIgbFGND14mumMHyLY7jUSUCAwEAAaOB7zCB7DASBgNVHRMBAf8ECDAGAQH/AgEAMB8GA1UdIwQYMBaAFCvQaUeUdgn+9GuNLkCm90dNfwheMEQGCCsGAQUFBwEBBDgwNjA0BggrBgEFBQcwAYYoaHR0cDovL29jc3AuYXBwbGUuY29tL29jc3AwMy1hcHBsZXJvb3RjYTAuBgNVHR8EJzAlMCOgIaAfhh1odHRwOi8vY3JsLmFwcGxlLmNvbS9yb290LmNybDAdBgNVHQ4EFgQUXUIQbBu7x1KXTkS9Eye5OhJ3gyswDgYDVR0PAQH/BAQDAgEGMBAGCiqGSIb3Y2QGAgEEAgUAMA0GCSqGSIb3DQEBBQUAA4IBAQBSowgpE2W3tR/mNAPt9hh3vD3KJ7Vw7OxsM0v2mSWUB54hMwNq9X0KLivfCKmC3kp/4ecLSwW4J5hJ3cEMhteBZK6CnMRF8eqPHCIw46IlYUSJ/oV6VvByknwMRFQkt7WknybwMvlXnWp5bEDtDzQGBkL/2A4xZW3mLgHZBr/Fyg2uR9QFF4g86ZzkGWRtipStEdwB9uV4r63ocNcNXYE+RiosriShx9Lgfb8d9TZrxd6pCpqAsRFesmR+s8FXzMJsWZm39LDdMdpI1mqB7rKLUDUW5udccWJusPJR4qht+CrLaHPGpsQaQ0kBPqmpAIqGbIOI0lxwV3ra+HbMGdWw"
+
+    /// G8 (RSA, signed by the original Apple Root CA).
+    private static let appleWWDRG8Base64 = "MIIEVTCCAz2gAwIBAgIUVLULr3kNjX+Mr2hMVi9QaQoaul8wDQYJKoZIhvcNAQEFBQAwYjELMAkGA1UEBhMCVVMxEzARBgNVBAoTCkFwcGxlIEluYy4xJjAkBgNVBAsTHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MRYwFAYDVQQDEw1BcHBsZSBSb290IENBMB4XDTIzMDYyMDIzMzcxNVoXDTI1MDEyNDAwMDAwMFowdTELMAkGA1UEBhMCVVMxEzARBgNVBAoMCkFwcGxlIEluYy4xCzAJBgNVBAsMAkc4MUQwQgYDVQQDDDtBcHBsZSBXb3JsZHdpZGUgRGV2ZWxvcGVyIFJlbGF0aW9ucyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANBAENQI+VIhY088aPfUnIICjINovLeNf4jnQk0s7yKlwonevQzXTWFQLTnkMHOl0tVomjPy79kqrS4fA7r4pfFCC1cuRsbQWNNwX/eyN+9qHz6/iTnCrf71BftYljHIhyzVI7p1sCz1q6C68iAMTOskY2npIkDwjlhb3mR7iRtREgTgF7JZzd/x586vLDLoacHQCH4dokdz0Us7/bmF3EenKIJ5KUiJAijiwewsH1uG/Ni2y3HAcwFL/AUREWwBAzRa9oHCXh98FA7eP2shy0/112HmhAOSvOclKZ7NWwzB2+PEOtl2V6wvOBQZyLexolVPX06OGVmp2v1y2rAEIQUCAwEAAaOB7zCB7DASBgNVHRMBAf8ECDAGAQH/AgEAMB8GA1UdIwQYMBaAFCvQaUeUdgn+9GuNLkCm90dNfwheMEQGCCsGAQUFBwEBBDgwNjA0BggrBgEFBQcwAYYoaHR0cDovL29jc3AuYXBwbGUuY29tL29jc3AwMy1hcHBsZXJvb3RjYTAuBgNVHR8EJzAlMCOgIaAfhh1odHRwOi8vY3JsLmFwcGxlLmNvbS9yb290LmNybDAdBgNVHQ4EFgQUtb28gMQM4zik9LetI7PvRM65WoUwDgYDVR0PAQH/BAQDAgEGMBAGCiqGSIb3Y2QGAgEEAgUAMA0GCSqGSIb3DQEBBQUAA4IBAQBMs+t6OZRKlWb6FjHqDYqPXUI4xgfN6MkirPwIQn5fk18xKqgiwXYZK+6ucum9Vs9JJJII980ZdcP5GicNDtwpjT+226VPTHLEYJGJEX4klUMiYGe83/+r5TwWF52CFE6d9HX+ULmtBbK4efaV1hDl9lP0zyPmdw/suEtp+OKeAjHZjtnKvmNeX+Ggac7BzW5Jo3hhrzk8aksKNCVk1TC1PKvdEYE5cejAw1iAERAaEdLCvFnwitk1c8DmbeTJfWIUPoICqRBpN3lhb/BGlD419ausY9DYXllXadG4S25d1F8TnHBOJRHcJCweFp6WWgTtRe467mddj8OGsPVMH2gQ"
 
     private static func embeddedWWDRCerts() -> [(der: Data, cert: SecCertificate)] {
+        let blobs = [appleWWDRG3Base64, appleWWDRG5Base64, appleWWDRG6Base64,
+                     appleWWDRG7Base64, appleWWDRG8Base64]
         var out: [(Data, SecCertificate)] = []
-        for blob in [appleWWDRG3Base64, appleWWDRG1Base64].compactMap({ $0 }) {
+        for blob in blobs {
             guard let der = Data(base64Encoded: blob),
                   let cert = SecCertificateCreateWithData(nil, der as CFData) else { continue }
             out.append((der, cert))
@@ -817,14 +854,29 @@ public final class CertificateStore: ObservableObject {
         return out
     }
 
-    /// The embedded WWDR that must sit at CMS slot 1. Only G3 is embedded today
-    /// (G1 is a nil placeholder), and G3 is the correct intermediate for every
-    /// currently-valid signing certificate, so we always return it. No AKID/SKID
-    /// chain walking is needed — keeping this simple also avoids depending on
-    /// SecCertificateCopyExtensionValue / the kSecOID* constants, which are not
-    /// uniformly exposed across SDK versions.
+    /// The embedded WWDR that must sit at CMS slot 1.
+    ///
+    /// We pick the candidate whose SUBJECT equals the leaf's ISSUER — the exact
+    /// X.509 chaining test (parent's subject == child's issuer). This needs no
+    /// AKID/SKID extension parsing (not uniformly exposed across SDK versions);
+    /// `SecCertificateCopyNormalizedIssuerSequence` / `…SubjectSequence` give
+    /// canonical, comparable DER name blobs.
+    ///
+    /// Result: when the leaf is signed by G6 we embed G6 (not G3), so the trust
+    /// chain `leaf → G6 → Apple Root CA - G3` validates and errno=1 is gone.
+    /// When the leaf is unavailable we fall back to G3 (the most common case).
     private static func preferredEmbeddedWWDR(for leaf: SecCertificate?) -> Data? {
-        embeddedWWDRCerts().first?.der
+        let candidates = embeddedWWDRCerts()
+        guard let leaf = leaf else { return candidates.first?.der }
+        guard let leafIssuer = SecCertificateCopyNormalizedIssuerSequence(leaf) as Data?
+        else { return candidates.first?.der }
+        for (der, cert) in candidates {
+            if let subj = SecCertificateCopyNormalizedSubjectSequence(cert) as Data?,
+               subj == leafIssuer {
+                return der
+            }
+        }
+        return candidates.first?.der   // fallback: G3
     }
 
     // MARK: - Persistence

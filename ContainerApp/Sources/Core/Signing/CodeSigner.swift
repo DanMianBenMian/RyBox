@@ -263,7 +263,14 @@ public final class CodeSigner {
             try? c.write(to: certsDir.appendingPathComponent("\(i).der"))
         }
         if !chain.isEmpty {
-            RyLog.shared.log("sign  证书链：\(chain.count) 张中间/根证书（含 WWDR 中间证书，置于 slot 1）",
+            // Slot 1 (chain[0]) is the WWDR intermediate we selected to match the
+            // leaf's issuer. Log its subject so a re-test can confirm we embedded
+            // G6 (not the old hardcoded G3) — the errno=1 fix.
+            let slot1Summary: String = {
+                guard let cert = SecCertificateCreateWithData(nil, chain[0] as CFData) else { return "?" }
+                return (SecCertificateCopySubjectSummary(cert) as? String) ?? "?"
+            }()
+            RyLog.shared.log("sign  证书链：\(chain.count) 张中间/根证书；slot 1 = \(slot1Summary)",
                              level: .info, tag: "sign")
         } else {
             RyLog.shared.log("sign  ⚠ 证书链为空：CMS 将只有叶子证书，DR 的 slot 1(WWDR) 校验会失败 → errno=85。请确认 p12 含完整链或由系统信任库提供。",
