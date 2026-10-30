@@ -475,6 +475,14 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
     CFDataRef sigData = NULL;
     OSStatus st = errSecSuccess;
     const char *usedName = NULL;
+    // Records the ACTUAL asymmetric family that produced `sigData`. The
+    // SignerInfo's declared signatureAlgorithm OID MUST match this — NOT the
+    // key's self-reported type (`preferEC`), which on iOS 27 can disagree with
+    // what the key can actually perform (see the probe note above). Declaring
+    // ECDSA while the bytes are an RSA signature (or vice-versa) makes AMFI
+    // reject the whole signature with `code signature invalid` even though the
+    // team id matches and our self-check never looks at the algorithm OID.
+    bool usedEC = false;
     int skipped = 0;
     for (int attempt = 0; attempt < 4 && !sigData; attempt++) {
         bool useDigest = (attempt % 2) == 1;
@@ -516,6 +524,10 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         if (sig) {
             sigData = sig; // ownership transferred to the CMS builder
             usedName = aName;
+            // idx 0 = the preferred family (EC when preferEC, else RSA);
+            // idx 1 = the alternate family. Derive the real family so the
+            // declared SignerInfo OID below matches the bytes we just made.
+            usedEC = (idx == 0) ? preferEC : !preferEC;
             g_sign_osstatus = errSecSuccess;
             break;
         }
@@ -548,6 +560,49 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         return -1;
     }
     rysign_set_diag("CMS 签名方式：%s", usedName ? usedName : "?");
+    // Surface a key/algorithm family mismatch that would otherwise only show up
+    // as a cryptic "code signature invalid" on device: if the key's
+    // self-reported type (`preferEC`) disagrees with the family that actually
+    // signed (`usedEC`), the SignerInfo declared the WRONG signatureAlgorithm
+    // OID — the single most likely cause of errno=1 with a self-check that
+    // passes. This line lets the device log confirm or rule it out next run.
+    fprintf(stderr, "rysign: key self-reported EC=%d, actual signing family EC=%d%s\n",
+            preferEC ? 1 : 0, usedEC ? 1 : 0,
+            (preferEC != usedEC) ? "  <<< MISMATCH (declared OID was wrong, now fixed)" : "");
+
+    // Definitive cryptographic self-check: re-verify the signature we just made
+    // with the device's own Security framework, using the SAME algorithm the
+    // SignerInfo now declares. If this fails, the declared signatureAlgorithm
+    // OID does NOT match the bytes AMFI will verify — the exact errno=1 cause —
+    // and no amount of team/page-hash self-checking would have caught it. We log
+    // it loudly but do NOT abort (a transient SecKey quirk on iOS 27 must not
+    // wedge the whole pipeline); the clear message tells the next run whether
+    // the signature itself is sound.
+    {
+        SecKeyRef vpub = SecKeyCopyPublicKey(privKey);
+        if (vpub) {
+            SecKeyAlgorithm vAlgo = usedEC
+                ? kSecKeyAlgorithmECDSASignatureMessageX962SHA256
+                : kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256;
+            CFDataRef vPay = CFDataCreate(NULL, saSet.p, (CFIndex)saSet.len);
+            CFDataRef vSig = CFDataCreate(NULL, CFDataGetBytePtr(sigData),
+                                         (CFIndex)CFDataGetLength(sigData));
+            CFErrorRef vErr = NULL;
+            bool vOk = (vPay && vSig) ? SecKeyVerifySignature(vpub, vAlgo, vPay, vSig, &vErr) : false;
+            fprintf(stderr, "rysign: CMS self-verify (declared algo) %s%s\n",
+                    vOk ? "OK" : "FAILED", vOk ? "" : "  <<< AMFI WILL REJECT");
+            if (!vOk) {
+                rysign_append_diag("｜⚠️ CMS 自签验证失败：声明算法与签名字节不符"
+                                   "（amfid 将以 code signature invalid 拒签）");
+            }
+            if (vErr) CFRelease(vErr);
+            if (vPay) CFRelease(vPay);
+            if (vSig) CFRelease(vSig);
+            CFRelease(vpub);
+        } else {
+            fprintf(stderr, "rysign: CMS self-verify skipped (no public key)\n");
+        }
+    }
 
     // ---- SignerInfo (version 3) -------------------------------------------
     Buf si; buf_init(&si);
@@ -559,13 +614,17 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
       der_wrap(&si, 0x30, &dseq); buf_free(&da); buf_free(&dseq); }
     der_ctx0(&si, &sa);                                       // signedAttrs [0]
     { Buf ra; buf_init(&ra);
-      // The asymmetric algorithm MUST match the one used to produce `sigData`
-      // (see the key-type probe above): RSA identities sign with
-      // sha256WithRSAEncryption, EC identities with ecdsa-with-SHA256. Declaring
-      // the wrong one makes AMFI reject the signature (errno=85) on a strict
-      // (distribution, non-exempt) host — the team id matching is irrelevant.
-      const unsigned char *sigOid = preferEC ? OID_ECDSA_SHA256 : OID_SHA256RSA;
-      size_t sigOidLen = preferEC ? sizeof(OID_ECDSA_SHA256) : sizeof(OID_SHA256RSA);
+      // The declared algorithm MUST match the one that ACTUALLY produced
+      // `sigData` (tracked in `usedEC`), NOT the key's self-reported type.
+      // On iOS 27 the key attributes can lie about their family, so trusting
+      // `preferEC` here would declare ECDSA while the bytes are an RSA
+      // signature (or the reverse) — AMFI then rejects the signature with
+      // `code signature invalid` even though the team id matches and library
+      // validation would otherwise pass. This is the errno=1 half of the
+      // "self-check passes but dlopen fails" puzzle: our self-check never
+      // inspects the SignerInfo algorithm OID.
+      const unsigned char *sigOid = usedEC ? OID_ECDSA_SHA256 : OID_SHA256RSA;
+      size_t sigOidLen = usedEC ? sizeof(OID_ECDSA_SHA256) : sizeof(OID_SHA256RSA);
       der_oid(&ra, sigOid, (unsigned)sigOidLen);
       Buf rseq; buf_init(&rseq); der_wrap(&rseq, 0x30, &ra);
       der_wrap(&si, 0x30, &rseq); buf_free(&ra); buf_free(&rseq); }
@@ -1343,6 +1402,49 @@ static int ry_verify_signed_file(const char *path, const char *team) {
     }
     fprintf(stderr, "rysign: verify page hashes OK (%u slots, codeLimit=%u page=%u)\n",
             nCode, codeLimit, pageSize);
+
+    // 2b) ALTERNATE (SHA-256) CodeDirectory — AMFI computes SHA256(cd2) and
+    //     checks it against the cdhashes plist entry[1] (and CDHashes2). The
+    //     self-check above only looked at the primary CD, so a bug in the
+    //     SHA-256 path would pass locally yet fail AMFI's cdhashes validation
+    //     with `code signature invalid`. Verify cd2's page hashes here so that
+    //     class of failure is caught before dlopen. The math mirrors the
+    //     primary path exactly (last page hashes only its real bytes).
+    if (cd_alt_off) {
+        const unsigned char *cd2 = blob + cd_alt_off;
+        uint32_t cd2_magic = rb32(cd2);
+        if (cd2_magic == 0xfade0c02 || cd2_magic == 0xfade0c01) {
+            uint32_t cd2_hSize   = cd2[36];
+            uint8_t  cd2_hType   = cd2[37];
+            uint8_t  cd2_pageLog = cd2[39];
+            uint32_t cd2_hashOff = rb32(cd2 + 16);
+            uint32_t cd2_nCode   = rb32(cd2 + 28);
+            uint32_t cd2_limit   = rb32(cd2 + 32);
+            uint32_t cd2_pg      = (cd2_pageLog && cd2_pageLog < 32) ? (1u << cd2_pageLog) : 4096u;
+            const unsigned char *cd2_stored = cd2 + cd2_hashOff;
+            uint32_t cd2_nfull = cd2_limit / cd2_pg;
+            uint32_t cd2_rem   = cd2_limit % cd2_pg;
+            int cd2_bad = -1;
+            for (uint32_t i = 0; i < cd2_nCode; i++) {
+                if (cd2_hType == 2) {
+                    if (i < cd2_nfull) CC_SHA256(buf + (size_t)i * cd2_pg, cd2_pg, h);
+                    else              CC_SHA256(buf + (size_t)cd2_nfull * cd2_pg, cd2_rem, h);
+                } else {
+                    if (i < cd2_nfull) CC_SHA1(buf + (size_t)i * cd2_pg, cd2_pg, h);
+                    else              CC_SHA1(buf + (size_t)cd2_nfull * cd2_pg, cd2_rem, h);
+                }
+                if (memcmp(cd2_stored + (size_t)i * cd2_hSize, h, cd2_hSize) != 0) { cd2_bad = (int)i; break; }
+            }
+            if (cd2_bad >= 0) {
+                fprintf(stderr, "rysign: verify ALT(sha256) page hash slot %d MISMATCH\n", cd2_bad);
+                rysign_append_diag("｜自检失败(rc=15)：备用(SHA-256)CodeDirectory 第 %d 个页哈希与磁盘不符", cd2_bad);
+                free(buf); return 15;
+            }
+            fprintf(stderr, "rysign: verify ALT(sha256) page hashes OK (%u slots)\n", cd2_nCode);
+        } else {
+            fprintf(stderr, "rysign: verify ALT CD magic 0x%08x unexpected (skipped)\n", cd2_magic);
+        }
+    }
 
     // 3) CMS present (cryptographic verification is performed by AMFI on load).
     //

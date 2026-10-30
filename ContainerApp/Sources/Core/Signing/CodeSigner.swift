@@ -366,6 +366,7 @@ public final class CodeSigner {
         case 11: return "签名自检未通过：签完的 guest 签名内部不一致（team / 页哈希 / CMS），已拦截 dlopen"
         case 13: return "签名自检未通过：CMS 槽缺少 FADE0B01 BlobWrapper 头（格式错，内核会以 errno=85 拒签）"
         case 14: return "签名自检未通过：CMS 载荷不是合法的 DER SignedData"
+        case 15: return "签名自检未通过：备用(SHA-256)CodeDirectory 的页哈希与磁盘字节不符（amfid 的 cdhashes 校验会拒签）"
         default: return "签名器内部错误（rc=\(rc)）"
         }
     }
