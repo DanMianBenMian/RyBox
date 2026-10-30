@@ -401,7 +401,6 @@ final class DevBridge {
         defer { freeifaddrs(ifaddrs) }
 
         var candidates: [String: String] = [:]   // interface name -> IPv4
-        var all: [String] = []
         var p = first
         while true {
             if let addr = p.pointee.ifa_addr,
@@ -416,7 +415,6 @@ final class DevBridge {
                 var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
                 if let c = inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) {
                     let ip = String(cString: c)
-                    all.append("\(name)=\(ip)\(skip ? "(skip)" : "")")
                     if !skip && ip != "127.0.0.1" { candidates[name] = ip }
                 }
             }
@@ -424,11 +422,10 @@ final class DevBridge {
             p = p.pointee.ifa_next
         }
 
-        // Log EVERY interface, so the next device log answers "why is the
-        // address incomplete / unknown" in one line instead of another round
-        // of guessing. Cheap, and it only runs when the Settings screen asks.
-        RyLog.shared.log("网络接口枚举：\(all.isEmpty ? "(无 AF_INET 接口)" : all.joined(separator: ", "))",
-                         level: .debug, tag: "dev")
+        // NOTE: the per-interface enumeration is intentionally NOT logged.
+        // It used to dump every AF_INET interface into the log on every
+        // Settings-screen open, which buried the real launch/guest errors.
+        // The resolved address is still surfaced by the Settings UI directly.
 
         // Preference order: Wi-Fi, then any wired/en*, then cellular, then bridge,
         // then whatever else we found.

@@ -240,6 +240,12 @@ static const unsigned char OID_RSA[]       = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01
 static const unsigned char OID_DATA[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x07,0x01};
 static const unsigned char OID_SIGNED[]    = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x07,0x02};
 static const unsigned char OID_SHA256RSA[] = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
+// ecdsa-with-SHA256 (1.2.840.10045.4.3.2) — REQUIRED when the signing identity
+// is an EC (P-256) key. Apple now issues EC-based "Apple Distribution" certs,
+// and a CMS that carries an ECDSA signature but declares sha256WithRSAEncryption
+// in SignerInfo.signatureAlgorithm is rejected by AMFI with errno=85 even
+// though the team id matches and library validation would otherwise pass.
+static const unsigned char OID_ECDSA_SHA256[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
 static const unsigned char OID_CTYPE[]     = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x03};
 static const unsigned char OID_MSGDIGEST[] = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x04};
 static const unsigned char OID_APPLE_CDHASHES[]  = {0x2A,0x86,0x48,0x86,0xF7,0x63,0x64,0x09,0x01};
@@ -538,7 +544,15 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
       Buf dseq; buf_init(&dseq); der_wrap(&dseq, 0x30, &da);
       der_wrap(&si, 0x30, &dseq); buf_free(&da); buf_free(&dseq); }
     der_ctx0(&si, &sa);                                       // signedAttrs [0]
-    { Buf ra; buf_init(&ra); der_oid(&ra, OID_SHA256RSA, sizeof(OID_SHA256RSA));
+    { Buf ra; buf_init(&ra);
+      // The asymmetric algorithm MUST match the one used to produce `sigData`
+      // (see the key-type probe above): RSA identities sign with
+      // sha256WithRSAEncryption, EC identities with ecdsa-with-SHA256. Declaring
+      // the wrong one makes AMFI reject the signature (errno=85) on a strict
+      // (distribution, non-exempt) host — the team id matching is irrelevant.
+      const unsigned char *sigOid = preferEC ? OID_ECDSA_SHA256 : OID_SHA256RSA;
+      size_t sigOidLen = preferEC ? sizeof(OID_ECDSA_SHA256) : sizeof(OID_SHA256RSA);
+      der_oid(&ra, sigOid, (unsigned)sigOidLen);
       Buf rseq; buf_init(&rseq); der_wrap(&rseq, 0x30, &ra);
       der_wrap(&si, 0x30, &rseq); buf_free(&ra); buf_free(&rseq); }
     { Buf sigOct; buf_init(&sigOct);
