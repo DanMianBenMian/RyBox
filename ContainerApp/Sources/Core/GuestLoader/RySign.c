@@ -1068,6 +1068,150 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
 }
 
 // ---------------------------------------------------------------------------
+// Self-verify a just-signed Mach-O by reading it back from DISK.
+//
+// After writing the signature we re-read the file and prove the two things AMFI
+// checks before it lets the dylib load:
+//   * the CodeDirectory team id equals the intended team — otherwise signing
+//     SILENTLY FAILED and the guest's ORIGINAL signature (a different team)
+//     survived, which is the classic "library validation" errno=85 that LOOKS
+//     like "our signature is broken";
+//   * every page hash in the CodeDirectory matches the on-disk bytes — otherwise
+//     the blob is internally inconsistent.
+// Returns 0 when both hold; a non-zero code names the failure so the caller can
+// refuse the dlopen with a clear message instead of an opaque errno=85.
+// ---------------------------------------------------------------------------
+static uint32_t rb32(const unsigned char *p) {
+    return (uint32_t)((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
+}
+static int ry_verify_signed_file(const char *path, const char *team) {
+    size_t len; unsigned char *buf = read_file(path, &len);
+    if (!buf) { fprintf(stderr, "rysign: verify cannot read '%s'\n", path); return -1; }
+    if (len < sizeof(struct mach_header_64)) { free(buf); return -1; }
+    if (*(uint32_t *)buf != MH_MAGIC_64) { free(buf); return -1; }
+
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)buf;
+    const struct load_command *lc = (const struct load_command *)(buf + sizeof(*mh));
+    uint32_t sig_off = 0, sig_size = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_CODE_SIGNATURE) {
+            const struct linkedit_data_command *ld = (const struct linkedit_data_command *)lc;
+            sig_off = ld->dataoff; sig_size = ld->datasize; break;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    if (!sig_off || sig_size < 12 || sig_off + sig_size > len) {
+        fprintf(stderr, "rysign: verify NO signature blob (off=%u size=%u len=%zu)\n", sig_off, sig_size, len);
+        free(buf); return -2;
+    }
+    const unsigned char *blob = buf + sig_off;
+    if (rb32(blob) != 0xfade0cc0) {
+        fprintf(stderr, "rysign: verify blob magic 0x%08x != embedded-signature\n", rb32(blob));
+        free(buf); return -3;
+    }
+    uint32_t nslots = rb32(blob + 8);
+    uint32_t cd_off = 0, cd_type = 0, cms_off = 0;
+    for (uint32_t s = 0; s < nslots; s++) {
+        const unsigned char *e = blob + 12 + (size_t)s * 8;
+        if ((size_t)(e - blob) + 8 > sig_size) break;
+        uint32_t type = rb32(e), off = rb32(e + 4);
+        if ((type & 0xffff) == 0x0000) {            // CodeDirectory (primary or alternate)
+            if (type >= cd_type) { cd_type = type; cd_off = off; }
+        } else if (type == 0x10000) {                // CMS signature
+            cms_off = off;
+        }
+    }
+    if (!cd_off) {
+        fprintf(stderr, "rysign: verify NO CodeDirectory slot\n");
+        free(buf); return -4;
+    }
+    const unsigned char *cd = blob + cd_off;
+    uint32_t cd_magic = rb32(cd);
+    if (cd_magic != 0xfade0c02 && cd_magic != 0xfade0c01) {
+        fprintf(stderr, "rysign: verify CD magic 0x%08x unsupported\n", cd_magic);
+        free(buf); return -5;
+    }
+    uint32_t cd_len     = rb32(cd + 4);
+    uint32_t codeLimit  = rb32(cd + 32);
+    uint8_t  hashSize   = cd[36];
+    uint8_t  hashType   = cd[37];
+    uint8_t  pageLog    = cd[39];
+    uint32_t hashOffset = rb32(cd + 16);
+    uint32_t nSpecial   = rb32(cd + 24);
+    uint32_t nCode      = rb32(cd + 28);
+    uint32_t pageSize   = (pageLog && pageLog < 32) ? (1u << pageLog) : 4096u;
+    if ((size_t)codeLimit > len) {
+        fprintf(stderr, "rysign: verify codeLimit %u > file length %zu\n", codeLimit, len);
+        free(buf); return -8;
+    }
+
+    // 1) TEAM — the decisive check. A mismatch means the guest's ORIGINAL
+    //    signature (a different team) survived signing, which is the classic
+    //    library-validation errno=85 that LOOKS like "our signature is broken".
+    int teamMismatch = 0;
+    const char *foundTeam = "(none)";
+    if (cd_magic == 0xfade0c02) {
+        uint32_t teamOffset = rb32(cd + 48);
+        if (teamOffset && teamOffset < cd_len) foundTeam = (const char *)(cd + teamOffset);
+        if (team && team[0]) {
+            if (teamOffset == 0) teamMismatch = 1;
+            else if (strcmp(foundTeam, team) != 0) teamMismatch = 1;
+        }
+        fprintf(stderr, "rysign: verify team expected='%s' found='%s' %s\n",
+                team ? team : "(nil)", foundTeam, teamMismatch ? "MISMATCH" : "OK");
+    } else {
+        fprintf(stderr, "rysign: verify CD v1 (no team field) — skipping team check\n");
+    }
+    if (teamMismatch) { free(buf); return 1; }
+
+    // 2) PAGE HASHES — recompute and compare every code slot. The math mirrors
+    //    ry_build_codedirectory exactly (last page hashes only its real bytes).
+    if (hashSize == 0 || nCode == 0 || hashType == 0) {
+        fprintf(stderr, "rysign: verify bad CD params (size=%u nCode=%u type=%u)\n", hashSize, nCode, hashType);
+        free(buf); return -6;
+    }
+    if (hashOffset + (nSpecial + nCode) * hashSize != cd_len) {
+        fprintf(stderr, "rysign: verify CD hash region size mismatch "
+                        "(off=%u nSp=%u nCode=%u len=%u)\n", hashOffset, nSpecial, nCode, cd_len);
+        free(buf); return -7;
+    }
+    const unsigned char *stored = cd + hashOffset + (size_t)nSpecial * hashSize;
+    uint32_t n_full = codeLimit / pageSize;
+    uint32_t rem    = codeLimit % pageSize;
+    unsigned char h[CC_SHA256_DIGEST_LENGTH];
+    int bad = -1;
+    for (uint32_t i = 0; i < nCode; i++) {
+        if (hashType == 2) {                         // SHA-256
+            if (i < n_full) CC_SHA256(buf + (size_t)i * pageSize, pageSize, h);
+            else            CC_SHA256(buf + (size_t)n_full * pageSize, rem, h);
+        } else {                                     // SHA-1
+            if (i < n_full) CC_SHA1(buf + (size_t)i * pageSize, pageSize, h);
+            else            CC_SHA1(buf + (size_t)n_full * pageSize, rem, h);
+        }
+        const unsigned char *exp = stored + (size_t)i * hashSize;
+        if (memcmp(exp, h, hashSize) != 0) { bad = (int)i; break; }
+    }
+    if (bad >= 0) {
+        fprintf(stderr, "rysign: verify PAGE HASH slot %d MISMATCH "
+                        "(on-disk bytes != CodeDirectory — blob internally inconsistent)\n", bad);
+        free(buf); return 2;
+    }
+    fprintf(stderr, "rysign: verify page hashes OK (%u slots, codeLimit=%u page=%u)\n",
+            nCode, codeLimit, pageSize);
+
+    // 3) CMS present (cryptographic verification is performed by AMFI on load).
+    if (cms_off) {
+        uint32_t cms_len = rb32(blob + cms_off + 4);
+        fprintf(stderr, "rysign: verify CMS blob present (len=%u)\n", cms_len);
+    } else {
+        fprintf(stderr, "rysign: verify NO CMS slot — SignerInfo missing\n");
+        free(buf); return 3;
+    }
+    free(buf);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Sign a whole Mach-O file (single 64-bit slice)
 // ---------------------------------------------------------------------------
 static int sign_macho_file_at(const char *path, const char *bundlePath,
@@ -1280,6 +1424,21 @@ static int sign_bundle_core(const char *bundlePath,
         fprintf(stderr, "rysign: sign main exe failed (%d)\n", rc);
         free(prov); if (ent) free((void *)ent);
         return 6;
+    }
+
+    // Self-verify the just-signed main executable BEFORE any dlopen. A team
+    // mismatch or hash inconsistency here is exactly what AMFI would reject as
+    // an opaque "code signature invalid (errno=85)"; reporting it now turns
+    // that into a clear, logged diagnosis and stops the launch cleanly.
+    {
+        int vrc = ry_verify_signed_file(exe_path, team);
+        if (vrc != 0) {
+            fprintf(stderr, "rysign: SELF-VERIFY FAILED (rc=%d) — guest signature "
+                            "defective; refusing to proceed to dlopen\n", vrc);
+            free(prov); if (ent) free((void *)ent);
+            return 11;
+        }
+        fprintf(stderr, "rysign: SELF-VERIFY OK — team matches, page hashes consistent\n");
     }
 
     const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };

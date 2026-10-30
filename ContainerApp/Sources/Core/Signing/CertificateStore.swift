@@ -401,42 +401,60 @@ public final class CertificateStore: ObservableObject {
         // samples use, and the p12 key bag stored exactly that.
         let blobs: [Data] = [decodedKeyPKCS8, decodedKey].compactMap { $0 }
         for blob in blobs {
-            let add: [String: Any] = [
-                kSecClass as String: kSecClassKey,
-                kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
-                kSecAttrKeyType as String: fallbackKeyTypeCF,
-                kSecAttrApplicationTag as String: Self.fallbackKeyTag,
-                // The key must be readable when RyBox signs a guest, which
-                // happens after the device has been unlocked at least once.
-                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-                kSecValueData as String: blob
-            ]
-            var st = SecItemAdd(add as CFDictionary, nil)
-            if st == errSecDuplicateItem {
-                // Our tag is already taken (previous launch, or the sibling
-                // blob). Drop the stale item and re-add so the keychain always
-                // holds the CURRENT p12's key — a stale key from an older
-                // certificate would silently sign with the wrong identity.
-                RyLog.shared.log("sign  钥匙串已有同 tag 私钥，清除旧项后重新导入（\(blob.count) 字节）",
+        let add: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrKeyType as String: fallbackKeyTypeCF,
+            kSecAttrApplicationTag as String: Self.fallbackKeyTag,
+            // The key must be readable when RyBox signs a guest, which
+            // happens after the device has been unlocked at least once.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            // Capture the live SecKey straight from the add call. A SEPARATE
+            // SecItemCopyMatching right after a successful add returns nil on
+            // some iOS builds — that is exactly the rc=8 "import ok, lookup
+            // nil" failure that forced the DER path. kSecReturnRef hands back
+            // the SecKey in the same call, skipping that second lookup.
+            kSecReturnRef as String: true,
+            kSecValueData as String: blob
+        ]
+        var added: CFTypeRef?
+        var st = SecItemAdd(add as CFDictionary, &added)
+        if st == errSecDuplicateItem {
+            // Our tag is already taken (previous launch, or the sibling
+            // blob). Drop the stale item and re-add so the keychain always
+            // holds the CURRENT p12's key — a stale key from an older
+            // certificate would silently sign with the wrong identity.
+            RyLog.shared.log("sign  钥匙串已有同 tag 私钥，清除旧项后重新导入（\(blob.count) 字节）",
+                             level: .info, tag: "sign")
+            Self.deleteFallbackKeychainItem()
+            added = nil
+            st = SecItemAdd(add as CFDictionary, &added)
+        }
+        RyLog.shared.log("sign  钥匙串导入私钥（\(blob.count) 字节）→ osstatus=\(st)",
+                         level: st == errSecSuccess ? .info : .warn, tag: "sign")
+        if st == errSecSuccess {
+            // PREFER the ref returned by SecItemAdd — it is the reliable path.
+            if let ref = added, CFGetTypeID(ref) == SecKeyGetTypeID() {
+                let k = ref as! SecKey
+                RyLog.shared.log("sign  私钥已进入系统钥匙串，改用活 SecKey 签名路径（add 直接取回）",
                                  level: .info, tag: "sign")
-                Self.deleteFallbackKeychainItem()
-                st = SecItemAdd(add as CFDictionary, nil)
+                Self.logKeySanity(k)
+                return k
             }
-            RyLog.shared.log("sign  钥匙串导入私钥（\(blob.count) 字节）→ osstatus=\(st)",
-                             level: st == errSecSuccess ? .info : .warn, tag: "sign")
-            if st == errSecSuccess {
-                if let k = Self.copyFallbackKeychainRef() {
-                    RyLog.shared.log("sign  私钥已进入系统钥匙串，改用活 SecKey 签名路径", level: .info, tag: "sign")
-                    Self.logKeySanity(k)
-                    return k
-                }
-                // Import succeeded but the lookup returned nothing. This is
-                // exactly how rc=8 looked on the device: osstatus=0 on add,
-                // nil on copy, signer silently back on the DER path that
-                // SecKeyCreateWithData refuses. Say it out loud now.
-                RyLog.shared.log("sign  ⚠ 钥匙串导入成功但取回失败——签名器将退回 DER 路径",
-                                 level: .warn, tag: "sign")
+            // Fallback to the separate lookup in case kSecReturnRef was
+            // unavailable on this build (kept for robustness).
+            if let k = Self.copyFallbackKeychainRef() {
+                RyLog.shared.log("sign  私钥已进入系统钥匙串，改用活 SecKey 签名路径", level: .info, tag: "sign")
+                Self.logKeySanity(k)
+                return k
             }
+            // Import succeeded but the lookup returned nothing. This is
+            // exactly how rc=8 looked on the device: osstatus=0 on add,
+            // nil on copy, signer silently back on the DER path that
+            // SecKeyCreateWithData refuses. Say it out loud now.
+            RyLog.shared.log("sign  ⚠ 钥匙串导入成功但取回失败——签名器将退回 DER 路径",
+                             level: .warn, tag: "sign")
+        }
         }
         return nil
     }
