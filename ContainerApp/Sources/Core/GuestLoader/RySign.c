@@ -84,6 +84,19 @@ static void rysign_set_diag(const char *fmt, ...) {
     va_end(ap);
 }
 
+/// Append to the diag buffer WITHOUT losing what is already there. The signer
+/// writes the CMS algorithm note first and the self-verify verdict second;
+/// overwriting would throw away the one line that says which algorithm
+/// actually signed. This buffer is what the Swift layer surfaces in the
+/// structured `[sign]` log, so anything worth knowing belongs here.
+static void rysign_append_diag(const char *fmt, ...) {
+    size_t used = strlen(g_sign_diag);
+    if (used + 1 >= sizeof(g_sign_diag)) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(g_sign_diag + used, sizeof(g_sign_diag) - used, fmt, ap);
+    va_end(ap);
+}
+
 /// The guest's Info.plist FILE BYTES (special slot -1). Swift can hand them
 /// over via `rysign_set_info_plist`; if it does not, the signer reads them from
 /// disk. (The in-C parser that used to `strstr` for `<string` failed on every
@@ -328,8 +341,9 @@ static int read_subject_cn(SecCertificateRef cert, char *out, size_t outcap) {
 ///   * SignedData / SignerInfo version 3 (signedAttrs present).
 ///
 /// `cd1` is the primary (SHA-1) CodeDirectory; `cd2` the alternate (SHA-256).
-/// On success `*out_cms` is the RAW CMS DER (the BLOBWRAPPER header is added by
-/// the SuperBlob assembler).
+/// On success `*out_cms` holds the CMS slot CONTENT: a CSMAGIC_BLOBWRAPPER
+/// (0xFADE0B01) header followed by the raw CMS DER. The SuperBlob assembler
+/// stores this buffer verbatim as the 0x10000 slot.
 static int build_cms(const unsigned char *cd1, size_t cd1_len,
                      const unsigned char *cd2, size_t cd2_len,
                      SecKeyRef privKey,
@@ -582,7 +596,23 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
     der_ctx0(&ci, &signedData);
     Buf ciSeq; buf_init(&ciSeq); der_wrap(&ciSeq, 0x30, &ci);
 
+    // The CMS slot (CSSLOT_SIGNATURESLOT = 0x10000) is NOT a native Blob:
+    // Apple classifies it as "raw" (CodeDirectory::slotAttributes() returns
+    // cdComponentPerArchitecture WITHOUT cdComponentIsBlob), which means the
+    // SuperBlob entry holds a BlobWrapper around the DER payload --
+    // CSMAGIC_BLOBWRAPPER (0xFADE0B01), length = 8 + payload, then the DER.
+    //
+    //   Apple source (apple-oss-distributions/Security):
+    //     codedirectory.cpp: case cdSignatureSlot: return cdComponentPerArchitecture;
+    //     sigblob.cpp:      else add(slot, BlobWrapper::alloc(data, len));
+    //     blob.cpp:         BlobWrapper::alloc -> magic 0xfade0b01, length len+8
+    //
+    // Shipping the bare DER here produced a SuperBlob the kernel could not
+    // parse, and the guest dylib was rejected with errno=85 (bad code
+    // signature) at dlopen time.
     ry_buf_init(out_cms);
+    ry_buf_be32(out_cms, RY_CSMAGIC_BLOBWRAPPER);
+    ry_buf_be32(out_cms, (uint32_t)(8 + ciSeq.len));
     ry_buf_put(out_cms, ciSeq.p, ciSeq.len);
 
     buf_free(&sa); buf_free(&saSet); buf_free(&cdh2); ry_buf_free(&plist);
@@ -1084,6 +1114,14 @@ static int sign_slice(unsigned char **pbuf, size_t *len,
 static uint32_t rb32(const unsigned char *p) {
     return (uint32_t)((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
 }
+
+/// Bounded strlen over a blob region — the CodeDirectory's ident/team strings
+/// live inside a fixed-size blob, so a plain strlen could run past it.
+static size_t rb_strlen(const unsigned char *p, size_t max) {
+    size_t n = 0;
+    while (n < max && p[n]) n++;
+    return n;
+}
 static int ry_verify_signed_file(const char *path, const char *team) {
     size_t len; unsigned char *buf = read_file(path, &len);
     if (!buf) { fprintf(stderr, "rysign: verify cannot read '%s'\n", path); return -1; }
@@ -1110,21 +1148,38 @@ static int ry_verify_signed_file(const char *path, const char *team) {
         free(buf); return -3;
     }
     uint32_t nslots = rb32(blob + 8);
-    uint32_t cd_off = 0, cd_type = 0, cms_off = 0;
+    // Slot TYPES must be compared EXACTLY:
+    //   0x0000          primary CodeDirectory
+    //   0x1000..0x100F  alternate CodeDirectory(s)
+    //   0x10000         CMS signature
+    //
+    // A mask such as `(type & 0xffff) == 0` ALSO matches 0x10000 — the CMS
+    // slot — because 0x10000 & 0xffff is 0. An earlier revision of this
+    // function used that mask and then preferred the HIGHEST matching type,
+    // so it picked the CMS blob and tried to parse a DER structure as a
+    // CodeDirectory. It failed on every signature that actually carries a
+    // CMS (i.e. every signature WE produce), and it silently passed only on
+    // ad-hoc signatures that have no CMS slot at all.
+    uint32_t cd_off = 0, cd_alt_off = 0, cms_off = 0;
     for (uint32_t s = 0; s < nslots; s++) {
         const unsigned char *e = blob + 12 + (size_t)s * 8;
         if ((size_t)(e - blob) + 8 > sig_size) break;
         uint32_t type = rb32(e), off = rb32(e + 4);
-        if ((type & 0xffff) == 0x0000) {            // CodeDirectory (primary or alternate)
-            if (type >= cd_type) { cd_type = type; cd_off = off; }
+        if (type == 0x0000) {                        // primary CodeDirectory
+            cd_off = off;
+        } else if (type >= 0x1000 && type <= 0x100F) {  // alternate CodeDirectory
+            cd_alt_off = off;
         } else if (type == 0x10000) {                // CMS signature
             cms_off = off;
         }
     }
     if (!cd_off) {
         fprintf(stderr, "rysign: verify NO CodeDirectory slot\n");
+        rysign_append_diag("｜自检失败(rc=-4)：SuperBlob 里没有 CodeDirectory 槽");
         free(buf); return -4;
     }
+    (void)cd_alt_off;   // the alternate CD is optional; the primary is the
+                        // one AMFI validates, so that is what we check.
     const unsigned char *cd = blob + cd_off;
     uint32_t cd_magic = rb32(cd);
     if (cd_magic != 0xfade0c02 && cd_magic != 0xfade0c01) {
@@ -1137,45 +1192,133 @@ static int ry_verify_signed_file(const char *path, const char *team) {
     uint8_t  hashType   = cd[37];
     uint8_t  pageLog    = cd[39];
     uint32_t hashOffset = rb32(cd + 16);
+    uint32_t identOffset= rb32(cd + 20);
     uint32_t nSpecial   = rb32(cd + 24);
     uint32_t nCode      = rb32(cd + 28);
+    uint32_t teamOffset = (cd_magic == 0xfade0c02) ? rb32(cd + 48) : 0;
     uint32_t pageSize   = (pageLog && pageLog < 32) ? (1u << pageLog) : 4096u;
     if ((size_t)codeLimit > len) {
         fprintf(stderr, "rysign: verify codeLimit %u > file length %zu\n", codeLimit, len);
         free(buf); return -8;
+    }
+    // The CodeDirectory must cover exactly the bytes BEFORE the signature.
+    // If codeLimit != the signature blob's own file offset, the kernel hashes
+    // a different range than we did (and reads the blob from a different
+    // place) — the whole "stale LC_CODE_SIGNATURE" family of bugs.
+    if (codeLimit != sig_off) {
+        fprintf(stderr, "rysign: verify codeLimit %u != signature file offset %u\n",
+                codeLimit, sig_off);
+        free(buf); return -9;
+    }
+
+    // ---- CodeDirectory layout -------------------------------------------
+    //
+    // Apple's layout (and ours, see ry_build_codedirectory):
+    //
+    //   [ hdr 88 ][ ident ][ team ][ special slots -n..-1 ][ code slots 0..m-1 ]
+    //                                                ^hashOffset
+    //
+    // The SPECIAL slots live BEFORE hashOffset (slot -k sits at
+    // `hashOffset - k*hashSize`), and the CODE slots start AT hashOffset and
+    // run to the end of the blob. Therefore:
+    //
+    //     cd_len == hashOffset + nCodeSlots * hashSize
+    //     base   == cd + hashOffset          (NOT + nSpecial*hashSize)
+    //
+    // This is not a theoretical concern: an earlier revision of this function
+    // added `nSpecial*hashSize` to BOTH the length check and the slot base.
+    // That made it reject 100% of correctly signed files, and the bogus
+    // "self-verify failed" then hid the real device behaviour behind a fake
+    // diagnosis. The layout is therefore PROVED from the CD's own fields
+    // below instead of being assumed.
+
+    if (hashSize == 0 || nCode == 0 || hashType == 0) {
+        fprintf(stderr, "rysign: verify bad CD params (size=%u nCode=%u type=%u)\n", hashSize, nCode, hashType);
+        free(buf); return -6;
+    }
+    // (1) the code slots fill the blob exactly, up to its end
+    if (hashOffset + (size_t)nCode * hashSize != cd_len) {
+        fprintf(stderr, "rysign: verify CD code-slot region mismatch "
+                        "(hashOffset=%u nCode=%u hashSize=%u cd_len=%u)\n",
+                hashOffset, nCode, hashSize, cd_len);
+        rysign_append_diag("｜自检失败(rc=-7)：CodeDirectory 代码槽区域长度不符"
+                           "（hashOffset=%u nCode=%u hashSize=%u cd_len=%u）",
+                           hashOffset, nCode, hashSize, cd_len);
+        free(buf); return -7;
+    }
+    // (2) the special slots must fit BEFORE hashOffset
+    if (hashOffset < (size_t)nSpecial * hashSize) {
+        fprintf(stderr, "rysign: verify CD special slots do not fit before hashOffset "
+                        "(hashOffset=%u nSpecial=%u hashSize=%u)\n",
+                hashOffset, nSpecial, hashSize);
+        rysign_append_diag("｜自检失败(rc=-10)：特殊槽放不进 hashOffset 之前");
+        free(buf); return -10;
+    }
+    // (3) PROOF of the layout from three INDEPENDENT fields: ident, team and
+    //     the special-slot count must chain up to exactly hashOffset. If this
+    //     holds, `cd + hashOffset` is provably the code-slot array base.
+    {
+        if (identOffset == 0 || identOffset >= cd_len) {
+            fprintf(stderr, "rysign: verify CD identOffset %u out of range (len=%u)\n",
+                    identOffset, cd_len);
+            rysign_append_diag("｜自检失败(rc=-11)：CodeDirectory identOffset 越界");
+            free(buf); return -11;
+        }
+        uint32_t expect = identOffset +
+            (uint32_t)(rb_strlen(cd + identOffset, cd_len - identOffset) + 1);
+        if (teamOffset) {
+            if (teamOffset >= cd_len) {
+                fprintf(stderr, "rysign: verify CD teamOffset %u out of range (len=%u)\n",
+                        teamOffset, cd_len);
+                rysign_append_diag("｜自检失败(rc=-11)：CodeDirectory teamOffset 越界");
+                free(buf); return -11;
+            }
+            expect += (uint32_t)(rb_strlen(cd + teamOffset, cd_len - teamOffset) + 1);
+        }
+        expect += (uint32_t)nSpecial * hashSize;
+        if (expect != hashOffset) {
+            fprintf(stderr, "rysign: verify CD layout mismatch (ident=%u team=%u "
+                            "nSpecial=%u hashSize=%u -> hashOffset should be %u, is %u)\n",
+                    identOffset, teamOffset, nSpecial, hashSize, expect, hashOffset);
+            rysign_append_diag("｜自检失败(rc=-12)：CodeDirectory 布局不自洽"
+                               "（按 ident/team/特殊槽推出 hashOffset=%u，实际=%u）",
+                               expect, hashOffset);
+            free(buf); return -12;
+        }
     }
 
     // 1) TEAM — the decisive check. A mismatch means the guest's ORIGINAL
     //    signature (a different team) survived signing, which is the classic
     //    library-validation errno=85 that LOOKS like "our signature is broken".
     int teamMismatch = 0;
-    const char *foundTeam = "(none)";
+    char foundTeam[256] = "(none)";
     if (cd_magic == 0xfade0c02) {
-        uint32_t teamOffset = rb32(cd + 48);
-        if (teamOffset && teamOffset < cd_len) foundTeam = (const char *)(cd + teamOffset);
+        if (teamOffset && teamOffset < cd_len) {
+            size_t n = rb_strlen(cd + teamOffset, cd_len - teamOffset);
+            if (n >= sizeof(foundTeam)) n = sizeof(foundTeam) - 1;
+            memcpy(foundTeam, cd + teamOffset, n);
+            foundTeam[n] = '\0';
+        }
         if (team && team[0]) {
             if (teamOffset == 0) teamMismatch = 1;
             else if (strcmp(foundTeam, team) != 0) teamMismatch = 1;
         }
         fprintf(stderr, "rysign: verify team expected='%s' found='%s' %s\n",
                 team ? team : "(nil)", foundTeam, teamMismatch ? "MISMATCH" : "OK");
+        if (teamMismatch) {
+            rysign_append_diag("｜自检失败(rc=1)：guest 的 CodeDirectory team='%s'，"
+                               "期望 '%s'——签名没有真正替换掉原签名",
+                               foundTeam, team ? team : "");
+            free(buf); return 1;
+        }
     } else {
         fprintf(stderr, "rysign: verify CD v1 (no team field) — skipping team check\n");
     }
-    if (teamMismatch) { free(buf); return 1; }
 
     // 2) PAGE HASHES — recompute and compare every code slot. The math mirrors
     //    ry_build_codedirectory exactly (last page hashes only its real bytes).
-    if (hashSize == 0 || nCode == 0 || hashType == 0) {
-        fprintf(stderr, "rysign: verify bad CD params (size=%u nCode=%u type=%u)\n", hashSize, nCode, hashType);
-        free(buf); return -6;
-    }
-    if (hashOffset + (nSpecial + nCode) * hashSize != cd_len) {
-        fprintf(stderr, "rysign: verify CD hash region size mismatch "
-                        "(off=%u nSp=%u nCode=%u len=%u)\n", hashOffset, nSpecial, nCode, cd_len);
-        free(buf); return -7;
-    }
-    const unsigned char *stored = cd + hashOffset + (size_t)nSpecial * hashSize;
+    //    The slot array starts AT hashOffset; the special slots are elsewhere.
+    const unsigned char *stored = cd + hashOffset;
     uint32_t n_full = codeLimit / pageSize;
     uint32_t rem    = codeLimit % pageSize;
     unsigned char h[CC_SHA256_DIGEST_LENGTH];
@@ -1194,19 +1337,60 @@ static int ry_verify_signed_file(const char *path, const char *team) {
     if (bad >= 0) {
         fprintf(stderr, "rysign: verify PAGE HASH slot %d MISMATCH "
                         "(on-disk bytes != CodeDirectory — blob internally inconsistent)\n", bad);
+        rysign_append_diag("｜自检失败(rc=2)：第 %d 个页哈希与磁盘字节不符"
+                           "（签名内部不自洽）", bad);
         free(buf); return 2;
     }
     fprintf(stderr, "rysign: verify page hashes OK (%u slots, codeLimit=%u page=%u)\n",
             nCode, codeLimit, pageSize);
 
     // 3) CMS present (cryptographic verification is performed by AMFI on load).
+    //
+    //    The CMS slot content MUST be a CSMAGIC_BLOBWRAPPER (0xFADE0B01) whose
+    //    length field covers the 8-byte header plus the DER payload. Apple
+    //    classifies slot 0x10000 as "raw" (not cdComponentIsBlob), so the
+    //    SuperBlob holds a BlobWrapper, not a bare DER. Emitting the bare DER
+    //    is exactly what made the kernel reject the guest with errno=85, and
+    //    this magic check is what catches that class of bug before dlopen.
     if (cms_off) {
+        if (cms_off + 8 > sig_size) {
+            fprintf(stderr, "rysign: verify CMS slot offset %u past blob end %u\n",
+                    cms_off, sig_size);
+            rysign_append_diag("｜自检失败(rc=4)：CMS 槽偏移越界");
+            free(buf); return 4;
+        }
+        uint32_t cms_magic = rb32(blob + cms_off);
+        if (cms_magic != RY_CSMAGIC_BLOBWRAPPER) {
+            fprintf(stderr, "rysign: verify CMS slot magic %08x != FADE0B01 (bare DER?)\n",
+                    cms_magic);
+            rysign_append_diag("｜自检失败(rc=13)：CMS 槽缺少 FADE0B01 BlobWrapper 头"
+                               "（当前 magic=%08x）", cms_magic);
+            free(buf); return 13;
+        }
         uint32_t cms_len = rb32(blob + cms_off + 4);
-        fprintf(stderr, "rysign: verify CMS blob present (len=%u)\n", cms_len);
+        if (cms_len < 8 || (size_t)cms_off + cms_len > sig_size) {
+            fprintf(stderr, "rysign: verify CMS blob length %u invalid (%u..%u)\n",
+                    cms_len, cms_off, sig_size);
+            rysign_append_diag("｜自检失败(rc=4)：CMS 长度超出签名区");
+            free(buf); return 4;
+        }
+        // The payload must be a DER SEQUENCE (tag 0x30) — the SignedData.
+        if (cms_len > 8 && blob[cms_off + 8] != 0x30) {
+            fprintf(stderr, "rysign: verify CMS payload not a DER SEQUENCE (0x%02x)\n",
+                    blob[cms_off + 8]);
+            rysign_append_diag("｜自检失败(rc=14)：CMS 载荷不是 DER SEQUENCE");
+            free(buf); return 14;
+        }
+        fprintf(stderr, "rysign: verify CMS blob present (wrapper len=%u, payload=%u)\n",
+                cms_len, cms_len - 8);
     } else {
         fprintf(stderr, "rysign: verify NO CMS slot — SignerInfo missing\n");
+        rysign_append_diag("｜自检失败(rc=3)：SuperBlob 里没有 CMS 签名槽");
         free(buf); return 3;
     }
+    rysign_append_diag("｜自检通过：team=%s，%u 个页哈希一致，CMS 正常",
+                       (cd_magic == 0xfade0c02 && teamOffset) ? foundTeam : "(无 team 槽)",
+                       nCode);
     free(buf);
     return 0;
 }

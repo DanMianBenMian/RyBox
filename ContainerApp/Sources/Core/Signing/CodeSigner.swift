@@ -307,6 +307,15 @@ public final class CodeSigner {
                                  level: .error, tag: "sign")
                 return .failure(.signFailed(rc, detail + "（\(subcodeReason(sub))）"))
             }
+            if rc == 11 {
+                // rc=11 IS the self-verify verdict — surface it to the user
+                // instead of a bare "internal error". The diag carries the
+                // CMS algorithm note first and the verdict after a "｜".
+                let parts = diag.split(separator: "｜", omittingEmptySubsequences: false)
+                if let verdict = parts.last, !verdict.isEmpty {
+                    return .failure(.signFailed(rc, detail + "：" + verdict))
+                }
+            }
             return .failure(.signFailed(rc, detail))
         }
         // On success the signer records WHICH of the four algorithm variants
@@ -354,6 +363,9 @@ public final class CodeSigner {
         case 7:  return "证书/私钥 DER 无法使用"
         case 8:  return "私钥无法创建（可能不是 RSA，或 DER 损坏）"
         case 9:  return "无法用这把私钥签名（SecKeyCreateSignature 拒绝）——证书可能是 EC，或密钥不受信任"
+        case 11: return "签名自检未通过：签完的 guest 签名内部不一致（team / 页哈希 / CMS），已拦截 dlopen"
+        case 13: return "签名自检未通过：CMS 槽缺少 FADE0B01 BlobWrapper 头（格式错，内核会以 errno=85 拒签）"
+        case 14: return "签名自检未通过：CMS 载荷不是合法的 DER SignedData"
         default: return "签名器内部错误（rc=\(rc)）"
         }
     }
