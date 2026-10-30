@@ -733,7 +733,7 @@ public final class CertificateStore: ObservableObject {
         //    certs in-code — exactly what LiveContainer does
         //    (`ZSignAsset::s_szAppleDevCACert` / `...G3`).
         if let embedded = Self.preferredEmbeddedWWDR(for: signingLeafCert) {
-            take(embedded, wwdrFirst: true)
+            take(embedded.der, wwdrFirst: true)
         }
 
         // 1) system-trust chain of the leaf (gives the WWDR intermediate)
@@ -842,14 +842,20 @@ public final class CertificateStore: ObservableObject {
     /// G8 (RSA, signed by the original Apple Root CA).
     private static let appleWWDRG8Base64 = "MIIEVTCCAz2gAwIBAgIUVLULr3kNjX+Mr2hMVi9QaQoaul8wDQYJKoZIhvcNAQEFBQAwYjELMAkGA1UEBhMCVVMxEzARBgNVBAoTCkFwcGxlIEluYy4xJjAkBgNVBAsTHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9yaXR5MRYwFAYDVQQDEw1BcHBsZSBSb290IENBMB4XDTIzMDYyMDIzMzcxNVoXDTI1MDEyNDAwMDAwMFowdTELMAkGA1UEBhMCVVMxEzARBgNVBAoMCkFwcGxlIEluYy4xCzAJBgNVBAsMAkc4MUQwQgYDVQQDDDtBcHBsZSBXb3JsZHdpZGUgRGV2ZWxvcGVyIFJlbGF0aW9ucyBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANBAENQI+VIhY088aPfUnIICjINovLeNf4jnQk0s7yKlwonevQzXTWFQLTnkMHOl0tVomjPy79kqrS4fA7r4pfFCC1cuRsbQWNNwX/eyN+9qHz6/iTnCrf71BftYljHIhyzVI7p1sCz1q6C68iAMTOskY2npIkDwjlhb3mR7iRtREgTgF7JZzd/x586vLDLoacHQCH4dokdz0Us7/bmF3EenKIJ5KUiJAijiwewsH1uG/Ni2y3HAcwFL/AUREWwBAzRa9oHCXh98FA7eP2shy0/112HmhAOSvOclKZ7NWwzB2+PEOtl2V6wvOBQZyLexolVPX06OGVmp2v1y2rAEIQUCAwEAAaOB7zCB7DASBgNVHRMBAf8ECDAGAQH/AgEAMB8GA1UdIwQYMBaAFCvQaUeUdgn+9GuNLkCm90dNfwheMEQGCCsGAQUFBwEBBDgwNjA0BggrBgEFBQcwAYYoaHR0cDovL29jc3AuYXBwbGUuY29tL29jc3AwMy1hcHBsZXJvb3RjYTAuBgNVHR8EJzAlMCOgIaAfhh1odHRwOi8vY3JsLmFwcGxlLmNvbS9yb290LmNybDAdBgNVHQ4EFgQUtb28gMQM4zik9LetI7PvRM65WoUwDgYDVR0PAQH/BAQDAgEGMBAGCiqGSIb3Y2QGAgEEAgUAMA0GCSqGSIb3DQEBBQUAA4IBAQBMs+t6OZRKlWb6FjHqDYqPXUI4xgfN6MkirPwIQn5fk18xKqgiwXYZK+6ucum9Vs9JJJII980ZdcP5GicNDtwpjT+226VPTHLEYJGJEX4klUMiYGe83/+r5TwWF52CFE6d9HX+ULmtBbK4efaV1hDl9lP0zyPmdw/suEtp+OKeAjHZjtnKvmNeX+Ggac7BzW5Jo3hhrzk8aksKNCVk1TC1PKvdEYE5cejAw1iAERAaEdLCvFnwitk1c8DmbeTJfWIUPoICqRBpN3lhb/BGlD419ausY9DYXllXadG4S25d1F8TnHBOJRHcJCweFp6WWgTtRe467mddj8OGsPVMH2gQ"
 
-    private static func embeddedWWDRCerts() -> [(der: Data, cert: SecCertificate)] {
-        let blobs = [appleWWDRG3Base64, appleWWDRG5Base64, appleWWDRG6Base64,
-                     appleWWDRG7Base64, appleWWDRG8Base64]
-        var out: [(Data, SecCertificate)] = []
-        for blob in blobs {
+    private static func embeddedWWDRCerts()
+        -> [(der: Data, cert: SecCertificate, label: String)] {
+        let blobs: [(String, String)] = [
+            (appleWWDRG3Base64, "G3"),
+            (appleWWDRG5Base64, "G5"),
+            (appleWWDRG6Base64, "G6"),
+            (appleWWDRG7Base64, "G7"),
+            (appleWWDRG8Base64, "G8")
+        ]
+        var out: [(Data, SecCertificate, String)] = []
+        for (blob, label) in blobs {
             guard let der = Data(base64Encoded: blob),
                   let cert = SecCertificateCreateWithData(nil, der as CFData) else { continue }
-            out.append((der, cert))
+            out.append((der, cert, label))
         }
         return out
     }
@@ -862,21 +868,38 @@ public final class CertificateStore: ObservableObject {
     /// `SecCertificateCopyNormalizedIssuerSequence` / `…SubjectSequence` give
     /// canonical, comparable DER name blobs.
     ///
-    /// Result: when the leaf is signed by G6 we embed G6 (not G3), so the trust
-    /// chain `leaf → G6 → Apple Root CA - G3` validates and errno=1 is gone.
-    /// When the leaf is unavailable we fall back to G3 (the most common case).
-    private static func preferredEmbeddedWWDR(for leaf: SecCertificate?) -> Data? {
+    /// The chosen label is logged: `SubjectSummary` returns only the CN (all
+    /// five WWDRs share one CN), so without it a device log cannot tell G3
+    /// from G6.
+    ///
+    /// - Returns: the matched intermediate plus which candidate it came from
+    ///   ("G3"…"G8"); `nil` only if no embedded blob parses.
+    private static func preferredEmbeddedWWDR(for leaf: SecCertificate?)
+        -> (der: Data, label: String)? {
         let candidates = embeddedWWDRCerts()
-        guard let leaf = leaf else { return candidates.first?.der }
+        guard let first = candidates.first else { return nil }
+        guard let leaf = leaf else {
+            RyLog.shared.log("sign  ⚠ 无叶子证书可比对签发者，WWDR 回落 \(first.label)",
+                             level: .warn, tag: "sign")
+            return (first.der, first.label)
+        }
         guard let leafIssuer = SecCertificateCopyNormalizedIssuerSequence(leaf) as Data?
-        else { return candidates.first?.der }
-        for (der, cert) in candidates {
+        else {
+            RyLog.shared.log("sign  ⚠ 读不出 leaf 签发者，WWDR 回落 \(first.label)",
+                             level: .warn, tag: "sign")
+            return (first.der, first.label)
+        }
+        for (der, cert, label) in candidates {
             if let subj = SecCertificateCopyNormalizedSubjectSequence(cert) as Data?,
                subj == leafIssuer {
-                return der
+                RyLog.shared.log("sign  WWDR 匹配：leaf 签发者 == \(label) 主题 → CMS slot 1 嵌入 \(label)",
+                                 level: .info, tag: "sign")
+                return (der, label)
             }
         }
-        return candidates.first?.der   // fallback: G3
+        RyLog.shared.log("sign  ⚠ WWDR 无匹配：leaf 的签发者不属于 G3/G5/G6/G7/G8，回落 \(first.label)",
+                         level: .warn, tag: "sign")
+        return (first.der, first.label)
     }
 
     // MARK: - Persistence

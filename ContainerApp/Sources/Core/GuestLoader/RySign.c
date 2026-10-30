@@ -604,9 +604,22 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
         }
     }
 
-    // ---- SignerInfo (version 3) -------------------------------------------
+    // ---- SignerInfo (version 1) -------------------------------------------
+    //
+    //    RFC 5652 §5.3 (MUST):
+    //      "If the SignerIdentifier is the CHOICE issuerAndSerialNumber, then the
+    //       version MUST be 1. If the SignerIdentifier is subjectKeyIdentifier,
+    //       then the version MUST be 3."
+    //
+    //    We identify the signer by `issuerAndSerialNumber` (see the
+    //    issuerAndSerialNumber field built right below), so this MUST be 1.
+    //    It used to be 3 — a version/sid mismatch that Apple's CMS parser is
+    //    entitled to reject, and the remaining `code signature invalid (errno=1)`
+    //    cause after the WWDR intermediate was fixed. zsign reaches the same
+    //    value via OpenSSL's CMS_add1_signer(), which emits v1 for
+    //    issuerAndSerialNumber.
     Buf si; buf_init(&si);
-    { unsigned char one[1] = {3}; der_int(&si, one, 1); }
+    { unsigned char one[1] = {1}; der_int(&si, one, 1); }
     { Buf iasn; buf_init(&iasn); buf_put(&iasn, issuer, issuer_len);
       der_int(&iasn, serial, serial_len); der_wrap(&si, 0x30, &iasn); buf_free(&iasn); }
     { Buf da; buf_init(&da); der_oid(&da, OID_SHA256, sizeof(OID_SHA256));
@@ -633,9 +646,18 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
       der_octet(&si, &sigOct); buf_free(&sigOct); }
     Buf signerInfo; buf_init(&signerInfo); der_wrap(&signerInfo, 0x30, &si);
 
-    // ---- SignedData (version 3) -------------------------------------------
+    // ---- SignedData (version 1) -------------------------------------------
+    //
+    //    RFC 5652 §5.1: version is 1 when
+    //      (a) the certificates field holds no version-1/version-2 attribute
+    //          certificates and no "other"-typed certificates,
+    //      (b) eContentType == id-data, and
+    //      (c) every SignerInfo is version 1.
+    //    All three hold here (plain X.509 leaf + WWDR, detached id-data, the
+    //    single v1 SignerInfo built above), so this MUST be 1 — it used to
+    //    be 3, paired with the wrong SignerInfo version.
     Buf sd; buf_init(&sd);
-    { unsigned char one[1] = {3}; der_int(&sd, one, 1); }
+    { unsigned char one[1] = {1}; der_int(&sd, one, 1); }
     { Buf da; buf_init(&da); der_oid(&da, OID_SHA256, sizeof(OID_SHA256));
       Buf dseq; buf_init(&dseq); der_wrap(&dseq, 0x30, &da);
       Buf dset; buf_init(&dset); der_set(&dset, &dseq);
