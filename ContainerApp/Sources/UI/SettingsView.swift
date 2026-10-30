@@ -232,7 +232,7 @@ struct SettingsView: View {
         } header: {
             Text("启动方式")
         } footer: {
-            Text("两种方式走的是完全不同的签名校验体系：进程内动态库要过 AMFI 的 library validation（宿主需开发证书豁免），可执行文件只按 DR 校验证书链。切换后立即生效，便于对照真机日志。")
+            Text("两种方式走的是不同的签名校验体系：进程内动态库要过 AMFI 的 library validation，但只要宿主与 guest 同 team（分发证书也行，用同一 Apple 账号的侧载/导入证书即可），就能直接加载；只有 team 不同且宿主无 get-task-allow 豁免时才被拒。可执行文件进程只按 DR 校验证书链，不涉及库验证。切换后立即生效，便于对照真机日志。")
         }
     }
 

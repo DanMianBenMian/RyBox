@@ -14,10 +14,13 @@ import os
 ///  * `.inProcessDylib` — the LiveContainer model: the guest is patched to
 ///    MH_DYLIB, re-signed, `dlopen`ed into RyBox and its entry point is
 ///    called. A library loaded into an arbitrary host process is validated
-///    far more strictly than an executable — it additionally has to survive
-///    AMFI's "transmute" path (an XML-only entitlements blob without a DER
-///    one is refused) and library validation. That strictness is what made
-///    Sileo die with `code signature invalid (errno=85)` over and over.
+///    far more strictly than a standalone executable — it must additionally
+///    pass AMFI's **library validation**, which only fails when the guest's
+///    team differs from the host's AND the host is not exempt
+///    (`get-task-allow` / `disable-library-validation`). Same team ⇒ loads
+///    fine with **either** a development or a distribution cert (this is the
+///    RyBox default and the recommended production path). The errno=85
+///    Sileo saw was library validation, not a certificate-type ban.
 ///
 /// The choice is persisted so it can be flipped on the device (Settings →
 /// 启动方式) without a rebuild — the two paths fail in different ways and
@@ -40,7 +43,7 @@ enum GuestLaunchMode: String, CaseIterable, Identifiable {
         case .executeProcess:
             return "guest 保持 MH_EXECUTE，用 posix_spawn 起成独立进程：可执行文件只按指定要求校验证书链，不涉及库验证。缺点是容器界面无法与 guest 共存，guest 也不能访问容器的虚拟根。"
         case .inProcessDylib:
-            return "LiveContainer 模式：把 guest 改成 MH_DYLIB 后 dlopen 进 RyBox 进程，界面能和容器共存。要求宿主用开发证书签名（get-task-allow），否则库验证会拒绝（errno=85）。"
+            return "LiveContainer 模式：把 guest 改成 MH_DYLIB 后 dlopen 进 RyBox 进程，界面能和容器共存。库验证只比对 team id：只要宿主与 guest 用「同一 Apple 账号」的侧载/分发证书（同 team），哪怕都是分发证书（get-task-allow=false）也能直接加载；只有 team 不同且宿主又没 get-task-allow 豁免时才会被拒（errno=85）。"
         }
     }
 
@@ -51,20 +54,29 @@ enum GuestLaunchMode: String, CaseIterable, Identifiable {
     /// the container never exits), and it is the mode LiveContainer itself
     /// uses.
     ///
-    /// The in-process path has ONE hard requirement that is easy to miss:
-    /// the HOST must be signed with a **development** profile
-    /// (`get-task-allow = true`). A debuggable host is exempt from AMFI's
-    /// library validation, so it may load a guest dylib signed by any team.
-    /// A host signed with a **distribution** profile is not debuggable, AMFI
-    /// enforces library validation, and any guest dylib whose team differs
-    /// from the host's is refused with `code signature invalid (errno=85)`.
+    /// The in-process path's strictness is **the library validation, not the
+    /// certificate type**. AMFI only refuses a guest dylib when BOTH hold:
+    ///   (1) the guest's team differs from the host's, AND
+    ///   (2) the host is NOT exempt from library validation
+    ///       (no `get-task-allow` and no `disable-library-validation`).
+    /// Two ways satisfy this:
+    ///   * **Channel A — same team (distribution certs are fine):** sign the
+    ///     RyBox.ipa and import the guest-resign p12 with the **same Apple
+    ///     account**. Same team ⇒ AMFI library validation passes regardless
+    ///     of whether either cert is development or distribution. This is the
+    ///     recommended, production-friendly path.
+    ///   * **Channel B — host exemption:** sign the host with a development
+    ///     profile (`get-task-allow = true`). A debuggable host is exempt
+    ///     from library validation and may load any team's guest dylib.
     ///
-    /// LiveContainer's FAQ says the same thing in so many words:
-    /// *"you are using a distribution certificate profile to sign LiveContainer,
-    /// which is not supported and LiveContainer won't work at all."*
+    /// The old "distribution certs won't work at all" line comes from
+    /// LiveContainer's own AltStore/SideStore flow, which always sideloads
+    /// LiveContainer with a *different* account than the apps it installs —
+    /// that is a flow constraint, not a platform rule. RyBox controls both
+    /// the host and the guest cert, so it can always arrange Channel A.
     ///
     /// `HostIdentity.inspect()` reads the host's own signature at launch and
-    /// logs whether that exemption is present, so the failure mode is
+    /// reports which channel is open (`可用通路`), so the failure mode is
     /// self-explaining instead of being a mystery.
     static var current: GuestLaunchMode {
         get {
