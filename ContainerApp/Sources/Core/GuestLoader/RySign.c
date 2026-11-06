@@ -566,9 +566,9 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
     // signed (`usedEC`), the SignerInfo declared the WRONG signatureAlgorithm
     // OID — the single most likely cause of errno=1 with a self-check that
     // passes. This line lets the device log confirm or rule it out next run.
-    fprintf(stderr, "rysign: key self-reported EC=%d, actual signing family EC=%d%s\n",
+    rysign_append_diag("｜EC 自报=%d 实际签名族=%d%s",
             preferEC ? 1 : 0, usedEC ? 1 : 0,
-            (preferEC != usedEC) ? "  <<< MISMATCH (declared OID was wrong, now fixed)" : "");
+            (preferEC != usedEC) ? "｜⚠️ 声明OID与签名族不符(已修复)" : "");
 
     // Definitive cryptographic self-check: re-verify the signature we just made
     // with the device's own Security framework, using the SAME algorithm the
@@ -589,8 +589,8 @@ static int build_cms(const unsigned char *cd1, size_t cd1_len,
                                          (CFIndex)CFDataGetLength(sigData));
             CFErrorRef vErr = NULL;
             bool vOk = (vPay && vSig) ? SecKeyVerifySignature(vpub, vAlgo, vPay, vSig, &vErr) : false;
-            fprintf(stderr, "rysign: CMS self-verify (declared algo) %s%s\n",
-                    vOk ? "OK" : "FAILED", vOk ? "" : "  <<< AMFI WILL REJECT");
+            rysign_append_diag("｜CMS 自签验证(声明算法)=%s%s",
+                    vOk ? "OK" : "FAILED", vOk ? "" : "｜⚠️ amfid 将拒签");
             if (!vOk) {
                 rysign_append_diag("｜⚠️ CMS 自签验证失败：声明算法与签名字节不符"
                                    "（amfid 将以 code signature invalid 拒签）");
@@ -1741,12 +1741,11 @@ static int sign_bundle_core(const char *bundlePath,
     {
         int vrc = ry_verify_signed_file(exe_path, team);
         if (vrc != 0) {
-            fprintf(stderr, "rysign: SELF-VERIFY FAILED (rc=%d) — guest signature "
-                            "defective; refusing to proceed to dlopen\n", vrc);
+            rysign_append_diag("｜SELF-VERIFY 失败(rc=%d)：guest 签名结构有缺陷，拒绝 dlopen", vrc);
             free(prov); if (ent) free((void *)ent);
             return 11;
         }
-        fprintf(stderr, "rysign: SELF-VERIFY OK — team matches, page hashes consistent\n");
+        rysign_append_diag("｜整文件 SELF-VERIFY OK（team匹配/页哈希一致）");
     }
 
     const char *subdirs[] = { "Frameworks", "PlugIns", "SwiftSupport" };
