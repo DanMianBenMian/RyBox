@@ -7,7 +7,12 @@ on:
 # run per file. Cancel the superseded ones: only the newest commit matters and
 # the macOS runner pool is the scarce resource here.
 concurrency:
-  group: ota-build-${{ github.ref }}
+  # Per-run group: each run gets its own slot, so a stuck/in-progress run in the
+  # shared `ota-build-refs/heads/main` group can never cancel a freshly-created
+  # one (observed 2026-11-06: every run against 767228ef was auto-cancelled the
+  # instant it was created, with no in-progress peer visible — the shared group
+  # had a latent cancellation state that blocked all new runs).
+  group: ota-build-${{ github.run_id }}
   cancel-in-progress: true
 jobs:
   build:
